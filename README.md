@@ -15,10 +15,23 @@ This is a **greenfield build**. The trust topology of prior marketplace designs
 
 ## For miners
 
-This lane is targeted at **10% of SN39 emissions** once live, reached in
-three gated steps: shadow (scores published, zero emission effect), canary
-(small live fraction), then ramp to the 10% target. The existing SAT scorer
-stays authoritative throughout — this lane is additive.
+Target economy: **50/50 between SAT and attested confidential compute**.
+The confidential share phases in on a published, adoption-gated schedule:
+
+| Attested miners in the lane | Confidential share of emissions |
+|---|---|
+| Shadow phase | 0% (scores published, proof visible) |
+| Lane opens, fewer than 5 | 10% |
+| 5 to 20 | 25% |
+| 20+ | **50% — target economy** |
+
+First movers split the largest per-miner pool the lane will ever pay.
+Two commitments: SAT miners are never diluted by an empty lane (the
+confidential share only exists when real attested miners are earning it),
+and Cathedral does not mine its own lane — our confidential hardware runs
+verification infrastructure only and is never registered for emissions.
+The existing SAT scorer stays authoritative throughout — this lane is
+additive.
 
 What you can do today:
 
