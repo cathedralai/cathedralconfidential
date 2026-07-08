@@ -33,6 +33,8 @@ print(json.dumps({
     "measurement": os.environ["FAKE_MEASUREMENT"],
     "tcb": int(os.environ["FAKE_TCB"]),
     "platform_id": os.environ["FAKE_PLATFORM_ID"],
+    "intel_verified": os.environ.get("FAKE_INTEL_VERIFIED", "true"),
+    "report_data_match": os.environ.get("FAKE_REPORT_DATA_MATCH", "true"),
 }))
 """.lstrip()
     )
@@ -86,6 +88,38 @@ def test_tdx_verify_rejects_disallowed_measurement(tmp_path, monkeypatch):
 
     evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
     policy = Policy(allowed_measurements={"other-measurement"}, min_tcb=0)
+
+    assert verify(evidence, nonce, policy) is None
+
+
+def test_tdx_verify_rejects_explicit_failed_intel_verdict(tmp_path, monkeypatch):
+    nonce = issue_nonce()
+    hotkey = "hotkey-tdx"
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path))
+    monkeypatch.setenv("FAKE_REPORT_DATA", report_data(nonce, hotkey).hex())
+    monkeypatch.setenv("FAKE_MEASUREMENT", "tdx-measurement-1")
+    monkeypatch.setenv("FAKE_TCB", "7")
+    monkeypatch.setenv("FAKE_PLATFORM_ID", "tdx-platform-1")
+    monkeypatch.setenv("FAKE_INTEL_VERIFIED", "false")
+
+    evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
+    policy = Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=0)
+
+    assert verify(evidence, nonce, policy) is None
+
+
+def test_tdx_verify_rejects_explicit_report_data_mismatch(tmp_path, monkeypatch):
+    nonce = issue_nonce()
+    hotkey = "hotkey-tdx"
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path))
+    monkeypatch.setenv("FAKE_REPORT_DATA", report_data(nonce, hotkey).hex())
+    monkeypatch.setenv("FAKE_MEASUREMENT", "tdx-measurement-1")
+    monkeypatch.setenv("FAKE_TCB", "7")
+    monkeypatch.setenv("FAKE_PLATFORM_ID", "tdx-platform-1")
+    monkeypatch.setenv("FAKE_REPORT_DATA_MATCH", "false")
+
+    evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
+    policy = Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=0)
 
     assert verify(evidence, nonce, policy) is None
 

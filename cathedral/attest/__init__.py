@@ -10,6 +10,7 @@ live Cathedral box is a GCP TDX CVM; SNP and GPU-CC follow the same interface.
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 
 from cathedral.common import Evidence, EvidenceKind, report_data
@@ -61,7 +62,7 @@ def _collect_configfs_tsm_quote(report_data_bytes: bytes, *, root: Path) -> tupl
     if not root.exists():
         raise FileNotFoundError(f"configfs-tsm report root not found: {root}")
 
-    report_dir = root / f"cathedral-{os.getpid()}"
+    report_dir = root / f"cathedral-{os.getpid()}-{secrets.token_hex(8)}"
     report_dir.mkdir(mode=0o700, exist_ok=False)
     try:
         (report_dir / "inblob").write_bytes(report_data_bytes)

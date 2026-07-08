@@ -64,6 +64,11 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
     """
 
     claims = _run_tdx_verifier(evidence.quote)
+    if _claim_bool(claims, "intel_verified") is False:
+        return None
+    if _claim_bool(claims, "report_data_match") is False:
+        return None
+
     actual_report_data = _claim_bytes(claims, "report_data")
     expected_report_data = report_data(nonce, evidence.miner_hotkey, evidence.ssh_host_key)
     if actual_report_data != expected_report_data:
@@ -157,3 +162,18 @@ def _claim_int(claims: dict[str, Any], *keys: str, default: int) -> int:
             except ValueError:
                 continue
     return default
+
+
+def _claim_bool(claims: dict[str, Any], key: str) -> bool | None:
+    value = claims.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return True
+        if normalized in {"0", "false", "no"}:
+            return False
+    return None

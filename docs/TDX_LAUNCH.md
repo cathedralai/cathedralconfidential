@@ -138,9 +138,13 @@ python -m pytest tests/test_attest_tdx_negative.py -q
 
 Latest live evidence, July 8, 2026:
 
-- Hardware-free local suite: `51 passed, 3 skipped`.
+- Hardware-free local suite: `53 passed, 3 skipped`.
 - Live TDX CVM with Polaris `attestor-verify` adapter:
   `tests/test_attest_tdx_hw.py tests/test_tdx_sat_e2e_hw.py` -> `2 passed`.
 - Live verifier smoke returned an 8000-byte quote with
   `intel_verified=true`, `report_data_match=true`, 64-byte `report_data`, and
   four Intel collateral URLs.
+- Non-TDX field negative control on disposable `e2-micro` Spot VM:
+  `/sys/module/tdx_guest`, `/dev/tdx_guest`, and
+  `/sys/kernel/config/tsm/report` were absent;
+  `CATHEDRAL_RUN_TDX_NEGATIVE=1 tests/test_attest_tdx_negative.py` -> `2 passed`.
