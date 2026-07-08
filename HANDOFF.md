@@ -34,12 +34,9 @@ the fastest way to a real `/dev/sev-guest`; do bare metal later for production.
 Requires Python 3.11+ and git. Nothing else.
 
 ```bash
-# get the code (from the bundle you were sent, or the transport branch)
-git clone cathedral.bundle cathedral         # OR:
-# git clone --branch cathedral-greenfield --single-branch \
-#   https://github.com/bigailabs/cathedral-archived.git cathedral
+# get the code
+git clone https://github.com/cathedralai/cathedralconfidential.git cathedral
 cd cathedral
-git checkout -b main            # if cloned from the bundle (branch is 'master')
 
 python3 -m venv .venv
 . .venv/bin/activate
