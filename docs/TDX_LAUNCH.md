@@ -79,23 +79,34 @@ quote-claim parser.
 
 ## Hardware Test
 
-Run quote collection + verification on the TDX CVM once the verifier command is
-installed:
+Run quote collection + verification on the TDX CVM with the Polaris verifier
+adapter:
 
 ```bash
-CATHEDRAL_RUN_TDX_HW=1 \
-CATHEDRAL_TDX_VERIFY_CMD='tdx-verifier-json' \
-CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<measurement>' \
-python -m pytest tests/test_attest_tdx_hw.py -q
+sudo env \
+  PYTHONPATH="$PWD" \
+  CATHEDRAL_RUN_TDX_HW=1 \
+  CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py' \
+  CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify \
+  CATHEDRAL_TDX_MEASUREMENT='<published-launch-measurement>' \
+  CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<published-launch-measurement>' \
+  CATHEDRAL_TDX_PLATFORM_ID='<stable-launch-platform-id>' \
+  CATHEDRAL_TDX_TCB=0 \
+  python -m pytest tests/test_attest_tdx_hw.py -q
 ```
 
 Run the full launch lane path on the TDX CVM:
 
 ```bash
 sudo env \
+  PYTHONPATH="$PWD" \
   CATHEDRAL_RUN_TDX_HW=1 \
-  CATHEDRAL_TDX_VERIFY_CMD='tdx-verifier-json' \
-  CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<measurement>' \
+  CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py' \
+  CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify \
+  CATHEDRAL_TDX_MEASUREMENT='<published-launch-measurement>' \
+  CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<published-launch-measurement>' \
+  CATHEDRAL_TDX_PLATFORM_ID='<stable-launch-platform-id>' \
+  CATHEDRAL_TDX_TCB=0 \
   python -m pytest tests/test_tdx_sat_e2e_hw.py -q
 ```
 
@@ -124,3 +135,12 @@ python -m pytest tests/test_attest_tdx_negative.py -q
 - A validator epoch can admit a real TDX-attested miner and still produce
   conserved weights.
 - SNP remains a second CPU platform port, not a launch blocker.
+
+Latest live evidence, July 8, 2026:
+
+- Hardware-free local suite: `51 passed, 3 skipped`.
+- Live TDX CVM with Polaris `attestor-verify` adapter:
+  `tests/test_attest_tdx_hw.py tests/test_tdx_sat_e2e_hw.py` -> `2 passed`.
+- Live verifier smoke returned an 8000-byte quote with
+  `intel_verified=true`, `report_data_match=true`, 64-byte `report_data`, and
+  four Intel collateral URLs.
