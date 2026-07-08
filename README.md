@@ -16,9 +16,13 @@ here — miners *serve* attestation, validators never touch miner machines.
 
 ## Read first
 
+- [`HANDOFF.md`](HANDOFF.md) — **start here to run or commission.** Run the
+  testable core in 5 minutes, or commission a real SEV-SNP box and build the
+  first hardware attestation test (Phase 1, the critical path).
 - [`docs/DESIGN.md`](docs/DESIGN.md) — the founding design. Products, supply
   chains, the lane model, emissions, attestation core, rental delivery, the
   thin on-chain cut, and the phased build plan.
+- [`RUNTEST.md`](RUNTEST.md) — per-command test breakdown.
 
 ## Two products
 
