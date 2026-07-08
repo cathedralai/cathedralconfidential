@@ -9,10 +9,8 @@ ticket to participate, not the paycheck. Miners earn by completing verified work
 in five lanes — inference, training, RL, agent hosting, and SAT/benchmark — and
 idle attested hardware earns only a thin floor. Unearned emission burns.
 
-This is a **greenfield build**. The prior benchmark-verified marketplace
-(forked from Basilica) lives at `bigailabs/cathedral-archived` as reference; its
-trust topology (validator SSHes into miners as root) is deliberately inverted
-here — miners *serve* attestation, validators never touch miner machines.
+This is a **greenfield build** with a deliberately inverted trust topology:
+miners *serve* attestation, validators never touch miner machines.
 
 ## Read first
 
@@ -63,5 +61,4 @@ policy.
 
 ## License
 
-MIT. Forked-from lineage: `bigailabs/cathedral-archived` (itself forked from
-one-covenant/basilica).
+MIT.
