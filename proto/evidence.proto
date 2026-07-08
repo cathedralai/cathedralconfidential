@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+// TEE attestation evidence. One message per hardware root of trust.
+// The verifier (validator side) turns Evidence into an Attested verdict via
+// vendor tooling (AMD KDS, Intel DCAP/Trust Authority, NVIDIA NRAS/nvtrust)
+// plus a measurement policy. See docs/DESIGN.md §6.
+package cathedral.v1;
+
+// What the miner sends. `report_data` in the underlying quote is bound to
+//   sha512(nonce || miner_hotkey [|| ssh_host_key])
+// so evidence is fresh (nonce), owned (hotkey — defeats relay), and — for
+// Sandbox rentals — channel-bound (ssh_host_key). See docs/DESIGN.md §6, §7.
+message Evidence {
+  Kind kind = 1;
+
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    SEV_SNP = 1;   // AMD EPYC 7003 (Milan) and newer
+    TDX = 2;       // Intel 5th-gen Xeon Scalable and newer
+    GPU_CC = 3;    // NVIDIA H100/H200 Hopper CC, B200/B300 Blackwell
+  }
+
+  // Raw vendor quote/report bytes (SNP report, TDX quote, or NVIDIA
+  // attestation report). Opaque here; parsed by the vendor verifier.
+  bytes quote = 2;
+
+  // Optional certificate chain when not fetched out-of-band by the verifier.
+  repeated bytes cert_chain = 3;
+
+  // The nonce the validator issued for this challenge (echoed for binding).
+  bytes nonce = 4;
+
+  // Miner hotkey bound into report_data.
+  string miner_hotkey = 5;
+
+  // Sandbox only: SSH host key bound into report_data so the rental channel
+  // terminates provably inside the attested guest. See docs/DESIGN.md §7.
+  bytes ssh_host_key = 6;
+
+  // Composite attestation (Sandbox on CC-GPU): a single Intel Trust Authority
+  // JWT binding the host CPU TDX quote and the GPU CC evidence together.
+  // See docs/DESIGN.md §6.
+  string composite_jwt = 7;
+}

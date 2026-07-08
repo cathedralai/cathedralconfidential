@@ -1,0 +1,25 @@
+[project]
+name = "cathedral"
+version = "0.0.0"
+description = "Confidential compute subnet (SN39): attestation is admission, verified work is currency"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  # bittensor SDK added in Phase 1 when chain integration lands
+  # "bittensor>=8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+cathedral-census = "cathedral.census:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

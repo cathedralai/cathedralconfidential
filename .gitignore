@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Local state
+*.db
+*.log
+.env
+.env.*
+!.env.example
+
+# TEE evidence / secrets (never commit)
+*.quote
+*.report
+report.bin
+attestation.json
+*.jwt
+*.pem
+*.key
+
+# Generated proto
+*_pb2.py
+*_pb2.pyi
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
