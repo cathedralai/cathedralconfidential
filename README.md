@@ -13,6 +13,27 @@ This is a **greenfield build**. The trust topology of prior marketplace designs
 (validator SSHes into miners as root) is deliberately inverted here — miners
 *serve* attestation, validators never touch miner machines.
 
+## For miners
+
+This lane is targeted at **10% of SN39 emissions** once live, reached in
+three gated steps: shadow (scores published, zero emission effect), canary
+(small live fraction), then ramp to the 10% target. The existing SAT scorer
+stays authoritative throughout — this lane is additive.
+
+What you can do today:
+
+1. **Run the testable core** — clone this repo, `pip install -e '.[dev]'`,
+   `python -m pytest -q` (40 tests, no special hardware). Understand the
+   evidence flow in `cathedral/attest` and the SAT lane in
+   `cathedral/lanes/sat.py`.
+2. **Prep confidential hardware** — Intel TDX or AMD SEV-SNP capable CPU
+   (CC-mode GPU support follows). Attestation is the admission ticket:
+   no genuine TEE evidence, no lane access.
+3. **Watch this repo** — intake opens after the shadow phase proves
+   attestation, UID mapping, and verified-work behavior on live data.
+
+No change to your existing SN39 SAT mining is needed for any of this.
+
 ## Read first
 
 - [`HANDOFF.md`](HANDOFF.md) — **start here to run or commission.** Run the
