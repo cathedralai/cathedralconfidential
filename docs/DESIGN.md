@@ -187,14 +187,14 @@ When off-subnet customers need trustless settlement, add exactly one **Verificat
 
 Each phase ships alone; nothing blocks on the phase after it.
 
-- **Phase 0 — now (~1–2 wk).** Land the rename. `TeeEvidence` proto (SNP | TDX | GPU, nonce+hotkey binding). CC census probe (`/dev/sev-guest`, TDX support, `nvidia-smi conf-compute -q`) to measure launch supply. *Blocker: one SNP-capable EPYC bare-metal box.*
+- **Phase 0 — now (~1–2 wk).** Land the rename. `TeeEvidence` proto (SNP | TDX | GPU, nonce+hotkey binding). CC census probe (`/dev/sev-guest`, TDX support, `nvidia-smi conf-compute -q`) to measure launch supply. *Launch path: TDX CPU first on the live GCP TDX CVM; SNP is the next CPU platform port.*
 - **Phase 1 — attestation core (~4–6 wk).** `cathedral-attestor` + `cathedral-verifier` (KDS / DCAP / NRAS + policy engine). Admission and emissions gate on attestation. Cathedral is now an attestation-gated subnet with the attestation floor + a first lane (SAT — cheapest verification, biggest CPU supply).
 - **Phase 2 — lanes (~4–6 wk).** Lane engine + the five lanes' dispatch/verify/score. Routing vector wired to the weight-setter. Canonical work queues live. Demand-preempt + burn.
 - **Phase 3 — Sandbox rentals (~6–10 wk).** Host-agent (cloud-hypervisor/QEMU + TDX/SNP + VFIO passthrough), measured guest image + build pipeline, attested SSH (host-key binding), control-plane API + CLI + MCP. CC-CPU pods first, CC-GPU second.
 - **Phase 4 — Core (rented-split) (~2–3 wk).** `suppliers/` module (Lium/Vast/RunPod backends), challenge harness + tolerance bounds, judge deployment. Opens the commodity-GPU floodgates for SAT / eval / open-model jobs.
 - **Phase 5 — settlement.** EVM Verification contract when off-subnet customers need trustless payment. Composite attestation for CC-GPU Sandbox. Confidential-K8s if demanded.
 
-**Sizing:** attestation-gated subnet core ≈ 1–2k LOC; full rentable platform ≈ 5–7k LOC; +2–3k for Core's verification harness and the EVM contract. Real cost is not lines — it is the guest-image build pipeline and the firmware/driver matrix (BIOS access, HGX firmware versions, per-platform Ubuntu). Dev hardware is the critical path: an SNP EPYC box now, a TDX host and a CC-capable H100/H200 for Phases 3–4.
+**Sizing:** attestation-gated subnet core ≈ 1–2k LOC; full rentable platform ≈ 5–7k LOC; +2–3k for Core's verification harness and the EVM contract. Real cost is not lines — it is the guest-image build pipeline and the firmware/driver matrix (BIOS access, HGX firmware versions, per-platform Ubuntu). Dev hardware is the critical path: a TDX CPU box now, then SNP and a CC-capable H100/H200 for later platform coverage.
 
 ---
 

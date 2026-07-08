@@ -17,8 +17,11 @@ here — miners *serve* attestation, validators never touch miner machines.
 ## Read first
 
 - [`HANDOFF.md`](HANDOFF.md) — **start here to run or commission.** Run the
-  testable core in 5 minutes, or commission a real SEV-SNP box and build the
-  first hardware attestation test (Phase 1, the critical path).
+  testable core in 5 minutes. The original handoff is SNP-first; launch work is
+  now TDX CPU first because live Cathedral supply is already on a GCP TDX CVM.
+- [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) — **current launch path.** Use the
+  live TDX CPU box to prove real attestation, then port the same interface to
+  SNP after launch.
 - [`docs/DESIGN.md`](docs/DESIGN.md) — the founding design. Products, supply
   chains, the lane model, emissions, attestation core, rental delivery, the
   thin on-chain cut, and the phased build plan.
@@ -52,9 +55,11 @@ docs/DESIGN.md           founding design
 
 ## Status
 
-Phase 0. See `docs/DESIGN.md §10` for the phase plan. The census probe and the
-evidence schema are the first hardware-free deliverables; the attestor and
-verifier need an SNP-capable EPYC box to develop against (the critical path).
+Phase 0 / Phase 1 bridge. The hardware-free core is green, and the launch path
+is TDX CPU first. The TDX collector uses Linux configfs-tsm; validator-side
+verification delegates DCAP / Trust Authority crypto to an external verifier and
+then enforces Cathedral's nonce, hotkey, measurement, TCB, and platform-id
+policy.
 
 ## License
 

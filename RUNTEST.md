@@ -27,8 +27,12 @@ points import cleanly) and pulls in `pytest`. No runtime deps beyond the stdlib.
 Expected:
 
 ```
-40 passed
+44 passed, 1 skipped
 ```
+
+The skipped test is the hardware-gated TDX round trip in
+`tests/test_attest_tdx_hw.py`; it only runs on a TDX CVM when
+`CATHEDRAL_RUN_TDX_HW=1` and verifier env vars are set.
 
 ## 3. Run the SAT demo
 
