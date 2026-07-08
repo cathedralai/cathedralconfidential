@@ -56,7 +56,7 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
       "report_data": "<hex or base64>",
       "measurement": "<MRTD or policy measurement>",
       "tcb": 1,
-      "platform_id": "<stable physical platform id>"
+      "platform_id": "<sybil-dedup platform key>"
     }
 
     The command is invoked as ``$CATHEDRAL_TDX_VERIFY_CMD <quote-file>``.
@@ -76,6 +76,11 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
 
     measurement = _claim_str(claims, "measurement", "mrtd", "td_measurement")
     if not measurement or measurement not in policy.allowed_measurements:
+        return None
+
+    if policy.min_tcb > 0 and _claim_str(claims, "tcb_svn") and not _claim_str(
+        claims, "tcb_status", "tdx_tcb_status"
+    ):
         return None
 
     tcb = _claim_int(claims, "tcb", "tcb_svn", default=-1)

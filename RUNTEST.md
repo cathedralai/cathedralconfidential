@@ -27,7 +27,7 @@ points import cleanly) and pulls in `pytest`. No runtime deps beyond the stdlib.
 Expected:
 
 ```
-53 passed, 3 skipped
+63 passed, 3 skipped
 ```
 
 The skipped tests are the hardware-gated TDX quote round trip, SAT lane e2e,

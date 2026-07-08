@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Adapt Polaris attestor-verify output to Cathedral's TDX verifier JSON.
 
-This is a launch adapter, not a TDX quote parser. The Polaris binary performs
-Intel-chain verification and report_data matching. Until Cathedral has a full
-quote-claim parser, measurement/platform/tcb are explicit operator-pinned
-inputs and this script refuses to emit claims without them.
+The Polaris binary performs Intel-chain verification and report_data matching.
+This adapter then parses policy claims from the same verified raw quote bytes.
 """
 
 from __future__ import annotations
@@ -18,22 +16,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-TDX_V4_REPORT_DATA_START = 568
-TDX_REPORT_DATA_SIZE = 64
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-
-def _env_or_arg(value: str | None, env_name: str) -> str:
-    selected = value or os.environ.get(env_name, "")
-    if not selected:
-        raise SystemExit(f"missing required --{env_name.lower().replace('_', '-')} or {env_name}")
-    return selected
-
-
-def _report_data_from_quote(quote: bytes) -> bytes:
-    end = TDX_V4_REPORT_DATA_START + TDX_REPORT_DATA_SIZE
-    if len(quote) < end:
-        raise SystemExit(f"TDX quote too short to contain report_data: {len(quote)} bytes")
-    return quote[TDX_V4_REPORT_DATA_START:end]
+from cathedral.verify.tdx_quote import TdxQuoteParseError, parse_tdx_quote
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -46,9 +31,11 @@ def _read_json(path: Path) -> dict[str, Any]:
     return parsed
 
 
-def _run_attestor_verify(bin_path: str, quote_path: Path, report_data_hex: str) -> dict[str, Any]:
+def _run_attestor_verify(bin_path: str, quote: bytes, report_data_hex: str) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="cathedral-tdx-verify-") as td:
+        quote_path = Path(td) / "quote.bin"
         out_path = Path(td) / "verify.json"
+        quote_path.write_bytes(quote)
         proc = subprocess.run(
             [bin_path, str(quote_path), report_data_hex, str(out_path)],
             check=False,
@@ -61,6 +48,11 @@ def _run_attestor_verify(bin_path: str, quote_path: Path, report_data_hex: str) 
         return _read_json(out_path)
 
 
+def _require_true(verifier: dict[str, Any], key: str, failure: str) -> None:
+    if verifier.get(key) is not True:
+        raise SystemExit(failure)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("quote", type=Path, help="raw TDX quote file")
@@ -69,48 +61,41 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN", "attestor-verify"),
         help="path to Polaris attestor-verify binary",
     )
-    parser.add_argument(
-        "--measurement",
-        default=None,
-        help="operator-pinned launch measurement (or CATHEDRAL_TDX_MEASUREMENT)",
-    )
-    parser.add_argument(
-        "--platform-id",
-        default=None,
-        help="stable launch platform id (or CATHEDRAL_TDX_PLATFORM_ID)",
-    )
-    parser.add_argument(
-        "--tcb",
-        type=int,
-        default=None,
-        help="operator-pinned TCB floor value (or CATHEDRAL_TDX_TCB)",
-    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    measurement = _env_or_arg(args.measurement, "CATHEDRAL_TDX_MEASUREMENT")
-    platform_id = _env_or_arg(args.platform_id, "CATHEDRAL_TDX_PLATFORM_ID")
-    tcb_text = str(args.tcb if args.tcb is not None else os.environ.get("CATHEDRAL_TDX_TCB", ""))
-    if not tcb_text:
-        raise SystemExit("missing required --tcb or CATHEDRAL_TDX_TCB")
 
     quote = args.quote.read_bytes()
-    report_data_hex = _report_data_from_quote(quote).hex()
-    verifier = _run_attestor_verify(args.attestor_verify, args.quote, report_data_hex)
-    if not bool(verifier.get("intel_verified")):
-        raise SystemExit("attestor-verify did not verify Intel TDX silicon")
-    if not bool(verifier.get("report_data_match")):
-        raise SystemExit("attestor-verify reported a report_data mismatch")
+    try:
+        parsed_quote = parse_tdx_quote(quote)
+    except TdxQuoteParseError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    report_data_hex = parsed_quote.report_data.hex()
+    verifier = _run_attestor_verify(args.attestor_verify, quote, report_data_hex)
+    _require_true(verifier, "intel_verified", "attestor-verify did not verify Intel TDX silicon")
+    _require_true(verifier, "report_data_match", "attestor-verify reported a report_data mismatch")
 
     print(
         json.dumps(
             {
                 "report_data": report_data_hex,
-                "measurement": measurement,
-                "tcb": int(tcb_text, 0),
-                "platform_id": platform_id,
+                "measurement": parsed_quote.measurement,
+                "tcb": parsed_quote.tcb,
+                "tcb_svn": parsed_quote.tcb_svn,
+                "platform_id": parsed_quote.platform_id,
+                "tdx_pck_cert_id": parsed_quote.platform_id,
+                "tdx_attestation_key_id": parsed_quote.attestation_key_id,
+                "tdx_certification_data_type": parsed_quote.certification_data_type,
+                "mrtd": parsed_quote.body.mr_td.hex(),
+                "rtmrs": [rtmr.hex() for rtmr in parsed_quote.body.rtmrs],
+                "mr_config_id": parsed_quote.body.mr_config_id.hex(),
+                "mr_owner": parsed_quote.body.mr_owner.hex(),
+                "mr_owner_config": parsed_quote.body.mr_owner_config.hex(),
+                "td_attributes": parsed_quote.body.td_attributes.hex(),
+                "xfam": parsed_quote.body.xfam.hex(),
                 "intel_verified": True,
                 "report_data_match": True,
                 "collateral_urls": verifier.get("collateral_urls", []),

@@ -50,7 +50,7 @@ claims:
   "report_data": "<hex or base64>",
   "measurement": "<MRTD or policy measurement>",
   "tcb": 1,
-  "platform_id": "<stable physical platform id>"
+  "platform_id": "<sybil-dedup platform key>"
 }
 ```
 
@@ -59,23 +59,30 @@ Cathedral then enforces:
 - `REPORTDATA == report_data(nonce, hotkey, ssh_host_key?)`
 - `measurement in policy.allowed_measurements`
 - `tcb >= policy.min_tcb`
-- `platform_id` is present and becomes the sybil-dedup key
+- `platform_id` is present and becomes the Phase 1 sybil-dedup key
 
 For the current Polaris TDX launch box, use the adapter in
 `scripts/tdx_verify_json.py` with the Polaris `attestor-verify` binary:
 
 ```bash
 export CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify
-export CATHEDRAL_TDX_MEASUREMENT='<published-launch-measurement>'
-export CATHEDRAL_TDX_PLATFORM_ID='<stable-launch-platform-id>'
-export CATHEDRAL_TDX_TCB=0
 export CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py'
 ```
 
 The adapter fails closed unless `attestor-verify` returns both
-`intel_verified=true` and `report_data_match=true`. Measurement, platform id,
-and TCB are operator-pinned launch metadata until Cathedral carries a full TDX
-quote-claim parser.
+`intel_verified=true` and `report_data_match=true`. It then parses policy
+claims from the same verified quote bytes: a canonical Cathedral TDX
+measurement over TD identity fields, `tee_tcb_svn`, REPORTDATA, MRTD, RTMRs,
+TD attributes, XFAM, the TDX attestation-key fingerprint, and a
+`tdx-pck-cert-sha256:*` PCK leaf certificate fingerprint used as the Phase 1
+`platform_id`. Package-stable platform identity and richer DCAP TCB status
+semantics remain post-launch hardening.
+
+Keep `CATHEDRAL_TDX_MIN_TCB=0` for this adapter until DCAP TCB status is
+plumbed through. The adapter exports raw `tee_tcb_svn` for auditability, but
+Cathedral rejects positive TCB floors when only raw `tcb_svn` is available.
+The PCK certificate fingerprint is also certificate-specific; it is a Phase 1
+dedup key, not a package-stable identity guarantee.
 
 ## Hardware Test
 
@@ -88,10 +95,7 @@ sudo env \
   CATHEDRAL_RUN_TDX_HW=1 \
   CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py' \
   CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify \
-  CATHEDRAL_TDX_MEASUREMENT='<published-launch-measurement>' \
-  CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<published-launch-measurement>' \
-  CATHEDRAL_TDX_PLATFORM_ID='<stable-launch-platform-id>' \
-  CATHEDRAL_TDX_TCB=0 \
+  CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<tdx-measurement-sha256:...>' \
   python -m pytest tests/test_attest_tdx_hw.py -q
 ```
 
@@ -103,14 +107,11 @@ sudo env \
   CATHEDRAL_RUN_TDX_HW=1 \
   CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py' \
   CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify \
-  CATHEDRAL_TDX_MEASUREMENT='<published-launch-measurement>' \
-  CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<published-launch-measurement>' \
-  CATHEDRAL_TDX_PLATFORM_ID='<stable-launch-platform-id>' \
-  CATHEDRAL_TDX_TCB=0 \
+  CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<tdx-measurement-sha256:...>' \
   python -m pytest tests/test_tdx_sat_e2e_hw.py -q
 ```
 
-Optional:
+Phase 1 defaults:
 
 ```bash
 export CATHEDRAL_TDX_MIN_TCB=0
@@ -138,8 +139,11 @@ python -m pytest tests/test_attest_tdx_negative.py -q
 
 Latest live evidence, July 8, 2026:
 
-- Hardware-free local suite: `53 passed, 3 skipped`.
+- Hardware-free local suite: `63 passed, 3 skipped`.
 - Live TDX CVM with Polaris `attestor-verify` adapter:
+  parsed `tdx-measurement-sha256:24da9c7003a1199293951b8e9acbf5ae0bf94b209b6958c1c3651892df5e02ce`,
+  `tdx-pck-cert-sha256:cac3ee7282e1c79c9d3bcfcad2125dce41d7ef773cf61655693b51e968baa5a2`,
+  and `tee_tcb_svn=0d010800000000000000000000000000`;
   `tests/test_attest_tdx_hw.py tests/test_tdx_sat_e2e_hw.py` -> `2 passed`.
 - Live verifier smoke returned an 8000-byte quote with
   `intel_verified=true`, `report_data_match=true`, 64-byte `report_data`, and

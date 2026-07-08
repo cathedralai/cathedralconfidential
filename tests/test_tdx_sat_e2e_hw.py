@@ -4,8 +4,9 @@ Run on a TDX CVM only:
 
     sudo env \
       CATHEDRAL_RUN_TDX_HW=1 \
-      CATHEDRAL_TDX_VERIFY_CMD='tdx-verifier-json' \
-      CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<measurement>' \
+      CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py' \
+      CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify \
+      CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<tdx-measurement-sha256:...>' \
       python -m pytest tests/test_tdx_sat_e2e_hw.py -q
 """
 

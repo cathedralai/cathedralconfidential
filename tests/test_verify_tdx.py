@@ -32,6 +32,8 @@ print(json.dumps({
     "report_data": os.environ["FAKE_REPORT_DATA"],
     "measurement": os.environ["FAKE_MEASUREMENT"],
     "tcb": int(os.environ["FAKE_TCB"]),
+    **({"tcb_svn": os.environ["FAKE_TCB_SVN"]} if "FAKE_TCB_SVN" in os.environ else {}),
+    **({"tcb_status": os.environ["FAKE_TCB_STATUS"]} if "FAKE_TCB_STATUS" in os.environ else {}),
     "platform_id": os.environ["FAKE_PLATFORM_ID"],
     "intel_verified": os.environ.get("FAKE_INTEL_VERIFIED", "true"),
     "report_data_match": os.environ.get("FAKE_REPORT_DATA_MATCH", "true"),
@@ -88,6 +90,22 @@ def test_tdx_verify_rejects_disallowed_measurement(tmp_path, monkeypatch):
 
     evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
     policy = Policy(allowed_measurements={"other-measurement"}, min_tcb=0)
+
+    assert verify(evidence, nonce, policy) is None
+
+
+def test_tdx_verify_rejects_positive_tcb_floor_for_raw_tcb_svn(tmp_path, monkeypatch):
+    nonce = issue_nonce()
+    hotkey = "hotkey-tdx"
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path))
+    monkeypatch.setenv("FAKE_REPORT_DATA", report_data(nonce, hotkey).hex())
+    monkeypatch.setenv("FAKE_MEASUREMENT", "tdx-measurement-1")
+    monkeypatch.setenv("FAKE_TCB", "999")
+    monkeypatch.setenv("FAKE_TCB_SVN", "0d010800000000000000000000000000")
+    monkeypatch.setenv("FAKE_PLATFORM_ID", "tdx-platform-1")
+
+    evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
+    policy = Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=1)
 
     assert verify(evidence, nonce, policy) is None
 
