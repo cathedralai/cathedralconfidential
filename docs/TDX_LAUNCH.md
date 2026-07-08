@@ -63,13 +63,24 @@ Cathedral then enforces:
 
 ## Hardware Test
 
-Run this on the TDX CVM once the verifier command is installed:
+Run quote collection + verification on the TDX CVM once the verifier command is
+installed:
 
 ```bash
 CATHEDRAL_RUN_TDX_HW=1 \
 CATHEDRAL_TDX_VERIFY_CMD='tdx-verifier-json' \
 CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<measurement>' \
 python -m pytest tests/test_attest_tdx_hw.py -q
+```
+
+Run the full launch lane path on the TDX CVM:
+
+```bash
+sudo env \
+  CATHEDRAL_RUN_TDX_HW=1 \
+  CATHEDRAL_TDX_VERIFY_CMD='tdx-verifier-json' \
+  CATHEDRAL_TDX_ALLOWED_MEASUREMENT='<measurement>' \
+  python -m pytest tests/test_tdx_sat_e2e_hw.py -q
 ```
 
 Optional:
@@ -83,6 +94,7 @@ export CATHEDRAL_TDX_TSM_REPORT_ROOT=/sys/kernel/config/tsm/report
 
 - Hardware-free suite stays green.
 - `tests/test_attest_tdx_hw.py` passes on the live TDX CVM.
+- `tests/test_tdx_sat_e2e_hw.py` passes on the live TDX CVM.
 - A validator epoch can admit a real TDX-attested miner and still produce
   conserved weights.
 - SNP remains a second CPU platform port, not a launch blocker.

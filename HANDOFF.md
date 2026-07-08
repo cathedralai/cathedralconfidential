@@ -51,7 +51,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 
-python -m pytest -q             # expect: 44 passed, 1 skipped
+python -m pytest -q             # expect: 47 passed, 2 skipped
 python scripts/demo_sat.py      # expect: ... PASS
 python -m cathedral.census      # prints CC capability of THIS box (exit 1 if none)
 ```
@@ -249,7 +249,7 @@ produces weights. That is the first real proof the subnet gates on hardware.
 
 Track A (any box):
 - [ ] `pip install -e '.[dev]'` succeeds
-- [ ] `python -m pytest -q` → **44 passed, 1 skipped**
+- [ ] `python -m pytest -q` → **47 passed, 2 skipped**
 - [ ] `python scripts/demo_sat.py` → **PASS**
 
 Track B (SNP box):

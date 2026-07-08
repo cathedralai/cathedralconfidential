@@ -17,10 +17,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from cathedral.common import Attested, EvidenceKind, Policy, Tier
+from cathedral.attest import collect_tdx
+from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier
 from cathedral.lanes.sat import solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.verify.mock import mock_evidence, verify_mock
+
+
+def _solve_sat_work(item: SatWorkItem) -> SatCertificate:
+    assignment = solve_sat(item.instance)
+    if assignment is None:
+        return SatCertificate(satisfiable=False, assignment=None, work_units=1.0)
+    return SatCertificate(
+        satisfiable=True,
+        assignment=assignment,
+        work_units=float(len(item.instance.clauses)),
+    )
 
 
 @dataclass
@@ -67,14 +79,27 @@ class MockMiner:
         is claimed with no assignment (DRAT proof in production).
         """
 
-        assignment = solve_sat(item.instance)
-        if assignment is None:
-            return SatCertificate(satisfiable=False, assignment=None, work_units=1.0)
-        return SatCertificate(
-            satisfiable=True,
-            assignment=assignment,
-            work_units=float(len(item.instance.clauses)),
-        )
+        return _solve_sat_work(item)
+
+
+@dataclass
+class TdxMiner:
+    """A local TDX miner adapter for the launch path.
+
+    It serves raw TDX ``Evidence`` bound to the validator nonce. The validator
+    verifies that evidence with DCAP / Trust Authority via ``cathedral.verify``,
+    then runs the same SAT work path as the mock miner.
+    """
+
+    uid: str
+    hotkey: str
+    ssh_host_key: bytes | None = None
+
+    def collect_evidence(self, nonce: bytes) -> Evidence:
+        return collect_tdx(nonce, self.hotkey, self.ssh_host_key)
+
+    def do_sat_work(self, item: SatWorkItem) -> SatCertificate:
+        return _solve_sat_work(item)
 
 
 def main() -> None:

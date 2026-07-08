@@ -16,13 +16,16 @@ stub with clear markers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable, Protocol, Sequence
 
 from cathedral.api import Inventory
-from cathedral.common import Policy, issue_nonce
+from cathedral.common import Attested, Evidence, Policy, issue_nonce
 from cathedral.economics import apply_routing
 from cathedral.lanes import ROUTING_VECTOR
 from cathedral.lanes.sat import SatLane
+from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.neuron.miner import MockMiner
+from cathedral.verify import verify
 
 # The attestation floor: valid TEE evidence + liveness earns this thin base,
 # the remainder is competed for as verified work (docs/DESIGN.md §5).
@@ -37,6 +40,16 @@ class EpochResult:
     weights: dict[str, float]
     burn: float
     admitted: list[str]
+
+
+class EvidenceMiner(Protocol):
+    """A miner that serves raw attestation evidence and SAT work."""
+
+    uid: str
+
+    def collect_evidence(self, nonce: bytes) -> Evidence: ...
+
+    def do_sat_work(self, item: SatWorkItem) -> SatCertificate: ...
 
 
 def epoch(
@@ -94,6 +107,60 @@ def epoch(
         lane_scores[lane.name][miner.uid] = lane.score(miner.uid, [accepted])
 
     # --- emissions: route work through the vector, conserve to 1.0 ---
+    weights, burn = apply_routing(lane_scores, routing, floor=floor)
+    return EpochResult(weights=weights, burn=burn, admitted=admitted)
+
+
+def attested_epoch(
+    miners: Sequence[EvidenceMiner],
+    policy: Policy,
+    *,
+    floor: float = ATTESTATION_FLOOR,
+    routing: dict[str, float] | None = None,
+    verifier: Callable[[Evidence, bytes, Policy], Attested | None] = verify,
+) -> EpochResult:
+    """Run one epoch using real attestation evidence.
+
+    This is the launch-path equivalent of ``epoch``: challenge each miner, ask
+    for raw ``Evidence``, vendor-verify it through ``cathedral.verify.verify``,
+    admit by physical platform id, run SAT, then route emissions.
+    """
+
+    routing = routing if routing is not None else dict(ROUTING_VECTOR)
+
+    inventory = Inventory()
+    lane = SatLane()
+    seen_chip: dict[str, str] = {}
+    admitted: list[str] = []
+    lane_scores: dict[str, dict[str, float]] = {lane.name: {}}
+
+    for miner in miners:
+        nonce = issue_nonce()
+        evidence = miner.collect_evidence(nonce)
+        if evidence.nonce != nonce:
+            continue
+
+        attested = verifier(evidence, nonce, policy)
+        if attested is None:
+            continue
+
+        if attested.chip_id in seen_chip:
+            continue
+        seen_chip[attested.chip_id] = miner.uid
+
+        if not lane.qualify(attested):
+            continue
+        inventory.register(miner.uid, attested)
+        admitted.append(miner.uid)
+
+        item = lane.dispatch(miner.uid, budget=0)
+        cert = miner.do_sat_work(item)
+        accepted = lane.verify(item, cert)
+        if accepted is None:
+            lane_scores[lane.name][miner.uid] = 0.0
+            continue
+        lane_scores[lane.name][miner.uid] = lane.score(miner.uid, [accepted])
+
     weights, burn = apply_routing(lane_scores, routing, floor=floor)
     return EpochResult(weights=weights, burn=burn, admitted=admitted)
 
