@@ -61,6 +61,22 @@ Cathedral then enforces:
 - `tcb >= policy.min_tcb`
 - `platform_id` is present and becomes the sybil-dedup key
 
+For the current Polaris TDX launch box, use the adapter in
+`scripts/tdx_verify_json.py` with the Polaris `attestor-verify` binary:
+
+```bash
+export CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify
+export CATHEDRAL_TDX_MEASUREMENT='<published-launch-measurement>'
+export CATHEDRAL_TDX_PLATFORM_ID='<stable-launch-platform-id>'
+export CATHEDRAL_TDX_TCB=0
+export CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py'
+```
+
+The adapter fails closed unless `attestor-verify` returns both
+`intel_verified=true` and `report_data_match=true`. Measurement, platform id,
+and TCB are operator-pinned launch metadata until Cathedral carries a full TDX
+quote-claim parser.
+
 ## Hardware Test
 
 Run quote collection + verification on the TDX CVM once the verifier command is
