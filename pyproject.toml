@@ -11,10 +11,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+# stdlib-only runtime; the only third-party dependency anywhere is pytest (dev).
+dev = ["pytest>=8.0"]
 
 [project.scripts]
+cathedral = "cathedral.cli:main"
 cathedral-census = "cathedral.census:main"
+cathedral-validator = "cathedral.neuron.validator:main"
+cathedral-miner = "cathedral.neuron.miner:main"
 
 [build-system]
 requires = ["hatchling"]
