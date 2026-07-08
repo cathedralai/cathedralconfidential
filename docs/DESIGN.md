@@ -2,7 +2,7 @@
 
 **A confidential compute subnet that directs attested hardware at verifiable work.**
 
-Status: founding design. Supersedes the "verified GPU rental marketplace" thesis inherited from the Basilica fork.
+Status: founding design. Supersedes the earlier "verified GPU rental marketplace" thesis.
 
 ---
 
