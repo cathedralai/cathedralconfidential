@@ -54,7 +54,12 @@ def test_rejects_wrong_nonce_binding():
     assert verify_snp_report_data(report, wrong_request_data, _policy_for(report)) is None
 
 
-def test_chain_unavailable_is_not_verified():
+def test_chain_unavailable_rejects_by_default():
+    """The admission path fails closed: no vendor chain means no Attested.
+
+    A structurally valid report with a forged signature must never become an
+    admission ticket on a box that happens to lack snpguest.
+    """
     report = REPORT.read_bytes()
     request_data = REQUEST_DATA.read_bytes()
 
@@ -63,6 +68,21 @@ def test_chain_unavailable_is_not_verified():
         request_data,
         _policy_for(report),
         snpguest_path="/definitely/not/snpguest",
+    )
+
+    assert verdict is None
+
+
+def test_chain_unavailable_diagnostic_status_via_opt_in():
+    report = REPORT.read_bytes()
+    request_data = REQUEST_DATA.read_bytes()
+
+    verdict = verify_snp_report_data(
+        report,
+        request_data,
+        _policy_for(report),
+        snpguest_path="/definitely/not/snpguest",
+        require_chain=False,
     )
 
     assert verdict is not None

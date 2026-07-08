@@ -188,8 +188,16 @@ def verify_snp_report_data(
     *,
     snpguest_path: str | os.PathLike[str] | None = None,
     certs_dir: str | os.PathLike[str] | None = None,
+    require_chain: bool = True,
 ) -> Attested | None:
-    """Verify a raw SNP report against explicit 64-byte REPORT_DATA."""
+    """Verify a raw SNP report against explicit 64-byte REPORT_DATA.
+
+    Fail-closed by default: every existing caller treats ANY ``Attested`` as an
+    admission ticket, so without a vendor-verified signature chain the default
+    verdict is ``None``. Diagnostic/shadow tooling that wants the parsed report
+    with an explicit ``STRUCTURE_OK_CHAIN_UNVERIFIED`` status can opt in with
+    ``require_chain=False`` — that verdict must never be used for admission.
+    """
 
     if len(expected_report_data) != REPORT_DATA_SIZE:
         raise ValueError("expected REPORT_DATA must be exactly 64 bytes")
@@ -217,6 +225,9 @@ def verify_snp_report_data(
                 if attempt == 2:
                     return None
                 time.sleep(1)
+
+    if require_chain and not chain_verified:
+        return None
 
     status = VERIFIED if chain_verified else STRUCTURE_OK_CHAIN_UNVERIFIED
     return Attested(
