@@ -27,7 +27,7 @@ points import cleanly) and pulls in `pytest`. No runtime deps beyond the stdlib.
 Expected:
 
 ```
-39 passed
+40 passed
 ```
 
 ## 3. Run the SAT demo
