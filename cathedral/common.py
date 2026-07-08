@@ -50,6 +50,8 @@ class Attested:
     chip_id: str          # SNP CHIP_ID / TDX platform id / certified GPU UUID
     measurement: str      # the attested measurement, matched against policy
     tcb: int              # trusted computing base version
+    verification_status: str = "VERIFIED"
+    chain_verified: bool = True
 
 
 def issue_nonce() -> bytes:
