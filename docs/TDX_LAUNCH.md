@@ -90,11 +90,21 @@ export CATHEDRAL_TDX_MIN_TCB=0
 export CATHEDRAL_TDX_TSM_REPORT_ROOT=/sys/kernel/config/tsm/report
 ```
 
+Run the negative control on a plain Linux CPU host. This should fail before
+quote collection because the host does not expose the TDX configfs-tsm report
+root:
+
+```bash
+CATHEDRAL_RUN_TDX_NEGATIVE=1 \
+python -m pytest tests/test_attest_tdx_negative.py -q
+```
+
 ## Definition Of Done
 
 - Hardware-free suite stays green.
 - `tests/test_attest_tdx_hw.py` passes on the live TDX CVM.
 - `tests/test_tdx_sat_e2e_hw.py` passes on the live TDX CVM.
+- `tests/test_attest_tdx_negative.py` fails closed on a non-TDX CPU host.
 - A validator epoch can admit a real TDX-attested miner and still produce
   conserved weights.
 - SNP remains a second CPU platform port, not a launch blocker.

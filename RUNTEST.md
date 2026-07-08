@@ -27,12 +27,12 @@ points import cleanly) and pulls in `pytest`. No runtime deps beyond the stdlib.
 Expected:
 
 ```
-47 passed, 2 skipped
+48 passed, 3 skipped
 ```
 
-The skipped tests are the hardware-gated TDX quote round trip and SAT lane e2e
-tests; they only run on a TDX CVM when `CATHEDRAL_RUN_TDX_HW=1` and verifier env
-vars are set.
+The skipped tests are the hardware-gated TDX quote round trip, SAT lane e2e,
+and non-TDX negative-control tests. They only run when `CATHEDRAL_RUN_TDX_HW=1`
+or `CATHEDRAL_RUN_TDX_NEGATIVE=1` is set on the right machine.
 
 ## 3. Run the SAT demo
 
