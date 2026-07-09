@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from typing import Any
 from wsgiref.simple_server import make_server
 
-from cathedral.attest import collect_snp
-from cathedral.common import Attested, EvidenceKind, Policy, Tier
+from cathedral.attest import collect_gpu_cc, collect_snp
+from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier
 from cathedral.lanes.sat import solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.verify.mock import mock_evidence, verify_mock
@@ -106,22 +106,11 @@ class EvidenceApp:
             requested_hotkey = payload.get("hotkey")
             if requested_hotkey is not None and requested_hotkey != self.hotkey:
                 raise ValueError("hotkey mismatch")
-            evidence = collect_snp(nonce, self.hotkey)
-            body = {
-                "kind": evidence.kind.value,
-                "quote_b64": base64.b64encode(evidence.quote).decode("ascii"),
-                "nonce_hex": evidence.nonce.hex(),
-                "miner_hotkey": evidence.miner_hotkey,
-                "cert_chain_b64": [
-                    base64.b64encode(cert).decode("ascii") for cert in evidence.cert_chain
-                ],
-                "ssh_host_key_b64": (
-                    base64.b64encode(evidence.ssh_host_key).decode("ascii")
-                    if evidence.ssh_host_key is not None
-                    else None
-                ),
-                "composite_jwt": evidence.composite_jwt,
-            }
+            evidences = [
+                collect_snp(nonce, self.hotkey),
+                collect_gpu_cc(nonce, self.hotkey),
+            ]
+            body = {"evidence": [self._evidence_json(evidence) for evidence in evidences]}
             return self._json(start_response, 200, body)
         except (KeyError, ValueError, json.JSONDecodeError) as exc:
             return self._json(start_response, 400, {"error": str(exc)})
@@ -142,6 +131,24 @@ class EvidenceApp:
             [("Content-Type", "application/json"), ("Content-Length", str(len(body)))],
         )
         return [body]
+
+    @staticmethod
+    def _evidence_json(evidence: Evidence) -> dict[str, Any]:
+        return {
+            "kind": evidence.kind.value,
+            "quote_b64": base64.b64encode(evidence.quote).decode("ascii"),
+            "nonce_hex": evidence.nonce.hex(),
+            "miner_hotkey": evidence.miner_hotkey,
+            "cert_chain_b64": [
+                base64.b64encode(cert).decode("ascii") for cert in evidence.cert_chain
+            ],
+            "ssh_host_key_b64": (
+                base64.b64encode(evidence.ssh_host_key).decode("ascii")
+                if evidence.ssh_host_key is not None
+                else None
+            ),
+            "composite_jwt": evidence.composite_jwt,
+        }
 
 
 def main() -> None:

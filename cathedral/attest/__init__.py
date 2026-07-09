@@ -66,9 +66,10 @@ def collect_tdx(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) ->
 def collect_gpu_cc(nonce: bytes, hotkey: str) -> Evidence:
     """NVIDIA GPU attestation report via NVML / nvtrust.
 
-    TODO(phase1): pull the GPU attestation report; compose with the host CPU
-    TEE quote via Intel Trust Authority into a single JWT (docs/DESIGN.md §6).
+    Enrollment requires GPU CC evidence in addition to SNP evidence. Until the
+    NVIDIA NRAS/local verifier path is implemented, this collector fails closed
+    instead of emitting placeholder evidence.
     """
 
-    _ = EvidenceKind.GPU_CC
-    raise NotImplementedError("GPU CC collector — Phase 1, needs a CC-capable H100/H200")
+    _ = (nonce, hotkey, EvidenceKind.GPU_CC)
+    raise RuntimeError("GPU CC collector unavailable; CC enrollment fails closed")

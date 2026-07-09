@@ -22,6 +22,9 @@ def verify(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
       3. check measurement in policy.allowed_measurements and tcb >= min_tcb
       4. extract chip_id (SNP CHIP_ID / TDX platform id / GPU UUID) for
          free sybil defense (one machine -> one UID)
+
+    Unsupported evidence kinds return None. They are rejections, not process
+    errors, so one miner cannot kill the prober loop.
     """
 
     expected = report_data(nonce, evidence.miner_hotkey, evidence.ssh_host_key)
@@ -30,7 +33,7 @@ def verify(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
     if evidence.kind is EvidenceKind.SEV_SNP:
         return verify_snp(evidence, nonce, policy)
     if evidence.kind is EvidenceKind.TDX:
-        raise NotImplementedError("TDX verify — Phase 1 (DCAP / Trust Authority)")
+        return None
     if evidence.kind is EvidenceKind.GPU_CC:
-        raise NotImplementedError("GPU CC verify — Phase 1 (NRAS / nvtrust + composite JWT)")
+        return None
     return None

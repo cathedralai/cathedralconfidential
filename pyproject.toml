@@ -6,12 +6,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
+  "substrate-interface>=1.7,<2",
   # bittensor SDK added in Phase 1 when chain integration lands
   # "bittensor>=8.0",
 ]
 
 [project.optional-dependencies]
-# stdlib-only runtime; the only third-party dependency anywhere is pytest (dev).
 dev = ["pytest>=8.0"]
 
 [project.scripts]
