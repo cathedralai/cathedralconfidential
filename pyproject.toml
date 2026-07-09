@@ -17,8 +17,10 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 cathedral = "cathedral.cli:main"
 cathedral-census = "cathedral.census:main"
+cathedral-enroll = "cathedral.enroll:main"
 cathedral-validator = "cathedral.neuron.validator:main"
 cathedral-miner = "cathedral.neuron.miner:main"
+cathedral-prober = "cathedral.prober:main"
 
 [build-system]
 requires = ["hatchling"]

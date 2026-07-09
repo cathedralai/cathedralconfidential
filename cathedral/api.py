@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable
 
 from cathedral.common import Attested, Tier
+from cathedral.enroll import RegistryApp, RegistryStore
 from cathedral.lanes import WorkItem
 
 

@@ -15,8 +15,14 @@ Phase-1 stub with clear markers.
 
 from __future__ import annotations
 
+import argparse
+import base64
+import json
 from dataclasses import dataclass
+from typing import Any
+from wsgiref.simple_server import make_server
 
+from cathedral.attest import collect_snp
 from cathedral.common import Attested, EvidenceKind, Policy, Tier
 from cathedral.lanes.sat import solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
@@ -77,11 +83,78 @@ class MockMiner:
         )
 
 
+class EvidenceApp:
+    """Miner-side HTTP evidence endpoint served to validators/probers."""
+
+    def __init__(self, hotkey: str) -> None:
+        self.hotkey = hotkey
+
+    def __call__(self, environ: dict[str, Any], start_response: Any) -> list[bytes]:
+        try:
+            if environ.get("REQUEST_METHOD") != "POST" or environ.get("PATH_INFO") != "/v1/evidence":
+                return self._json(start_response, 404, {"error": "not found"})
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or "0")
+            except ValueError as exc:
+                raise ValueError("invalid content length") from exc
+            if length <= 0 or length > 16 * 1024:
+                raise ValueError("invalid body size")
+            payload = json.loads(environ["wsgi.input"].read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("json body must be an object")
+            nonce = bytes.fromhex(payload["nonce_hex"])
+            requested_hotkey = payload.get("hotkey")
+            if requested_hotkey is not None and requested_hotkey != self.hotkey:
+                raise ValueError("hotkey mismatch")
+            evidence = collect_snp(nonce, self.hotkey)
+            body = {
+                "kind": evidence.kind.value,
+                "quote_b64": base64.b64encode(evidence.quote).decode("ascii"),
+                "nonce_hex": evidence.nonce.hex(),
+                "miner_hotkey": evidence.miner_hotkey,
+                "cert_chain_b64": [
+                    base64.b64encode(cert).decode("ascii") for cert in evidence.cert_chain
+                ],
+                "ssh_host_key_b64": (
+                    base64.b64encode(evidence.ssh_host_key).decode("ascii")
+                    if evidence.ssh_host_key is not None
+                    else None
+                ),
+                "composite_jwt": evidence.composite_jwt,
+            }
+            return self._json(start_response, 200, body)
+        except (KeyError, ValueError, json.JSONDecodeError) as exc:
+            return self._json(start_response, 400, {"error": str(exc)})
+        except Exception as exc:
+            return self._json(start_response, 503, {"error": str(exc)})
+
+    @staticmethod
+    def _json(start_response: Any, status: int, payload: dict[str, Any]) -> list[bytes]:
+        reason = {
+            200: "OK",
+            400: "Bad Request",
+            404: "Not Found",
+            503: "Service Unavailable",
+        }.get(status, "OK")
+        body = json.dumps(payload, sort_keys=True).encode("utf-8")
+        start_response(
+            f"{status} {reason}",
+            [("Content-Type", "application/json"), ("Content-Length", str(len(body)))],
+        )
+        return [body]
+
+
 def main() -> None:
-    # TODO(phase1): bittensor registration; serve an authenticated attestation
-    # endpoint (attest.collect_* bound to the validator's nonce + this hotkey);
-    # advertise tier + lane subscriptions; run lane work loops.
-    raise NotImplementedError("miner neuron main — Phase 1 (real registration + attestation)")
+    parser = argparse.ArgumentParser(description="Serve Cathedral miner TEE evidence")
+    parser.add_argument("--hotkey", required=True)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8090)
+    args = parser.parse_args()
+
+    app = EvidenceApp(args.hotkey)
+    with make_server(args.host, args.port, app) as server:
+        print(f"serving miner evidence on http://{args.host}:{args.port}")
+        server.serve_forever()
 
 
 if __name__ == "__main__":

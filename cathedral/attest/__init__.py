@@ -9,18 +9,47 @@ first, then a TDX host and a CC-capable H100/H200.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
 from cathedral.common import Evidence, EvidenceKind, report_data
 
 
 def collect_snp(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) -> Evidence:
     """AMD SEV-SNP report via /dev/sev-guest with bound REPORT_DATA.
 
-    TODO(phase1): call snpguest / ioctl(/dev/sev-guest) with
-    report_data(nonce, hotkey, ssh_host_key); attach the VCEK cert chain.
+    Requires a real SNP guest with /dev/sev-guest and the snpguest CLI:
+
+        snpguest report <out-report> <request-data-file>
     """
 
-    _ = report_data(nonce, hotkey, ssh_host_key)
-    raise NotImplementedError("SNP collector — Phase 1, needs an SNP-capable EPYC box")
+    snpguest = shutil.which("snpguest")
+    if snpguest is None:
+        raise RuntimeError("snpguest not found")
+
+    request_data = report_data(nonce, hotkey, ssh_host_key)
+    with tempfile.TemporaryDirectory() as td:
+        work = Path(td)
+        report_path = work / "attestation-report.bin"
+        request_data_path = work / "request-data.bin"
+        request_data_path.write_bytes(request_data)
+        subprocess.run(
+            [snpguest, "report", str(report_path), str(request_data_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        quote = report_path.read_bytes()
+
+    return Evidence(
+        kind=EvidenceKind.SEV_SNP,
+        quote=quote,
+        nonce=nonce,
+        miner_hotkey=hotkey,
+        ssh_host_key=ssh_host_key,
+    )
 
 
 def collect_tdx(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) -> Evidence:
