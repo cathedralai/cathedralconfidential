@@ -305,42 +305,82 @@ def policy_from_args(args: argparse.Namespace) -> Policy:
     return Policy(allowed_measurements=measurements, min_tcb=args.min_tcb)
 
 
+def _verify_tdx_evidence(
+    evidences: list[Evidence],
+    nonce: bytes,
+    policy: Policy,
+) -> Attested | None:
+    """TDX-CPU launch path: a single verified TDX evidence is sufficient.
+
+    Returns an ``Attested(CC_CPU_TDX)`` verdict only when the verifier returns
+    an ``Attested`` with ``verification_status == "VERIFIED"`` and
+    ``tier == Tier.CC_CPU_TDX``.  Any other outcome (None, wrong status, wrong
+    tier) rejects.
+    """
+    tdx = next(
+        (e for e in evidences if e.kind is EvidenceKind.TDX), None
+    )
+    if tdx is None:
+        return None
+
+    attested = verifier.verify(tdx, nonce, policy)
+    if (
+        attested is None
+        or attested.verification_status != "VERIFIED"
+        or attested.tier is not Tier.CC_CPU_TDX
+    ):
+        return None
+    return attested
+
+
 def verify_cc_evidence_bundle(
     evidences: list[Evidence],
     nonce: bytes,
     policy: Policy,
 ) -> Attested | None:
-    """Enrollment requires both a verified SNP guest and verified GPU CC evidence.
+    """Verify an evidence bundle and return an admission verdict.
 
-    GPU verification is intentionally still fail-closed. Until the NVIDIA NRAS
-    or local verifier is wired in, ``verifier.verify`` returns ``None`` for
-    GPU_CC evidence and this bundle cannot produce an admission verdict.
+    Launch paths tried in order:
+
+    1. **GPU composite** (SNP + GPU_CC): both must be VERIFIED.  GPU
+       verification is intentionally still fail-closed -- until the NVIDIA
+       NRAS or local verifier is wired in, ``verifier.verify`` returns
+       ``None`` for GPU_CC evidence and this path cannot produce a verdict.
+
+    2. **TDX-CPU**: a single TDX evidence with ``VERIFIED`` status and
+       ``CC_CPU_TDX`` tier is sufficient.
+
+    Returns ``None`` (reject) when no path produces a verdict.
     """
 
-    snp = next((evidence for evidence in evidences if evidence.kind is EvidenceKind.SEV_SNP), None)
-    gpu = next((evidence for evidence in evidences if evidence.kind is EvidenceKind.GPU_CC), None)
-    if snp is None or gpu is None:
-        return None
+    # --- GPU composite path (fail-closed) ---
+    snp = next((e for e in evidences if e.kind is EvidenceKind.SEV_SNP), None)
+    gpu = next((e for e in evidences if e.kind is EvidenceKind.GPU_CC), None)
+    if snp is not None and gpu is not None:
+        snp_attested = verifier.verify(snp, nonce, policy)
+        gpu_attested = verifier.verify(gpu, nonce, policy)
+        if (
+            snp_attested is not None
+            and gpu_attested is not None
+            and snp_attested.verification_status == "VERIFIED"
+            and gpu_attested.verification_status == "VERIFIED"
+        ):
+            measurement = hashlib.sha256(
+                f"snp:{snp_attested.measurement}\ngpu:{gpu_attested.measurement}".encode("utf-8")
+            ).hexdigest()
+            return Attested(
+                tier=Tier.CC_GPU,
+                chip_id=snp_attested.chip_id,
+                measurement=measurement,
+                tcb=min(snp_attested.tcb, gpu_attested.tcb),
+            )
 
-    snp_attested = verifier.verify(snp, nonce, policy)
-    gpu_attested = verifier.verify(gpu, nonce, policy)
-    if (
-        snp_attested is None
-        or gpu_attested is None
-        or snp_attested.verification_status != "VERIFIED"
-        or gpu_attested.verification_status != "VERIFIED"
-    ):
-        return None
+    # --- TDX-CPU path ---
+    tdx_result = _verify_tdx_evidence(evidences, nonce, policy)
+    if tdx_result is not None:
+        return tdx_result
 
-    measurement = hashlib.sha256(
-        f"snp:{snp_attested.measurement}\ngpu:{gpu_attested.measurement}".encode("utf-8")
-    ).hexdigest()
-    return Attested(
-        tier=Tier.CC_GPU,
-        chip_id=snp_attested.chip_id,
-        measurement=measurement,
-        tcb=min(snp_attested.tcb, gpu_attested.tcb),
-    )
+    return None
 
 
 def probe_once(

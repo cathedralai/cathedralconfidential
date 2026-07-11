@@ -28,7 +28,7 @@ from pathlib import Path
 from cathedral import census as census_mod
 from cathedral.api import WorkQueue
 from cathedral.common import Policy
-from cathedral.lanes.sat import SatLane
+from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 
 DEFAULT_QUEUE_FILE = Path(".cathedral_queue.json")
@@ -57,11 +57,25 @@ def _save_pending(path: Path, pending: list[dict]) -> None:
 
 
 def _item_to_dict(item: SatWorkItem) -> dict:
-    return {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses, "seed": item.seed}
+    return {
+        "n_vars": item.instance.n_vars,
+        "clauses": item.instance.clauses,
+        "seed": item.seed,
+        "challenge_id": item.challenge_id,
+    }
 
 
 def _dict_to_item(d: dict) -> SatWorkItem:
-    return SatWorkItem(instance=SatInstance(n_vars=d["n_vars"], clauses=d["clauses"]), seed=d["seed"])
+    instance = SatInstance(n_vars=d["n_vars"], clauses=d["clauses"])
+    # Legacy queue entries may lack challenge_id; recompute and validate.
+    stored_id = d.get("challenge_id")
+    computed_id = _compute_challenge_id(instance, d["seed"])
+    if stored_id is not None and stored_id != computed_id:
+        raise ValueError(
+            f"persisted challenge_id {stored_id} does not match "
+            f"recomputed {computed_id} for seed={d['seed']}"
+        )
+    return SatWorkItem(instance=instance, seed=d["seed"], challenge_id=computed_id)
 
 
 def _build_queue(pending: list[dict]) -> WorkQueue:
@@ -98,7 +112,9 @@ def cmd_work_submit(args: argparse.Namespace) -> int:
     if args.clauses is not None:
         clauses = json.loads(args.clauses)
         instance = SatInstance(n_vars=args.n_vars, clauses=clauses)
-        item = SatWorkItem(instance=instance, seed=args.seed or 0)
+        seed = args.seed or 0
+        challenge_id = _compute_challenge_id(instance, seed)
+        item = SatWorkItem(instance=instance, seed=seed, challenge_id=challenge_id)
     else:
         # No explicit job given: backfill one canonical instance to submit.
         dispatched = SatLane().dispatch("cli-submit", budget=1)
