@@ -27,11 +27,17 @@ from cathedral.verify.mock import mock_evidence, verify_mock
 def _solve_sat_work(item: SatWorkItem) -> SatCertificate:
     assignment = solve_sat(item.instance)
     if assignment is None:
-        return SatCertificate(satisfiable=False, assignment=None, work_units=1.0)
+        return SatCertificate(
+            satisfiable=False,
+            assignment=None,
+            work_units=1.0,
+            challenge_id=item.challenge_id,
+        )
     return SatCertificate(
         satisfiable=True,
         assignment=assignment,
         work_units=float(len(item.instance.clauses)),
+        challenge_id=item.challenge_id,
     )
 
 

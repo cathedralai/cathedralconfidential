@@ -30,41 +30,53 @@ def test_known_unsat_instance_yields_none():
 
 
 def test_verify_accepts_true_certificate():
+    lane = SatLane()
     inst = SatInstance(n_vars=3, clauses=[[1, 2], [-1, 3], [-2, -3]])
     assignment = solve_sat(inst)
     assert assignment is not None
-    item = SatWorkItem(instance=inst, seed=0, challenge_id=_compute_challenge_id(inst, 0))
-    cert = SatCertificate(satisfiable=True, assignment=assignment, work_units=1.0)
-    assert SatLane().verify(item, cert) is not None
+    challenge_id = _compute_challenge_id(inst, 0)
+    item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
+    lane._issued_ids.add(challenge_id)
+    cert = SatCertificate(satisfiable=True, assignment=assignment, work_units=1.0, challenge_id=challenge_id)
+    assert lane.verify(item, cert) is not None
 
 
 def test_verify_rejects_forged_assignment():
     # clause [1, 2] needs var1 or var2 true; the forged assignment sets both false.
+    lane = SatLane()
     inst = SatInstance(n_vars=3, clauses=[[1, 2], [-1, 3], [-2, -3]])
-    item = SatWorkItem(instance=inst, seed=0, challenge_id=_compute_challenge_id(inst, 0))
-    forged = SatCertificate(satisfiable=True, assignment=[-1, -2, -3], work_units=1.0)
-    assert SatLane().verify(item, forged) is None
+    challenge_id = _compute_challenge_id(inst, 0)
+    item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
+    lane._issued_ids.add(challenge_id)
+    forged = SatCertificate(satisfiable=True, assignment=[-1, -2, -3], work_units=1.0, challenge_id=challenge_id)
+    assert lane.verify(item, forged) is None
 
 
 def test_verify_rejects_wrong_satisfiable_flag():
     # A satisfiable instance falsely claimed UNSAT must be rejected.
+    lane = SatLane()
     inst = SatInstance(n_vars=3, clauses=[[1, 2], [-1, 3], [-2, -3]])
-    item = SatWorkItem(instance=inst, seed=0, challenge_id=_compute_challenge_id(inst, 0))
-    wrong = SatCertificate(satisfiable=False, assignment=None, work_units=1.0)
-    assert SatLane().verify(item, wrong) is None
+    challenge_id = _compute_challenge_id(inst, 0)
+    item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
+    lane._issued_ids.add(challenge_id)
+    wrong = SatCertificate(satisfiable=False, assignment=None, work_units=1.0, challenge_id=challenge_id)
+    assert lane.verify(item, wrong) is None
 
 
 def test_verify_accepts_true_unsat_certificate():
+    lane = SatLane()
     inst = SatInstance(n_vars=1, clauses=[[1], [-1]])
-    item = SatWorkItem(instance=inst, seed=0, challenge_id=_compute_challenge_id(inst, 0))
-    cert = SatCertificate(satisfiable=False, assignment=None, work_units=1.0)
-    assert SatLane().verify(item, cert) is not None
+    challenge_id = _compute_challenge_id(inst, 0)
+    item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
+    lane._issued_ids.add(challenge_id)
+    cert = SatCertificate(satisfiable=False, assignment=None, work_units=1.0, challenge_id=challenge_id)
+    assert lane.verify(item, cert) is not None
 
 
 def test_score_sums_work_units():
     certs = [
-        SatCertificate(satisfiable=True, assignment=[1], work_units=2.0),
-        SatCertificate(satisfiable=True, assignment=[1], work_units=3.0),
+        SatCertificate(satisfiable=True, assignment=[1], work_units=2.0, challenge_id="c1"),
+        SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c2"),
     ]
     assert SatLane().score("miner-x", certs) == 5.0
 
@@ -96,9 +108,12 @@ def test_verify_rejects_contradictory_assignment():
     from cathedral.lanes.sat import SatLane, _compute_challenge_id
     from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
+    lane = SatLane()
     # Instance over 2 vars; the forged assignment repeats var 1 with both signs
     # and omits var 2 (still length 2), trying to satisfy a clause dishonestly.
     inst = SatInstance(n_vars=2, clauses=[[1], [-1]])  # actually UNSAT as SAT claim
-    item = SatWorkItem(instance=inst, seed=0, challenge_id=_compute_challenge_id(inst, 0))
-    forged = SatCertificate(satisfiable=True, assignment=[1, -1], work_units=2.0)
-    assert SatLane().verify(item, forged) is None
+    challenge_id = _compute_challenge_id(inst, 0)
+    item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
+    lane._issued_ids.add(challenge_id)
+    forged = SatCertificate(satisfiable=True, assignment=[1, -1], work_units=2.0, challenge_id=challenge_id)
+    assert lane.verify(item, forged) is None

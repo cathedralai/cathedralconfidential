@@ -56,8 +56,12 @@ class SatCertificate(Certificate):
 
     ``work_units`` is the difficulty-weighted credit for the solve; the lane's
     score() sums it across a miner's accepted certificates.
+
+    ``challenge_id`` echoes the ID from the SatWorkItem to prevent duplicate
+    crediting and detect mismatched submissions.
     """
 
     satisfiable: bool
     assignment: list[int] | None
     work_units: float
+    challenge_id: str  # echoed from SatWorkItem

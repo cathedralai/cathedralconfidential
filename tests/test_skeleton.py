@@ -40,6 +40,7 @@ def test_epoch_admits_runs_sat_and_conserves_weights():
             satisfiable=True,
             assignment=assignment,
             work_units=float(len(item.instance.clauses)),
+            challenge_id=item.challenge_id,
         )
         accepted = lane.verify(item, cert)
         assert accepted is not None

@@ -158,9 +158,15 @@ class SatLane(Lane):
 
     name = "sat_benchmark"
 
-    def __init__(self) -> None:
+    def __init__(self, namespace: str | None = None) -> None:
         self._queue: list[SatWorkItem] = []
+        # Fresh instances should not emit the same first ID. Use a random
+        # namespace to prevent collision across epochs while keeping the SAT
+        # instance reproducible from (namespace, counter).
+        self._namespace = namespace or hashlib.sha256(random.randbytes(16)).hexdigest()[:8]
         self._seed_counter = 0
+        self._issued_ids: set[str] = set()
+        self._credited_ids: set[str] = set()
 
     def qualify(self, attested: Attested) -> bool:
         return attested.tier in _QUALIFIED_TIERS
@@ -177,18 +183,31 @@ class SatLane(Lane):
 
     def dispatch(self, miner: str, budget: int) -> WorkItem:
         if self._queue:
-            return self._queue.pop(0)
+            item = self._queue.pop(0)
+            self._issued_ids.add(item.challenge_id)
+            return item
 
-        seed = self._seed_counter
+        # Use namespace + counter for deterministic but non-colliding seeds
+        seed = hash((self._namespace, self._seed_counter)) & 0x7FFFFFFF
         self._seed_counter += 1
         instance = _canonical_instance(seed)
         challenge_id = _compute_challenge_id(instance, seed)
+        self._issued_ids.add(challenge_id)
         return SatWorkItem(instance=instance, seed=seed, challenge_id=challenge_id)
 
     def verify(self, item: WorkItem, result: object) -> Certificate | None:
         assert isinstance(item, SatWorkItem)
         if not isinstance(result, SatCertificate):
             return None
+
+        # Challenge accounting: require matching challenge_id, reject unissued,
+        # already-credited, or mismatched IDs.
+        if result.challenge_id != item.challenge_id:
+            return None  # mismatch
+        if result.challenge_id not in self._issued_ids:
+            return None  # unissued
+        if result.challenge_id in self._credited_ids:
+            return None  # already credited
 
         instance = item.instance
 
@@ -215,19 +234,25 @@ class SatLane(Lane):
             for clause in instance.clauses:
                 if not any(lit in true_lits for lit in clause):
                     return None
+            # Mark credited only after full validation passes
+            self._credited_ids.add(result.challenge_id)
             return SatCertificate(
                 satisfiable=True,
                 assignment=result.assignment,
                 work_units=validator_work_units,
+                challenge_id=result.challenge_id,
             )
 
         # UNSAT claim: testable core re-solves to confirm (Phase-2: DRAT proof).
         if solve_sat(instance) is not None:
             return None
+        # Mark credited only after full validation passes
+        self._credited_ids.add(result.challenge_id)
         return SatCertificate(
             satisfiable=False,
             assignment=None,
             work_units=validator_work_units,
+            challenge_id=result.challenge_id,
         )
 
     def score(self, miner: str, certs: list[Certificate]) -> float:
@@ -238,10 +263,20 @@ class SatLane(Lane):
         to validator-derived non-negative finite values, but we guard here too
         in case certs are constructed outside verify() or are manually forged.
 
+        Defensively count each challenge_id at most once — even though verify()
+        should prevent duplicates, this guards against replayed certs.
+
         Returns the total accumulated work_units, or 0.0 if no valid certs.
         """
         total = 0.0
+        seen_ids: set[str] = set()
         for c in certs:
+            # Skip if challenge_id is missing or already seen
+            cid = getattr(c, "challenge_id", None)
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+
             wu = getattr(c, "work_units", 0.0)
             # Must be a number and must be finite and non-negative.
             if not isinstance(wu, (int, float)):
