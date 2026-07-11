@@ -22,6 +22,27 @@ Treat it as live infrastructure. Initial probes should only request attestation
 evidence and inspect read-only capability state. Do not restart services, change
 config, or stop the VM as part of attestation development.
 
+## Verifier Subprocess Controls
+
+The validator-side subprocess verifier is governed by three environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `CATHEDRAL_TDX_VERIFY_CMD` | *(required)* | Command (plus any fixed args) that receives the quote file path as a final argument and must print a JSON claims object to stdout. |
+| `CATHEDRAL_TDX_VERIFY_TIMEOUT` | `30` | Seconds before the subprocess is killed. Timeout causes the miner to be rejected without hanging the epoch. |
+| `CATHEDRAL_TDX_VERIFY_MAX_OUTPUT` | `1048576` (1 MiB) | Maximum bytes of stdout (or stderr) accepted. Output exceeding this limit is rejected without parsing. |
+
+Acceptance requires both `intel_verified` and `report_data_match` to be the
+exact JSON boolean `true`. Missing fields, JSON strings (`"true"`), integers
+(`1`), `null`, or `false` all reject.
+
+The subprocess itself is rejected (returns no claims) if:
+- it exceeds `CATHEDRAL_TDX_VERIFY_TIMEOUT` seconds
+- it exits with a nonzero code
+- its stdout or stderr exceeds `CATHEDRAL_TDX_VERIFY_MAX_OUTPUT` bytes
+- its stdout is not valid JSON
+- its stdout is valid JSON but not an object
+
 ## Interface
 
 The miner-side collector is:

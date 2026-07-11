@@ -4,6 +4,11 @@ Vendors do the cryptography (AMD KDS cert chains, Intel DCAP / Trust Authority,
 NVIDIA NRAS / nvtrust); this module does policy — allowed measurements, minimum
 TCB, allowed firmware — and returns an `Attested` verdict or None.
 See docs/DESIGN.md §6.
+
+Env controls for the TDX subprocess verifier:
+  CATHEDRAL_TDX_VERIFY_CMD        Command (+ args) to invoke; receives quote path.
+  CATHEDRAL_TDX_VERIFY_TIMEOUT    Seconds before the subprocess is killed (default 30).
+  CATHEDRAL_TDX_VERIFY_MAX_OUTPUT Max bytes of stdout+stderr accepted (default 1 048 576).
 """
 
 from __future__ import annotations
@@ -64,9 +69,11 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
     """
 
     claims = _run_tdx_verifier(evidence.quote)
-    if _claim_bool(claims, "intel_verified") is False:
+    # Both flags must be the exact JSON boolean true; missing, malformed, or
+    # false (including string forms and integers) all reject.
+    if _claim_bool(claims, "intel_verified") is not True:
         return None
-    if _claim_bool(claims, "report_data_match") is False:
+    if _claim_bool(claims, "report_data_match") is not True:
         return None
 
     actual_report_data = _claim_bytes(claims, "report_data")
@@ -99,7 +106,16 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
     )
 
 
+_DEFAULT_VERIFY_TIMEOUT = 30
+_DEFAULT_MAX_OUTPUT = 1024 * 1024  # 1 MiB
+
+
 def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
+    """Invoke the external TDX verifier and return its parsed JSON claims.
+
+    Returns an empty dict on any failure so callers can treat every field as
+    absent and reject accordingly.
+    """
     cmd = os.environ.get("CATHEDRAL_TDX_VERIFY_CMD")
     if not cmd:
         raise NotImplementedError(
@@ -107,23 +123,43 @@ def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
             "(DCAP or Intel Trust Authority JSON verifier)"
         )
 
+    try:
+        timeout = int(os.environ.get("CATHEDRAL_TDX_VERIFY_TIMEOUT", str(_DEFAULT_VERIFY_TIMEOUT)))
+    except ValueError:
+        timeout = _DEFAULT_VERIFY_TIMEOUT
+    try:
+        max_output = int(
+            os.environ.get("CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", str(_DEFAULT_MAX_OUTPUT))
+        )
+    except ValueError:
+        max_output = _DEFAULT_MAX_OUTPUT
+
     with tempfile.TemporaryDirectory(prefix="cathedral-tdx-") as td:
         quote_path = Path(td) / "quote.bin"
         quote_path.write_bytes(quote)
-        proc = subprocess.run(
-            [*shlex.split(cmd), str(quote_path)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            proc = subprocess.run(
+                [*shlex.split(cmd), str(quote_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {}  # reject: verifier exceeded time budget
 
     if proc.returncode != 0:
-        return {}
+        return {}  # reject: verifier signalled failure
+
+    # Guard against oversized output before parsing.
+    if len(proc.stdout) > max_output or len(proc.stderr) > max_output:
+        return {}  # reject: output exceeded size budget
+
     try:
         parsed = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        return {}  # reject: not valid JSON
+    return parsed if isinstance(parsed, dict) else {}  # reject: not an object
 
 
 def _claim_bytes(claims: dict[str, Any], key: str) -> bytes:

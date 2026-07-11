@@ -11,6 +11,13 @@ routing, driven against MOCKED attestation. The MOCK boundary is the only
 substitution — everything downstream of an ``Attested`` verdict is the real
 Phase-2 code path. ``main`` (real chain + hardware collectors) stays a Phase-1
 stub with clear markers.
+
+Fault isolation in ``attested_epoch``:
+  Each miner’s collection + verification phase is wrapped in its own try/except
+  so a misbehaving miner (exception in collect_evidence, the verifier, or
+  do_sat_work) cannot abort the epoch for its peers. A miner that fails
+  admission is simply skipped; one that fails work keeps its attestation floor
+  but earns no work score.
 """
 
 from __future__ import annotations
@@ -135,31 +142,42 @@ def attested_epoch(
     lane_scores: dict[str, dict[str, float]] = {lane.name: {}}
 
     for miner in miners:
-        nonce = issue_nonce()
-        evidence = miner.collect_evidence(nonce)
-        if evidence.nonce != nonce:
-            continue
+        # --- Phase 1: collection + admission (isolated per miner) -----------
+        # Any exception here (network, malformed evidence, verifier crash)
+        # is caught so a bad miner cannot abort its peers.
+        try:
+            nonce = issue_nonce()
+            evidence = miner.collect_evidence(nonce)
+            if evidence.nonce != nonce:
+                continue
 
-        attested = verifier(evidence, nonce, policy)
-        if attested is None:
-            continue
+            attested = verifier(evidence, nonce, policy)
+            if attested is None:
+                continue
 
-        if attested.chip_id in seen_chip:
-            continue
-        seen_chip[attested.chip_id] = miner.uid
+            if attested.chip_id in seen_chip:
+                continue
+            seen_chip[attested.chip_id] = miner.uid
 
-        if not lane.qualify(attested):
-            continue
-        inventory.register(miner.uid, attested)
-        admitted.append(miner.uid)
+            if not lane.qualify(attested):
+                continue
+            inventory.register(miner.uid, attested)
+            admitted.append(miner.uid)
+        except Exception:  # noqa: BLE001
+            continue  # admission failure — skip, do not propagate
 
-        item = lane.dispatch(miner.uid, budget=0)
-        cert = miner.do_sat_work(item)
-        accepted = lane.verify(item, cert)
-        if accepted is None:
-            lane_scores[lane.name][miner.uid] = 0.0
-            continue
-        lane_scores[lane.name][miner.uid] = lane.score(miner.uid, [accepted])
+        # --- Phase 2: work (isolated per admitted miner) --------------------
+        # Admitted miner earns at least the attestation floor; work exceptions
+        # leave the work score at 0.0 rather than aborting the epoch.
+        lane_scores[lane.name][miner.uid] = 0.0
+        try:
+            item = lane.dispatch(miner.uid, budget=0)
+            cert = miner.do_sat_work(item)
+            accepted = lane.verify(item, cert)
+            if accepted is not None:
+                lane_scores[lane.name][miner.uid] = lane.score(miner.uid, [accepted])
+        except Exception:  # noqa: BLE001
+            pass  # work failure — miner keeps floor, peers unaffected
 
     weights, burn = apply_routing(lane_scores, routing, floor=floor)
     return EpochResult(weights=weights, burn=burn, admitted=admitted)
