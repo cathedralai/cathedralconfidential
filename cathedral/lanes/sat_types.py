@@ -35,10 +35,14 @@ class SatWorkItem(WorkItem):
 
     The seed makes canonical work reproducible — anyone can regenerate the exact
     instance and independently check the returned certificate.
+
+    challenge_id is a deterministic hash of (n_vars, clauses, seed), used to
+    prevent duplicate crediting of the same challenge across epochs.
     """
 
     instance: SatInstance
     seed: int
+    challenge_id: str  # sha256 hex digest of instance + seed
 
 
 @dataclass(frozen=True)

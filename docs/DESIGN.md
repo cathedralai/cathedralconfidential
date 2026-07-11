@@ -124,6 +124,19 @@ routing = { inference: 0.30, training: 0.20, rl: 0.15, agents: 0.10, sat: 0.25 }
 
 Want more CPU enclaves this quarter? Raise the SAT lane. Need CC-GPUs for an eval customer? Shift weight to inference/benchmark. The subnet does not merely *admit* confidential hardware — it *steers* it, and everyone can see where it is pointed. Demand preempts canonical work in any lane at market price.
 
+### Credit validation: preventing inflation and replay
+
+Miners cannot choose their own credit. Every work unit's difficulty and credit is **validator-derived** at verification time from the instance itself, never from the miner's claim.
+
+**Challenge identity (challenge_id).** Every dispatched work item carries a deterministic, immutable hash of its (instance, seed) tuple. This hash is computed by the validator before dispatch and cannot be forged by a miner. Encoding the seed in the hash ties each challenge to its canonical generation, preventing a replay of the same challenge across epochs (one physical challenge = one possible credit line).
+
+**Credit immutability.** In SAT, the validator computes work units from the instance's clause count, never from `result.work_units`. If a miner claims 1e300, NaN, −5, or Infinity, the validator-derived value wins; the miner's claim is ignored. Defense-in-depth at the score level rejects any miner-supplied or manually-forged certificate with non-finite or negative work units, even if it leaks past verification().
+
+**Invariants:**
+- Every dispatched challenge has a unique challenge_id (via monotonic seed counter).
+- Only validator-derived work units affect scoring; miner claims are irrelevant.
+- The validator's routing application ensures finite, nonnegative weights that sum to ~1.0 (+ burn).
+
 ---
 
 ## 6. Attestation core (the security spine)

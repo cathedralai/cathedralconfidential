@@ -64,9 +64,11 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
     """
 
     claims = _run_tdx_verifier(evidence.quote)
-    if _claim_bool(claims, "intel_verified") is False:
+    # TDX requires both flags to be explicitly True — absent or non-boolean
+    # values are treated as failures, not as "we don't know".
+    if _claim_bool(claims, "intel_verified") is not True:
         return None
-    if _claim_bool(claims, "report_data_match") is False:
+    if _claim_bool(claims, "report_data_match") is not True:
         return None
 
     actual_report_data = _claim_bytes(claims, "report_data")
@@ -99,6 +101,13 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
     )
 
 
+# Maximum wall-clock seconds we allow the external verifier to run.
+_VERIFIER_TIMEOUT = 30
+# Maximum bytes of stdout we accept from the verifier; a claim blob has no
+# business being larger.  Oversized output is rejected as malformed.
+_VERIFIER_OUTPUT_LIMIT = 65536  # 64 KiB
+
+
 def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
     cmd = os.environ.get("CATHEDRAL_TDX_VERIFY_CMD")
     if not cmd:
@@ -110,14 +119,20 @@ def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="cathedral-tdx-") as td:
         quote_path = Path(td) / "quote.bin"
         quote_path.write_bytes(quote)
-        proc = subprocess.run(
-            [*shlex.split(cmd), str(quote_path)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            proc = subprocess.run(
+                [*shlex.split(cmd), str(quote_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_VERIFIER_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return {}
 
     if proc.returncode != 0:
+        return {}
+    if len(proc.stdout) > _VERIFIER_OUTPUT_LIMIT:
         return {}
     try:
         parsed = json.loads(proc.stdout)

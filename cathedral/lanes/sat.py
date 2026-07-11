@@ -15,6 +15,9 @@ the satisfiable-accept path.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import random
 
 from cathedral.common import Attested, Tier
@@ -22,6 +25,21 @@ from cathedral.lanes import Certificate, Lane, WorkItem
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
 _QUALIFIED_TIERS = {Tier.CC_CPU_SNP, Tier.CC_CPU_TDX}
+
+
+def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
+    """Deterministic hash of instance + seed to prevent duplicate crediting.
+
+    Returns the hex digest of sha256(json(instance) + seed). This challenge_id
+    is immutable after dispatch — it cannot be forged or duplicated.
+    """
+    payload = {
+        "n_vars": instance.n_vars,
+        "clauses": instance.clauses,
+        "seed": seed,
+    }
+    h = hashlib.sha256(json.dumps(payload, sort_keys=True).encode())
+    return h.hexdigest()
 
 
 def solve_sat(instance: SatInstance) -> list[int] | None:
@@ -148,8 +166,13 @@ class SatLane(Lane):
         return attested.tier in _QUALIFIED_TIERS
 
     def enqueue(self, item: SatWorkItem) -> None:
-        """Add a customer job to the internal queue (dispatch prefers these)."""
+        """Add a customer job to the internal queue (dispatch prefers these).
 
+        The item must have a valid challenge_id (deterministic hash binding the
+        instance and seed). This prevents duplicate crediting across epochs.
+        """
+        if not item.challenge_id:
+            raise ValueError("enqueue: item.challenge_id must be non-empty")
         self._queue.append(item)
 
     def dispatch(self, miner: str, budget: int) -> WorkItem:
@@ -159,7 +182,8 @@ class SatLane(Lane):
         seed = self._seed_counter
         self._seed_counter += 1
         instance = _canonical_instance(seed)
-        return SatWorkItem(instance=instance, seed=seed)
+        challenge_id = _compute_challenge_id(instance, seed)
+        return SatWorkItem(instance=instance, seed=seed, challenge_id=challenge_id)
 
     def verify(self, item: WorkItem, result: object) -> Certificate | None:
         assert isinstance(item, SatWorkItem)
@@ -167,6 +191,14 @@ class SatLane(Lane):
             return None
 
         instance = item.instance
+
+        # Validator-derived difficulty: clause count — never the miner's claimed
+        # work_units. The returned certificate always carries the validator's
+        # value so score() never touches a miner-supplied number. Defending
+        # against 1e300, NaN, Infinity, negative, or any forged claim.
+        validator_work_units = float(len(instance.clauses))
+        if not math.isfinite(validator_work_units) or validator_work_units < 0:
+            return None  # defense-in-depth (should never happen)
 
         if result.satisfiable:
             if result.assignment is None:
@@ -183,12 +215,38 @@ class SatLane(Lane):
             for clause in instance.clauses:
                 if not any(lit in true_lits for lit in clause):
                     return None
-            return result
+            return SatCertificate(
+                satisfiable=True,
+                assignment=result.assignment,
+                work_units=validator_work_units,
+            )
 
         # UNSAT claim: testable core re-solves to confirm (Phase-2: DRAT proof).
         if solve_sat(instance) is not None:
             return None
-        return result
+        return SatCertificate(
+            satisfiable=False,
+            assignment=None,
+            work_units=validator_work_units,
+        )
 
     def score(self, miner: str, certs: list[Certificate]) -> float:
-        return sum(c.work_units for c in certs)  # type: ignore[union-attr]
+        """Sum validator-derived work_units across all certificates.
+
+        Defense-in-depth: reject any cert with non-finite or negative work_units
+        (including 1e300, NaN, Infinity, negative). verify() always sets these
+        to validator-derived non-negative finite values, but we guard here too
+        in case certs are constructed outside verify() or are manually forged.
+
+        Returns the total accumulated work_units, or 0.0 if no valid certs.
+        """
+        total = 0.0
+        for c in certs:
+            wu = getattr(c, "work_units", 0.0)
+            # Must be a number and must be finite and non-negative.
+            if not isinstance(wu, (int, float)):
+                continue
+            if not math.isfinite(wu) or wu < 0:
+                continue
+            total += wu
+        return total

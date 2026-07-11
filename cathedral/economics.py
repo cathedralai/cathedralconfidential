@@ -12,6 +12,8 @@ Three layers, sum-conserving to exactly 1.0:
 
 from __future__ import annotations
 
+import math
+
 
 def apply_routing(
     lane_scores: dict[str, dict[str, float]],
@@ -30,17 +32,26 @@ def apply_routing(
             weights[m] += share
 
     work_total = 1.0 - floor
-    denom = sum(routing.values())
+    # Guard: only finite, positive routing shares enter the denominator.
+    denom = sum(v for v in routing.values() if math.isfinite(v) and v > 0)
     if denom > 0:
         for lane, lane_share in routing.items():
+            if not math.isfinite(lane_share) or lane_share <= 0:
+                continue
             lane_budget = work_total * lane_share / denom
             miners = lane_scores.get(lane)
             if not miners:
                 continue
-            total_score = sum(miners.values())
+            # Guard: only finite, non-negative scores enter the total.
+            total_score = sum(
+                s for s in miners.values()
+                if isinstance(s, (int, float)) and math.isfinite(s) and s >= 0
+            )
             if total_score <= 0:
                 continue
             for m, score in miners.items():
+                if not isinstance(score, (int, float)) or not math.isfinite(score) or score < 0:
+                    continue
                 weights[m] = weights.get(m, 0.0) + lane_budget * score / total_score
 
     burn = 1.0 - sum(weights.values())
