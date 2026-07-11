@@ -149,3 +149,151 @@ def test_tdx_verify_requires_external_verifier(monkeypatch):
 
     with pytest.raises(NotImplementedError):
         verify(evidence, nonce, Policy(allowed_measurements={"m"}))
+
+
+def test_tdx_verify_rejects_unbounded_stdout_output(tmp_path, monkeypatch):
+    """Verify that a child writing excessive stdout is killed and rejected."""
+    nonce = issue_nonce()
+    hotkey = "hotkey-tdx"
+    script = tmp_path / "spam_verifier.py"
+    script.write_text(
+        """
+from __future__ import annotations
+
+import sys
+
+quote = open(sys.argv[-1], "rb").read()
+if quote != b"tdx-quote":
+    raise SystemExit(2)
+
+# Write 512 KB to stdout (exceeds typical 1 MB cap when combined with stderr)
+for _ in range(64):
+    print("x" * 8192)
+""".lstrip()
+    )
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", f"{sys.executable} {script}")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", "102400")  # 100 KB cap
+
+    evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
+    policy = Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=0)
+
+    # Should be rejected due to excessive output
+    assert verify(evidence, nonce, policy) is None
+
+
+def test_tdx_verify_rejects_unbounded_stderr_output(tmp_path, monkeypatch):
+    """Verify that a child writing excessive stderr is killed and rejected."""
+    nonce = issue_nonce()
+    hotkey = "hotkey-tdx"
+    script = tmp_path / "spam_stderr_verifier.py"
+    script.write_text(
+        """
+from __future__ import annotations
+
+import sys
+
+quote = open(sys.argv[-1], "rb").read()
+if quote != b"tdx-quote":
+    raise SystemExit(2)
+
+# Write 512 KB to stderr
+for _ in range(64):
+    print("y" * 8192, file=sys.stderr)
+""".lstrip()
+    )
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", f"{sys.executable} {script}")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", "102400")  # 100 KB cap
+
+    evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
+    policy = Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=0)
+
+    # Should be rejected due to excessive stderr
+    assert verify(evidence, nonce, policy) is None
+
+
+def test_tdx_verify_rejects_unbounded_concurrent_output(tmp_path, monkeypatch):
+    """Verify that concurrent stdout+stderr writes are capped together."""
+    nonce = issue_nonce()
+    hotkey = "hotkey-tdx"
+    script = tmp_path / "concurrent_spam_verifier.py"
+    script.write_text(
+        """
+from __future__ import annotations
+
+import sys
+import threading
+
+quote = open(sys.argv[-1], "rb").read()
+if quote != b"tdx-quote":
+    raise SystemExit(2)
+
+# Write 300 KB to stdout and 300 KB to stderr concurrently
+def spam_stdout():
+    for _ in range(38):
+        print("a" * 8192)
+
+def spam_stderr():
+    for _ in range(38):
+        print("b" * 8192, file=sys.stderr)
+
+t1 = threading.Thread(target=spam_stdout)
+t2 = threading.Thread(target=spam_stderr)
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+""".lstrip()
+    )
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", f"{sys.executable} {script}")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", "102400")  # 100 KB cap
+
+    evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
+    policy = Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=0)
+
+    # Should be rejected; combined output exceeds cap
+    assert verify(evidence, nonce, policy) is None
+
+
+def test_tdx_verify_accepts_output_within_cap(tmp_path, monkeypatch):
+    """Verify that output within the cap is accepted and parsed normally."""
+    nonce = issue_nonce()
+    hotkey = "hotkey-tdx"
+    script = tmp_path / "ok_verifier.py"
+    script.write_text(
+        f"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+quote = open(sys.argv[-1], "rb").read()
+if quote != b"tdx-quote":
+    raise SystemExit(2)
+
+# Output a valid JSON response plus a small warning on stderr
+print(json.dumps({{
+    "report_data": "{report_data(nonce, hotkey).hex()}",
+    "measurement": "tdx-measurement-1",
+    "tcb": 7,
+    "platform_id": "tdx-platform-1",
+    "intel_verified": True,
+    "report_data_match": True,
+}}))
+
+print("Warning: this is a test", file=sys.stderr)
+""".lstrip()
+    )
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", f"{sys.executable} {script}")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", "1048576")  # 1 MB cap
+
+    evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
+    policy = Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=7)
+
+    attested = verify(evidence, nonce, policy)
+
+    assert attested is not None
+    assert attested.tier is Tier.CC_CPU_TDX
+    assert attested.chip_id == "tdx-platform-1"
+    assert attested.measurement == "tdx-measurement-1"
+    assert attested.tcb == 7

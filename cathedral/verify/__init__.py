@@ -17,9 +17,11 @@ import base64
 import binascii
 import json
 import os
+import select
 import shlex
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +115,9 @@ _DEFAULT_MAX_OUTPUT = 1024 * 1024  # 1 MiB
 def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
     """Invoke the external TDX verifier and return its parsed JSON claims.
 
+    Enforces output cap during execution: kills subprocess if combined stdout+stderr
+    exceeds max_output, preventing memory exhaustion from unbounded child output.
+
     Returns an empty dict on any failure so callers can treat every field as
     absent and reject accordingly.
     """
@@ -142,28 +147,19 @@ def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
         quote_path = Path(td) / "quote.bin"
         quote_path.write_bytes(quote)
         try:
-            proc = subprocess.run(
+            stdout_str, stderr_str, returncode = _read_bounded_subprocess(
                 [*shlex.split(cmd), str(quote_path)],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                max_output,
+                timeout,
             )
         except subprocess.TimeoutExpired:
             return {}  # reject: verifier exceeded time budget
 
-    if proc.returncode != 0:
+    if returncode != 0:
         return {}  # reject: verifier signalled failure
 
-    # Measure combined stdout+stderr as encoded bytes against the cap.
-    # text=True in subprocess.run means stdout/stderr are strings (decoded);
-    # encode them to measure actual wire size for cap enforcement.
-    combined_bytes = len(proc.stdout.encode("utf-8")) + len(proc.stderr.encode("utf-8"))
-    if combined_bytes > max_output:
-        return {}  # reject: combined output exceeded size budget
-
     try:
-        parsed = json.loads(proc.stdout)
+        parsed = json.loads(stdout_str)
     except json.JSONDecodeError:
         return {}  # reject: not valid JSON
     return parsed if isinstance(parsed, dict) else {}  # reject: not an object
@@ -221,3 +217,94 @@ def _claim_bool(claims: dict[str, Any], key: str) -> bool | None:
     value = claims.get(key)
     # Only the exact boolean True is accepted; everything else rejects.
     return True if value is True else None
+
+
+def _read_bounded_subprocess(
+    cmd: list[str], max_output: int, timeout: int
+) -> tuple[str, str, int]:
+    """Run subprocess with bounded output capture.
+
+    Streams stdout+stderr and kills the process if combined output exceeds
+    max_output. Returns (stdout_str, stderr_str, returncode).
+
+    Raises subprocess.TimeoutExpired if the process exceeds timeout.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+
+    stdout_parts = []
+    stderr_parts = []
+    combined_bytes = 0
+    exceeds_cap = threading.Event()
+
+    def read_streams():
+        """Read from stdout/stderr without deadlock; kill if cap exceeded."""
+        nonlocal combined_bytes
+        sentinel_size = 1024
+        hard_limit = max_output + sentinel_size
+
+        while proc.poll() is None:
+            # Use select with 1s timeout to avoid blocking indefinitely
+            ready_to_read, _, _ = select.select(
+                [proc.stdout, proc.stderr], [], [], 1.0
+            )
+            for stream in ready_to_read:
+                try:
+                    chunk = stream.read(8192)  # Read in 8KB chunks
+                    if not chunk:
+                        continue
+                    chunk_bytes = len(chunk.encode("utf-8"))
+                    combined_bytes += chunk_bytes
+                    if stream == proc.stdout:
+                        stdout_parts.append(chunk)
+                    else:
+                        stderr_parts.append(chunk)
+                    if combined_bytes > hard_limit:
+                        exceeds_cap.set()
+                        try:
+                            proc.terminate()
+                        except (ProcessLookupError, OSError):
+                            pass
+                        break
+                except (OSError, ValueError):
+                    # Stream closed or invalid
+                    pass
+
+    reader_thread = threading.Thread(target=read_streams, daemon=True)
+    reader_thread.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        reader_thread.join(timeout=1)
+        raise
+
+    reader_thread.join(timeout=1)
+
+    # Drain any remaining data
+    if proc.stdout:
+        try:
+            remaining = proc.stdout.read()
+            if remaining:
+                stdout_parts.append(remaining)
+        except (OSError, ValueError):
+            pass
+    if proc.stderr:
+        try:
+            remaining = proc.stderr.read()
+            if remaining:
+                stderr_parts.append(remaining)
+        except (OSError, ValueError):
+            pass
+
+    if exceeds_cap.is_set():
+        return "", "", -1
+
+    stdout_str = "".join(stdout_parts)
+    stderr_str = "".join(stderr_parts)
+    return stdout_str, stderr_str, proc.returncode
