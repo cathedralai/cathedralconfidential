@@ -21,7 +21,7 @@ import select
 import shlex
 import subprocess
 import tempfile
-import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -222,89 +222,101 @@ def _claim_bool(claims: dict[str, Any], key: str) -> bool | None:
 def _read_bounded_subprocess(
     cmd: list[str], max_output: int, timeout: int
 ) -> tuple[str, str, int]:
-    """Run subprocess with bounded output capture.
+    """Run a subprocess with a hard combined-output byte cap and wall-clock timeout.
 
-    Streams stdout+stderr and kills the process if combined output exceeds
-    max_output. Returns (stdout_str, stderr_str, returncode).
+    Reads both stdout and stderr in the calling thread using select(2) and
+    os.read so there is no race between a drain thread and the main path.
+    Binary pipes prevent codec-buffering surprises.
 
-    Raises subprocess.TimeoutExpired if the process exceeds timeout.
+    Enforcement guarantees:
+    - At most max_output bytes are stored; the very read that pushes combined
+      past max_output is discarded and triggers immediate kill+reap.
+    - The post-exit pipe drain shares the same combined counter, so a fast
+      child that writes and exits cannot bypass the cap.
+    - Wall-clock timeout fires inside select(); kill and reap happen before
+      raising TimeoutExpired.
+
+    Returns (stdout_str, stderr_str, returncode).
+    Returns ("", "", -1) if the byte cap is exceeded.
+    Raises subprocess.TimeoutExpired if the process exceeds timeout seconds.
     """
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        universal_newlines=True,
     )
 
-    stdout_parts = []
-    stderr_parts = []
-    combined_bytes = 0
-    exceeds_cap = threading.Event()
+    stdout_buf: list[bytes] = []
+    stderr_buf: list[bytes] = []
+    combined = 0
+    deadline = time.monotonic() + timeout
 
-    def read_streams():
-        """Read from stdout/stderr without deadlock; kill if cap exceeded."""
-        nonlocal combined_bytes
-        sentinel_size = 1024
-        hard_limit = max_output + sentinel_size
+    out_fd = proc.stdout.fileno()
+    err_fd = proc.stderr.fileno()
+    fd_to_buf: dict[int, list[bytes]] = {out_fd: stdout_buf, err_fd: stderr_buf}
+    open_fds: set[int] = {out_fd, err_fd}
+    cap_exceeded = False
 
-        while proc.poll() is None:
-            # Use select with 1s timeout to avoid blocking indefinitely
-            ready_to_read, _, _ = select.select(
-                [proc.stdout, proc.stderr], [], [], 1.0
-            )
-            for stream in ready_to_read:
-                try:
-                    chunk = stream.read(8192)  # Read in 8KB chunks
-                    if not chunk:
-                        continue
-                    chunk_bytes = len(chunk.encode("utf-8"))
-                    combined_bytes += chunk_bytes
-                    if stream == proc.stdout:
-                        stdout_parts.append(chunk)
-                    else:
-                        stderr_parts.append(chunk)
-                    if combined_bytes > hard_limit:
-                        exceeds_cap.set()
-                        try:
-                            proc.terminate()
-                        except (ProcessLookupError, OSError):
-                            pass
-                        break
-                except (OSError, ValueError):
-                    # Stream closed or invalid
-                    pass
+    while open_fds:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.stdout.close()
+            proc.stderr.close()
+            proc.wait()
+            raise subprocess.TimeoutExpired(cmd, timeout)
 
-    reader_thread = threading.Thread(target=read_streams, daemon=True)
-    reader_thread.start()
-
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        reader_thread.join(timeout=1)
-        raise
-
-    reader_thread.join(timeout=1)
-
-    # Drain any remaining data
-    if proc.stdout:
         try:
-            remaining = proc.stdout.read()
-            if remaining:
-                stdout_parts.append(remaining)
-        except (OSError, ValueError):
-            pass
-    if proc.stderr:
-        try:
-            remaining = proc.stderr.read()
-            if remaining:
-                stderr_parts.append(remaining)
-        except (OSError, ValueError):
-            pass
+            readable, _, _ = select.select(list(open_fds), [], [], min(remaining, 1.0))
+        except OSError:
+            break
 
-    if exceeds_cap.is_set():
+        for fd in readable:
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                data = b""
+            if not data:
+                open_fds.discard(fd)
+                continue
+            combined += len(data)
+            if combined > max_output:
+                cap_exceeded = True
+                break
+            fd_to_buf[fd].append(data)
+
+        if cap_exceeded:
+            break
+
+    if cap_exceeded:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.stdout.close()
+        proc.stderr.close()
+        proc.wait()
         return "", "", -1
 
-    stdout_str = "".join(stdout_parts)
-    stderr_str = "".join(stderr_parts)
-    return stdout_str, stderr_str, proc.returncode
+    # Both pipes are at EOF; close them and wait for the process to exit.
+    proc.stdout.close()
+    proc.stderr.close()
+    wait_secs = max(deadline - time.monotonic(), 1.0)
+    try:
+        proc.wait(timeout=wait_secs)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+        raise
+
+    return (
+        b"".join(stdout_buf).decode("utf-8", errors="replace"),
+        b"".join(stderr_buf).decode("utf-8", errors="replace"),
+        proc.returncode,
+    )
