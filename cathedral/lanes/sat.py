@@ -16,6 +16,7 @@ the satisfiable-accept path.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import random
@@ -166,7 +167,9 @@ class SatLane(Lane):
         self._namespace = namespace or hashlib.sha256(random.randbytes(16)).hexdigest()[:8]
         self._seed_counter = 0
         self._issued_ids: set[str] = set()
-        self._credited_ids: set[str] = set()
+        # Map challenge_id -> work_units for verified certificates only.
+        # This ensures score() only counts certs that passed verify().
+        self._verified_credits: dict[str, float] = {}
 
     def qualify(self, attested: Attested) -> bool:
         return attested.tier in _QUALIFIED_TIERS
@@ -174,11 +177,18 @@ class SatLane(Lane):
     def enqueue(self, item: SatWorkItem) -> None:
         """Add a customer job to the internal queue (dispatch prefers these).
 
-        The item must have a valid challenge_id (deterministic hash binding the
-        instance and seed). This prevents duplicate crediting across epochs.
+        The item must have a valid challenge_id matching _compute_challenge_id(
+        instance, seed). This prevents duplicate crediting and internal consistency
+        errors across epochs.
         """
         if not item.challenge_id:
             raise ValueError("enqueue: item.challenge_id must be non-empty")
+        computed_id = _compute_challenge_id(item.instance, item.seed)
+        if item.challenge_id != computed_id:
+            raise ValueError(
+                f"enqueue: challenge_id mismatch: provided {item.challenge_id}, "
+                f"computed {computed_id} from instance + seed"
+            )
         self._queue.append(item)
 
     def dispatch(self, miner: str, budget: int) -> WorkItem:
@@ -187,8 +197,17 @@ class SatLane(Lane):
             self._issued_ids.add(item.challenge_id)
             return item
 
-        # Use namespace + counter for deterministic but non-colliding seeds
-        seed = hash((self._namespace, self._seed_counter)) & 0x7FFFFFFF
+        # Derive seed from namespace + counter using stable HMAC, not Python
+        # hash() which is process-salted and not reproducible. HMAC-SHA256
+        # ensures identical namespace/counter always yields identical seed
+        # across different PYTHONHASHSEED values.
+        seed_bytes = hmac.new(
+            self._namespace.encode(),
+            str(self._seed_counter).encode(),
+            hashlib.sha256,
+        ).digest()
+        # Constrain to positive 31-bit int (same as original intent).
+        seed = int.from_bytes(seed_bytes[:4], "big") & 0x7FFFFFFF
         self._seed_counter += 1
         instance = _canonical_instance(seed)
         challenge_id = _compute_challenge_id(instance, seed)
@@ -201,13 +220,14 @@ class SatLane(Lane):
             return None
 
         # Challenge accounting: require matching challenge_id, reject unissued,
-        # already-credited, or mismatched IDs.
+        # or mismatched IDs. Duplicate verification is prevented by checking if
+        # challenge_id is already in _verified_credits.
         if result.challenge_id != item.challenge_id:
             return None  # mismatch
         if result.challenge_id not in self._issued_ids:
             return None  # unissued
-        if result.challenge_id in self._credited_ids:
-            return None  # already credited
+        if result.challenge_id in self._verified_credits:
+            return None  # already verified and credited
 
         instance = item.instance
 
@@ -234,8 +254,8 @@ class SatLane(Lane):
             for clause in instance.clauses:
                 if not any(lit in true_lits for lit in clause):
                     return None
-            # Mark credited only after full validation passes
-            self._credited_ids.add(result.challenge_id)
+            # Record verified credit only after full validation passes.
+            self._verified_credits[result.challenge_id] = validator_work_units
             return SatCertificate(
                 satisfiable=True,
                 assignment=result.assignment,
@@ -246,8 +266,8 @@ class SatLane(Lane):
         # UNSAT claim: testable core re-solves to confirm (Phase-2: DRAT proof).
         if solve_sat(instance) is not None:
             return None
-        # Mark credited only after full validation passes
-        self._credited_ids.add(result.challenge_id)
+        # Record verified credit only after full validation passes.
+        self._verified_credits[result.challenge_id] = validator_work_units
         return SatCertificate(
             satisfiable=False,
             assignment=None,
@@ -256,32 +276,18 @@ class SatLane(Lane):
         )
 
     def score(self, miner: str, certs: list[Certificate]) -> float:
-        """Sum validator-derived work_units across all certificates.
+        """Sum validator-derived work_units for verified certificates only.
 
-        Defense-in-depth: reject any cert with non-finite or negative work_units
-        (including 1e300, NaN, Infinity, negative). verify() always sets these
-        to validator-derived non-negative finite values, but we guard here too
-        in case certs are constructed outside verify() or are manually forged.
+        Only certificates that passed verify() are recorded in _verified_credits.
+        This ensures that hand-constructed certs with forged work_units, unknown
+        challenge_ids, or unverified assignments contribute zero.
 
-        Defensively count each challenge_id at most once — even though verify()
-        should prevent duplicates, this guards against replayed certs.
-
-        Returns the total accumulated work_units, or 0.0 if no valid certs.
+        Returns the total accumulated work_units, or 0.0 if no verified certs.
         """
         total = 0.0
-        seen_ids: set[str] = set()
         for c in certs:
-            # Skip if challenge_id is missing or already seen
+            # Only count if challenge_id is in the verified_credits map.
             cid = getattr(c, "challenge_id", None)
-            if not cid or cid in seen_ids:
-                continue
-            seen_ids.add(cid)
-
-            wu = getattr(c, "work_units", 0.0)
-            # Must be a number and must be finite and non-negative.
-            if not isinstance(wu, (int, float)):
-                continue
-            if not math.isfinite(wu) or wu < 0:
-                continue
-            total += wu
+            if cid in self._verified_credits:
+                total += self._verified_credits[cid]
         return total

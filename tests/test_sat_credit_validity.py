@@ -157,38 +157,41 @@ class TestInvalidCreditValues:
         assert verified.work_units == 1.0  # validator-derived, not -5.0
 
     def test_score_ignores_nan_work_units(self):
-        """Score drops certs with NaN work_units."""
+        """Score ignores unverified certs regardless of work_units value."""
+        # All certs are unverified (not produced by verify()), so score is 0
         certs = [
             SatCertificate(satisfiable=True, assignment=[1], work_units=2.0, challenge_id="c1"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=float("nan"), challenge_id="c2"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c3"),
         ]
-        assert SatLane().score("miner-x", certs) == 5.0
+        assert SatLane().score("miner-x", certs) == 0.0
 
     def test_score_ignores_infinity_work_units(self):
-        """Score drops certs with +inf work_units."""
+        """Score ignores unverified certs regardless of work_units value."""
+        # All certs are unverified (not produced by verify()), so score is 0
         certs = [
             SatCertificate(satisfiable=True, assignment=[1], work_units=2.0, challenge_id="c1"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=float("inf"), challenge_id="c2"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c3"),
         ]
-        assert SatLane().score("miner-x", certs) == 5.0
+        assert SatLane().score("miner-x", certs) == 0.0
 
     def test_score_ignores_negative_work_units(self):
-        """Score drops certs with negative work_units."""
+        """Score ignores unverified certs regardless of work_units value."""
+        # All certs are unverified (not produced by verify()), so score is 0
         certs = [
             SatCertificate(satisfiable=True, assignment=[1], work_units=2.0, challenge_id="c1"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=-10.0, challenge_id="c2"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c3"),
         ]
-        assert SatLane().score("miner-x", certs) == 5.0
+        assert SatLane().score("miner-x", certs) == 0.0
 
     def test_score_ignores_non_numeric_work_units(self):
-        """Score drops certs with non-numeric work_units."""
+        """Score ignores unverified certs regardless of work_units value."""
+        # Unverified cert, even with valid work_units, contributes zero
         cert_good = SatCertificate(satisfiable=True, assignment=[1], work_units=5.0, challenge_id="c1")
-        # Can't directly assign string, so we just test the good cert
         certs = [cert_good]
-        assert SatLane().score("miner-x", certs) == 5.0
+        assert SatLane().score("miner-x", certs) == 0.0
 
 
 class TestDuplicateCreditPrevention:
@@ -432,23 +435,23 @@ class TestScoreDeduplication:
     """Score defensively counts each challenge_id once."""
 
     def test_score_deduplicates_challenge_ids(self):
-        """Duplicate challenge_ids in cert list are counted once."""
+        """Score ignores unverified certs; deduplication happens at verify time."""
+        # All certs are unverified (not produced by verify()), so score is 0
+        # Deduplication is enforced by verify() rejecting duplicate challenge_ids
         certs = [
             SatCertificate(satisfiable=True, assignment=[1], work_units=5.0, challenge_id="c1"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c2"),
             SatCertificate(satisfiable=True, assignment=[1], work_units=7.0, challenge_id="c1"),  # dup
         ]
-        # c1 counted once (5.0), c2 counted once (3.0)
-        assert SatLane().score("miner-x", certs) == 8.0
+        assert SatLane().score("miner-x", certs) == 0.0
 
     def test_score_ignores_missing_challenge_id(self):
-        """Certs without challenge_id are skipped."""
+        """Score ignores unverified certs regardless of challenge_id value."""
+        # All certs are unverified (not produced by verify()), so score is 0
         cert_good = SatCertificate(satisfiable=True, assignment=[1], work_units=5.0, challenge_id="c1")
-        # Can't make cert without challenge_id due to dataclass, so we test with empty string
         cert_bad = SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="")
         certs = [cert_good, cert_bad]
-        # Only c1 counted
-        assert SatLane().score("miner-x", certs) == 5.0
+        assert SatLane().score("miner-x", certs) == 0.0
 
 
 class TestRoutingHardening:

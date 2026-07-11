@@ -7,6 +7,10 @@ testable core (DRAT proof in production).
 
 from __future__ import annotations
 
+import math
+import subprocess
+import sys
+
 from cathedral.common import Attested, Tier
 from cathedral.lanes.sat import SatLane, solve_sat, _compute_challenge_id
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
@@ -73,12 +77,32 @@ def test_verify_accepts_true_unsat_certificate():
     assert lane.verify(item, cert) is not None
 
 
-def test_score_sums_work_units():
-    certs = [
-        SatCertificate(satisfiable=True, assignment=[1], work_units=2.0, challenge_id="c1"),
-        SatCertificate(satisfiable=True, assignment=[1], work_units=3.0, challenge_id="c2"),
-    ]
-    assert SatLane().score("miner-x", certs) == 5.0
+def test_score_sums_verified_work_units():
+    """score() must sum work_units from verified certs only, not hand-constructed ones."""
+    lane = SatLane()
+
+    # Create and verify two certs to establish them in verified_credits
+    verified_certs = []
+    for i in range(2):
+        inst = SatInstance(n_vars=2, clauses=[[1, 2], [-1, -2]])
+        assignment = solve_sat(inst)
+        assert assignment is not None
+        challenge_id = _compute_challenge_id(inst, i)
+        item = SatWorkItem(instance=inst, seed=i, challenge_id=challenge_id)
+        lane._issued_ids.add(challenge_id)
+        cert = SatCertificate(
+            satisfiable=True,
+            assignment=assignment,
+            work_units=10.0,  # miner's claim, will be replaced by validator value
+            challenge_id=challenge_id,
+        )
+        verified = lane.verify(item, cert)
+        assert verified is not None
+        verified_certs.append(verified)
+
+    # Score should sum the validator-derived work_units (which is # clauses = 2 for each)
+    score = lane.score("miner-x", verified_certs)
+    assert score == 4.0  # 2 certs * 2 clauses each
 
 
 def test_score_of_no_certs_is_zero():
@@ -117,3 +141,180 @@ def test_verify_rejects_contradictory_assignment():
     lane._issued_ids.add(challenge_id)
     forged = SatCertificate(satisfiable=True, assignment=[1, -1], work_units=2.0, challenge_id=challenge_id)
     assert lane.verify(item, forged) is None
+
+
+def test_seed_derivation_is_reproducible_across_pythonhashseed():
+    """Seed derivation must be stable across different PYTHONHASHSEED values.
+
+    Python's hash() is process-salted and not reproducible. We use HMAC-SHA256
+    instead to ensure identical namespace + counter always yields identical seed.
+    """
+    # Run dispatch() in separate processes with different PYTHONHASHSEED values
+    # and verify they produce identical seeds.
+    script = (
+        "from cathedral.lanes.sat import SatLane; "
+        "lane = SatLane('test-namespace'); "
+        "item1 = lane.dispatch('miner-x', 0); "
+        "print(item1.seed)"
+    )
+    result1 = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={"PYTHONHASHSEED": "0"},
+    )
+    result2 = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={"PYTHONHASHSEED": "999"},
+    )
+    assert result1.returncode == 0, f"Process 1 failed: {result1.stderr}"
+    assert result2.returncode == 0, f"Process 2 failed: {result2.stderr}"
+    seed1 = int(result1.stdout.strip())
+    seed2 = int(result2.stdout.strip())
+    assert seed1 == seed2, f"Seeds differ: {seed1} != {seed2} with different PYTHONHASHSEED"
+
+
+def test_seed_derivation_varies_with_different_namespaces():
+    """Different namespaces must produce different seeds for the same counter."""
+    lane1 = SatLane("ns1")
+    lane2 = SatLane("ns2")
+    item1 = lane1.dispatch("miner-x", 0)
+    item2 = lane2.dispatch("miner-x", 0)
+    assert item1.seed != item2.seed, "Different namespaces should produce different seeds"
+
+
+def test_enqueue_rejects_mismatched_challenge_id():
+    """enqueue() must validate that challenge_id matches computed hash of instance+seed.
+
+    This prevents both accidental inconsistency and malicious intent to credit
+    the same work twice by changing the ID.
+    """
+    lane = SatLane()
+    inst = SatInstance(n_vars=2, clauses=[[1, 2], [-1, -2]])
+    correct_id = _compute_challenge_id(inst, 0)
+    wrong_id = _compute_challenge_id(inst, 999)
+
+    # Valid enqueue should succeed
+    item_ok = SatWorkItem(instance=inst, seed=0, challenge_id=correct_id)
+    lane.enqueue(item_ok)  # Should not raise
+
+    # Invalid enqueue should raise ValueError
+    item_bad = SatWorkItem(instance=inst, seed=0, challenge_id=wrong_id)
+    try:
+        lane.enqueue(item_bad)
+        assert False, "enqueue should reject mismatched challenge_id"
+    except ValueError as e:
+        assert "challenge_id mismatch" in str(e)
+
+
+def test_score_only_counts_verified_certificates():
+    """score() must only count certificates that passed verify().
+
+    Hand-constructed certs with forged work_units, unknown challenge_ids, or
+    unverified assignments must contribute zero to the score.
+    """
+    lane = SatLane()
+    inst = SatInstance(n_vars=3, clauses=[[1, 2], [-1, 3], [-2, -3]])  # 3 clauses
+    assignment = solve_sat(inst)
+    assert assignment is not None
+
+    # Verify a legitimate cert
+    challenge_id = _compute_challenge_id(inst, 0)
+    item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
+    lane._issued_ids.add(challenge_id)
+    cert_good = SatCertificate(
+        satisfiable=True,
+        assignment=assignment,
+        work_units=100.0,  # miner's claim is ignored
+        challenge_id=challenge_id,
+    )
+    verified = lane.verify(item, cert_good)
+    assert verified is not None
+    # verify() replaces work_units with validator-derived value (clause count = 3)
+    assert verified.work_units == 3.0
+
+    # Create a hand-constructed cert with forged work_units and unknown ID
+    cert_forged = SatCertificate(
+        satisfiable=True,
+        assignment=assignment,
+        work_units=1e300,
+        challenge_id="unknown-id",
+    )
+
+    # Score should only count the verified cert (3.0), ignore the forged one
+    score = lane.score("miner-x", [verified, cert_forged])
+    assert score == 3.0, f"Expected 3.0, got {score}"
+
+
+def test_score_rejects_forged_work_units_in_unverified_cert():
+    """score() must reject any cert with challenge_id not in verified_credits.
+
+    Even if work_units looks finite and positive, if the cert was not returned
+    by verify(), it contributes zero.
+    """
+    lane = SatLane()
+
+    # Create a cert that looks valid but was never verified
+    fake_cert = SatCertificate(
+        satisfiable=True,
+        assignment=[1, 2, 3],
+        work_units=999.0,
+        challenge_id="fake-id",
+    )
+
+    # Score must be zero because this cert was never verified
+    score = lane.score("miner-x", [fake_cert])
+    assert score == 0.0, f"Unverified cert should contribute zero; got {score}"
+
+
+def test_score_ignores_infinite_work_units_in_hand_constructed_cert():
+    """score() ignores certs not in verified_credits, regardless of work_units value.
+
+    This defends against claims like work_units=1e300, NaN, Infinity, or negative.
+    Since these certs are not in verified_credits, they contribute zero regardless.
+    """
+    lane = SatLane()
+
+    # Create certs with various invalid work_units values
+    certs = [
+        SatCertificate(satisfiable=True, assignment=[1], work_units=math.inf, challenge_id="inf"),
+        SatCertificate(satisfiable=True, assignment=[1], work_units=math.nan, challenge_id="nan"),
+        SatCertificate(satisfiable=True, assignment=[1], work_units=1e300, challenge_id="huge"),
+        SatCertificate(satisfiable=True, assignment=[1], work_units=-999.0, challenge_id="neg"),
+    ]
+
+    # All must be ignored (not in verified_credits), so score is zero
+    score = lane.score("miner-x", certs)
+    assert score == 0.0, f"Unverified certs with invalid work_units should score zero; got {score}"
+
+
+def test_score_accumulates_multiple_verified_certs():
+    """score() correctly accumulates work_units from multiple verified certs."""
+    lane = SatLane()
+
+    # Create and verify multiple certs
+    verified_certs = []
+    for i in range(3):
+        inst = SatInstance(n_vars=2, clauses=[[1, 2], [-1, -2]])  # 2 clauses
+        assignment = solve_sat(inst)
+        assert assignment is not None
+        challenge_id = _compute_challenge_id(inst, i)
+        item = SatWorkItem(instance=inst, seed=i, challenge_id=challenge_id)
+        lane._issued_ids.add(challenge_id)
+        cert = SatCertificate(
+            satisfiable=True,
+            assignment=assignment,
+            work_units=10.0,  # miner's claim, will be replaced by validator value
+            challenge_id=challenge_id,
+        )
+        verified = lane.verify(item, cert)
+        assert verified is not None
+        # verify() replaces work_units with validator-derived value (clause count = 2)
+        assert verified.work_units == 2.0
+        verified_certs.append(verified)
+
+    score = lane.score("miner-x", verified_certs)
+    # Should be 3 * 2.0 = 6.0 (validator-derived work_units from clause count)
+    assert score == 6.0, f"Expected 6.0, got {score}"
