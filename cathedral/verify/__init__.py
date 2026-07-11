@@ -304,9 +304,16 @@ def _read_bounded_subprocess(
     # Both pipes are at EOF; close them and wait for the process to exit.
     proc.stdout.close()
     proc.stderr.close()
-    wait_secs = max(deadline - time.monotonic(), 1.0)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+        raise subprocess.TimeoutExpired(cmd, timeout)
     try:
-        proc.wait(timeout=wait_secs)
+        proc.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
         try:
             proc.kill()

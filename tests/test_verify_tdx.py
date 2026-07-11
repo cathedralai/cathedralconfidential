@@ -432,3 +432,40 @@ time.sleep(3600)
 
     assert result is None  # timeout causes rejection
     assert elapsed < 5, f"timeout took {elapsed:.1f}s, expected <5"
+
+
+def test_tdx_verify_timeout_after_pipes_closed(tmp_path, monkeypatch):
+    """Child closes pipes then sleeps; deadline not extended after EOF.
+
+    Regression: wait_secs = max(deadline - time.monotonic(), 1.0) could
+    extend the configured timeout by up to 1 second. If both pipes reach EOF
+    with 0.1s remaining on a 1s timeout, the child still runs for up to 1.1s.
+    """
+    import time
+
+    script = tmp_path / "close_and_sleep.py"
+    script.write_text(
+        """\
+import os, sys, time
+open(sys.argv[-1], "rb").read()
+os.close(1)  # close stdout
+os.close(2)  # close stderr
+time.sleep(3600)  # child keeps running after pipes closed
+"""
+    )
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", f"{sys.executable} {script}")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_TIMEOUT", "1")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", "1048576")
+
+    nonce = issue_nonce()
+    hotkey = "hotkey-pipe-close"
+    evidence = Evidence(EvidenceKind.TDX, b"tdx-quote", nonce, hotkey)
+    policy = Policy(allowed_measurements=set(), min_tcb=0)
+
+    t0 = time.monotonic()
+    result = verify(evidence, nonce, policy)
+    elapsed = time.monotonic() - t0
+
+    assert result is None  # timeout causes rejection
+    # Must fire within ~1.2s (1s timeout + small overhead), not ~2s
+    assert elapsed < 2, f"timeout took {elapsed:.1f}s, expected <2s (suggests 1s timeout extended)"
