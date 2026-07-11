@@ -125,12 +125,16 @@ def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
 
     try:
         timeout = int(os.environ.get("CATHEDRAL_TDX_VERIFY_TIMEOUT", str(_DEFAULT_VERIFY_TIMEOUT)))
+        if timeout <= 0:
+            timeout = _DEFAULT_VERIFY_TIMEOUT
     except ValueError:
         timeout = _DEFAULT_VERIFY_TIMEOUT
     try:
         max_output = int(
             os.environ.get("CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", str(_DEFAULT_MAX_OUTPUT))
         )
+        if max_output <= 0:
+            max_output = _DEFAULT_MAX_OUTPUT
     except ValueError:
         max_output = _DEFAULT_MAX_OUTPUT
 
@@ -151,9 +155,12 @@ def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
     if proc.returncode != 0:
         return {}  # reject: verifier signalled failure
 
-    # Guard against oversized output before parsing.
-    if len(proc.stdout) > max_output or len(proc.stderr) > max_output:
-        return {}  # reject: output exceeded size budget
+    # Measure combined stdout+stderr as encoded bytes against the cap.
+    # text=True in subprocess.run means stdout/stderr are strings (decoded);
+    # encode them to measure actual wire size for cap enforcement.
+    combined_bytes = len(proc.stdout.encode("utf-8")) + len(proc.stderr.encode("utf-8"))
+    if combined_bytes > max_output:
+        return {}  # reject: combined output exceeded size budget
 
     try:
         parsed = json.loads(proc.stdout)
@@ -206,15 +213,11 @@ def _claim_int(claims: dict[str, Any], *keys: str, default: int) -> int:
 
 
 def _claim_bool(claims: dict[str, Any], key: str) -> bool | None:
+    """Accept only the exact JSON boolean True; reject all other forms.
+
+    Rejects: missing, null, strings (including "true", "1", etc.), integers,
+    boolean False, and any other type. Only the boolean True is accepted.
+    """
     value = claims.get(key)
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes"}:
-            return True
-        if normalized in {"0", "false", "no"}:
-            return False
-    return None
+    # Only the exact boolean True is accepted; everything else rejects.
+    return True if value is True else None

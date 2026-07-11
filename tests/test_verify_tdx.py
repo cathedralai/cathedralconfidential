@@ -35,8 +35,8 @@ print(json.dumps({
     **({"tcb_svn": os.environ["FAKE_TCB_SVN"]} if "FAKE_TCB_SVN" in os.environ else {}),
     **({"tcb_status": os.environ["FAKE_TCB_STATUS"]} if "FAKE_TCB_STATUS" in os.environ else {}),
     "platform_id": os.environ["FAKE_PLATFORM_ID"],
-    "intel_verified": os.environ.get("FAKE_INTEL_VERIFIED", "true"),
-    "report_data_match": os.environ.get("FAKE_REPORT_DATA_MATCH", "true"),
+    "intel_verified": os.environ.get("FAKE_INTEL_VERIFIED", "true").lower() == "true",
+    "report_data_match": os.environ.get("FAKE_REPORT_DATA_MATCH", "true").lower() == "true",
 }))
 """.lstrip()
     )
