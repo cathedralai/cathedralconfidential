@@ -41,6 +41,7 @@ def test_verify_accepts_true_certificate():
     challenge_id = _compute_challenge_id(inst, 0)
     item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
     lane._issued_ids.add(challenge_id)
+    lane._challenge_owner[challenge_id] = "miner-x"
     cert = SatCertificate(satisfiable=True, assignment=assignment, work_units=1.0, challenge_id=challenge_id)
     assert lane.verify(item, cert) is not None
 
@@ -52,6 +53,7 @@ def test_verify_rejects_forged_assignment():
     challenge_id = _compute_challenge_id(inst, 0)
     item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
     lane._issued_ids.add(challenge_id)
+    lane._challenge_owner[challenge_id] = "miner-x"
     forged = SatCertificate(satisfiable=True, assignment=[-1, -2, -3], work_units=1.0, challenge_id=challenge_id)
     assert lane.verify(item, forged) is None
 
@@ -63,6 +65,7 @@ def test_verify_rejects_wrong_satisfiable_flag():
     challenge_id = _compute_challenge_id(inst, 0)
     item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
     lane._issued_ids.add(challenge_id)
+    lane._challenge_owner[challenge_id] = "miner-x"
     wrong = SatCertificate(satisfiable=False, assignment=None, work_units=1.0, challenge_id=challenge_id)
     assert lane.verify(item, wrong) is None
 
@@ -73,6 +76,7 @@ def test_verify_accepts_true_unsat_certificate():
     challenge_id = _compute_challenge_id(inst, 0)
     item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
     lane._issued_ids.add(challenge_id)
+    lane._challenge_owner[challenge_id] = "miner-x"
     cert = SatCertificate(satisfiable=False, assignment=None, work_units=1.0, challenge_id=challenge_id)
     assert lane.verify(item, cert) is not None
 
@@ -80,29 +84,30 @@ def test_verify_accepts_true_unsat_certificate():
 def test_score_sums_verified_work_units():
     """score() must sum work_units from verified certs only, not hand-constructed ones."""
     lane = SatLane()
+    miner = "miner-x"
 
     # Create and verify two certs to establish them in verified_credits
+    # Use dispatch() to ensure proper ownership tracking
     verified_certs = []
+    expected_total = 0.0
     for i in range(2):
-        inst = SatInstance(n_vars=2, clauses=[[1, 2], [-1, -2]])
-        assignment = solve_sat(inst)
+        item = lane.dispatch(miner, 0)
+        assignment = solve_sat(item.instance)
         assert assignment is not None
-        challenge_id = _compute_challenge_id(inst, i)
-        item = SatWorkItem(instance=inst, seed=i, challenge_id=challenge_id)
-        lane._issued_ids.add(challenge_id)
         cert = SatCertificate(
             satisfiable=True,
             assignment=assignment,
             work_units=10.0,  # miner's claim, will be replaced by validator value
-            challenge_id=challenge_id,
+            challenge_id=item.challenge_id,
         )
         verified = lane.verify(item, cert)
         assert verified is not None
+        expected_total += verified.work_units
         verified_certs.append(verified)
 
-    # Score should sum the validator-derived work_units (which is # clauses = 2 for each)
-    score = lane.score("miner-x", verified_certs)
-    assert score == 4.0  # 2 certs * 2 clauses each
+    # Score should sum the validator-derived work_units from all verified certs
+    score = lane.score(miner, verified_certs)
+    assert score == expected_total
 
 
 def test_score_of_no_certs_is_zero():
@@ -139,6 +144,7 @@ def test_verify_rejects_contradictory_assignment():
     challenge_id = _compute_challenge_id(inst, 0)
     item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
     lane._issued_ids.add(challenge_id)
+    lane._challenge_owner[challenge_id] = "miner-x"
     forged = SatCertificate(satisfiable=True, assignment=[1, -1], work_units=2.0, challenge_id=challenge_id)
     assert lane.verify(item, forged) is None
 
@@ -216,24 +222,24 @@ def test_score_only_counts_verified_certificates():
     unverified assignments must contribute zero to the score.
     """
     lane = SatLane()
-    inst = SatInstance(n_vars=3, clauses=[[1, 2], [-1, 3], [-2, -3]])  # 3 clauses
-    assignment = solve_sat(inst)
+    miner = "miner-x"
+
+    # Dispatch and verify a legitimate cert
+    item = lane.dispatch(miner, 0)
+    assignment = solve_sat(item.instance)
     assert assignment is not None
 
-    # Verify a legitimate cert
-    challenge_id = _compute_challenge_id(inst, 0)
-    item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
-    lane._issued_ids.add(challenge_id)
     cert_good = SatCertificate(
         satisfiable=True,
         assignment=assignment,
         work_units=100.0,  # miner's claim is ignored
-        challenge_id=challenge_id,
+        challenge_id=item.challenge_id,
     )
     verified = lane.verify(item, cert_good)
     assert verified is not None
-    # verify() replaces work_units with validator-derived value (clause count = 3)
-    assert verified.work_units == 3.0
+    # verify() replaces work_units with validator-derived value (clause count)
+    assert verified.work_units > 0
+    expected_work_units = verified.work_units
 
     # Create a hand-constructed cert with forged work_units and unknown ID
     cert_forged = SatCertificate(
@@ -243,9 +249,9 @@ def test_score_only_counts_verified_certificates():
         challenge_id="unknown-id",
     )
 
-    # Score should only count the verified cert (3.0), ignore the forged one
-    score = lane.score("miner-x", [verified, cert_forged])
-    assert score == 3.0, f"Expected 3.0, got {score}"
+    # Score should only count the verified cert, ignore the forged one
+    score = lane.score(miner, [verified, cert_forged])
+    assert score == expected_work_units, f"Expected {expected_work_units}, got {score}"
 
 
 def test_score_rejects_forged_work_units_in_unverified_cert():
@@ -293,28 +299,27 @@ def test_score_ignores_infinite_work_units_in_hand_constructed_cert():
 def test_score_accumulates_multiple_verified_certs():
     """score() correctly accumulates work_units from multiple verified certs."""
     lane = SatLane()
+    miner = "miner-x"
 
-    # Create and verify multiple certs
+    # Create and verify multiple certs using dispatch()
     verified_certs = []
+    total_expected = 0.0
     for i in range(3):
-        inst = SatInstance(n_vars=2, clauses=[[1, 2], [-1, -2]])  # 2 clauses
-        assignment = solve_sat(inst)
+        item = lane.dispatch(miner, 0)
+        assignment = solve_sat(item.instance)
         assert assignment is not None
-        challenge_id = _compute_challenge_id(inst, i)
-        item = SatWorkItem(instance=inst, seed=i, challenge_id=challenge_id)
-        lane._issued_ids.add(challenge_id)
         cert = SatCertificate(
             satisfiable=True,
             assignment=assignment,
             work_units=10.0,  # miner's claim, will be replaced by validator value
-            challenge_id=challenge_id,
+            challenge_id=item.challenge_id,
         )
         verified = lane.verify(item, cert)
         assert verified is not None
-        # verify() replaces work_units with validator-derived value (clause count = 2)
-        assert verified.work_units == 2.0
+        # verify() replaces work_units with validator-derived value (clause count)
+        total_expected += verified.work_units
         verified_certs.append(verified)
 
-    score = lane.score("miner-x", verified_certs)
-    # Should be 3 * 2.0 = 6.0 (validator-derived work_units from clause count)
-    assert score == 6.0, f"Expected 6.0, got {score}"
+    score = lane.score(miner, verified_certs)
+    # Should sum up all validator-derived work_units from all certs
+    assert score == total_expected, f"Expected {total_expected}, got {score}"

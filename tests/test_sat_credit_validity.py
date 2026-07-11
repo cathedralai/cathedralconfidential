@@ -453,6 +453,154 @@ class TestScoreDeduplication:
         certs = [cert_good, cert_bad]
         assert SatLane().score("miner-x", certs) == 0.0
 
+    def test_score_deduplicates_same_verified_challenge_twice(self):
+        """After one successful verify, score counts the same challenge_id only once."""
+        lane = SatLane()
+        item = lane.dispatch("miner-1", 0)
+        from cathedral.lanes.sat import solve_sat
+        assignment = solve_sat(item.instance)
+        assert assignment is not None
+
+        cert = SatCertificate(
+            satisfiable=True,
+            assignment=assignment,
+            work_units=1.0,
+            challenge_id=item.challenge_id,
+        )
+
+        # Verify once; adds to _verified_credits
+        verified = lane.verify(item, cert)
+        assert verified is not None
+
+        # Try to score the same verified challenge twice in one call.
+        # Should only count it once.
+        certs = [verified, verified]
+        score = lane.score("miner-1", certs)
+        assert score == verified.work_units  # Only counted once, not twice
+
+
+class TestChallengeOwnership:
+    """Verified credit is bound to the miner it was dispatched to."""
+
+    def test_dispatch_tracks_miner_ownership(self):
+        """Challenge owner is recorded at dispatch time."""
+        lane = SatLane()
+        item_a = lane.dispatch("miner-a", 0)
+        item_b = lane.dispatch("miner-b", 0)
+        # Both challenges should have different owners recorded internally
+        assert lane._challenge_owner[item_a.challenge_id] == "miner-a"
+        assert lane._challenge_owner[item_b.challenge_id] == "miner-b"
+
+    def test_verify_preserves_ownership(self):
+        """Ownership from dispatch is preserved through verify."""
+        lane = SatLane()
+        item = lane.dispatch("miner-x", 0)
+        owner_at_dispatch = lane._challenge_owner[item.challenge_id]
+        assert owner_at_dispatch == "miner-x"
+
+        from cathedral.lanes.sat import solve_sat
+        assignment = solve_sat(item.instance)
+        assert assignment is not None
+
+        cert = SatCertificate(
+            satisfiable=True,
+            assignment=assignment,
+            work_units=1.0,
+            challenge_id=item.challenge_id,
+        )
+
+        verified = lane.verify(item, cert)
+        assert verified is not None
+        # Ownership should still be "miner-x"
+        assert lane._challenge_owner[item.challenge_id] == "miner-x"
+
+    def test_score_rejects_mismatched_miner(self):
+        """Challenge dispatched to miner-A is not credited to miner-B."""
+        lane = SatLane()
+        item = lane.dispatch("miner-a", 0)
+        from cathedral.lanes.sat import solve_sat
+        assignment = solve_sat(item.instance)
+        assert assignment is not None
+
+        cert = SatCertificate(
+            satisfiable=True,
+            assignment=assignment,
+            work_units=1.0,
+            challenge_id=item.challenge_id,
+        )
+
+        # Verify as miner-a (owner)
+        verified = lane.verify(item, cert)
+        assert verified is not None
+
+        # Try to score for miner-b (different miner)
+        score_b = lane.score("miner-b", [verified])
+        assert score_b == 0.0  # Should not credit miner-b
+
+        # But miner-a should get the credit
+        score_a = lane.score("miner-a", [verified])
+        assert score_a == verified.work_units
+
+    def test_score_accepts_matching_miner(self):
+        """Challenge dispatched to miner-A is credited only to miner-A."""
+        lane = SatLane()
+        item = lane.dispatch("miner-a", 0)
+        from cathedral.lanes.sat import solve_sat
+        assignment = solve_sat(item.instance)
+        assert assignment is not None
+
+        cert = SatCertificate(
+            satisfiable=True,
+            assignment=assignment,
+            work_units=1.0,
+            challenge_id=item.challenge_id,
+        )
+
+        # Verify and score for same miner
+        verified = lane.verify(item, cert)
+        assert verified is not None
+
+        score = lane.score("miner-a", [verified])
+        assert score == verified.work_units
+
+    def test_multiple_challenges_ownership_independent(self):
+        """Each challenge_id tracks its own owner independently."""
+        lane = SatLane()
+        item_a = lane.dispatch("miner-1", 0)
+        item_b = lane.dispatch("miner-2", 0)
+
+        from cathedral.lanes.sat import solve_sat
+        assignment_a = solve_sat(item_a.instance)
+        assignment_b = solve_sat(item_b.instance)
+        assert assignment_a is not None
+        assert assignment_b is not None
+
+        cert_a = SatCertificate(
+            satisfiable=True,
+            assignment=assignment_a,
+            work_units=1.0,
+            challenge_id=item_a.challenge_id,
+        )
+        cert_b = SatCertificate(
+            satisfiable=True,
+            assignment=assignment_b,
+            work_units=2.0,
+            challenge_id=item_b.challenge_id,
+        )
+
+        verified_a = lane.verify(item_a, cert_a)
+        verified_b = lane.verify(item_b, cert_b)
+        assert verified_a is not None
+        assert verified_b is not None
+
+        # miner-1 scores only verified_a (its own challenge)
+        score_m1 = lane.score("miner-1", [verified_a, verified_b])
+        assert score_m1 == verified_a.work_units
+
+        # miner-2 scores only verified_b (its own challenge)
+        score_m2 = lane.score("miner-2", [verified_a, verified_b])
+        assert score_m2 == verified_b.work_units
+
 
 class TestRoutingHardening:
     """Routing must handle invalid floors and overflow gracefully."""

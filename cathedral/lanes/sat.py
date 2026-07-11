@@ -167,6 +167,8 @@ class SatLane(Lane):
         self._namespace = namespace or hashlib.sha256(random.randbytes(16)).hexdigest()[:8]
         self._seed_counter = 0
         self._issued_ids: set[str] = set()
+        # Map challenge_id -> owner miner (tracked at dispatch time).
+        self._challenge_owner: dict[str, str] = {}
         # Map challenge_id -> work_units for verified certificates only.
         # This ensures score() only counts certs that passed verify().
         self._verified_credits: dict[str, float] = {}
@@ -195,6 +197,7 @@ class SatLane(Lane):
         if self._queue:
             item = self._queue.pop(0)
             self._issued_ids.add(item.challenge_id)
+            self._challenge_owner[item.challenge_id] = miner
             return item
 
         # Derive seed from namespace + counter using stable HMAC, not Python
@@ -212,6 +215,7 @@ class SatLane(Lane):
         instance = _canonical_instance(seed)
         challenge_id = _compute_challenge_id(instance, seed)
         self._issued_ids.add(challenge_id)
+        self._challenge_owner[challenge_id] = miner
         return SatWorkItem(instance=instance, seed=seed, challenge_id=challenge_id)
 
     def verify(self, item: WorkItem, result: object) -> Certificate | None:
@@ -282,12 +286,20 @@ class SatLane(Lane):
         This ensures that hand-constructed certs with forged work_units, unknown
         challenge_ids, or unverified assignments contribute zero.
 
+        Additionally, each challenge_id is counted at most once per call (deduplication),
+        and only when the challenge owner matches the miner being scored.
+
         Returns the total accumulated work_units, or 0.0 if no verified certs.
         """
         total = 0.0
+        seen_challenge_ids: set[str] = set()
         for c in certs:
             # Only count if challenge_id is in the verified_credits map.
             cid = getattr(c, "challenge_id", None)
-            if cid in self._verified_credits:
-                total += self._verified_credits[cid]
+            if cid in self._verified_credits and cid not in seen_challenge_ids:
+                # Only count if this challenge belongs to the miner being scored.
+                owner = self._challenge_owner.get(cid)
+                if owner == miner:
+                    total += self._verified_credits[cid]
+                    seen_challenge_ids.add(cid)
         return total
