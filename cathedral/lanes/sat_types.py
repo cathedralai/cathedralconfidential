@@ -65,4 +65,4 @@ class SatCertificate(Certificate):
     assignment: list[int] | None
     work_units: float
     challenge_id: str  # echoed from SatWorkItem
-    miner_hotkey: str = ""  # hotkey of the miner that produced this certificate
+    assigned_hotkey: str = ""  # hotkey of the miner that produced this certificate

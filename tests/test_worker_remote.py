@@ -29,8 +29,8 @@ import pytest
 from cathedral.common import Evidence, EvidenceKind
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
-from cathedral.remote import RemoteError, RemoteMiner
-from cathedral.worker import WorkerServer
+from cathedral.remote import RemoteError, RemoteMiner as _RemoteMiner
+from cathedral.worker import WorkerServer as _WorkerServer
 
 # ---------------------------------------------------------------------------
 # Test fixtures / helpers
@@ -38,6 +38,16 @@ from cathedral.worker import WorkerServer
 
 HOTKEY = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 OTHER_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+
+def WorkerServer(*args, **kwargs):
+    kwargs.setdefault("configured_hotkey", HOTKEY)
+    return _WorkerServer(*args, **kwargs)
+
+
+def RemoteMiner(endpoint, hotkey, **kwargs):
+    kwargs.setdefault("allow_insecure_http", True)
+    return _RemoteMiner(endpoint, hotkey, **kwargs)
 
 
 def _fake_evidence(nonce: bytes, hotkey: str) -> Evidence:
@@ -58,7 +68,7 @@ def _make_sat_item(n_vars: int = 3, seed: int = 0) -> SatWorkItem:
     return SatWorkItem(instance=inst, seed=seed, challenge_id=cid)
 
 
-def _start_server(server: WorkerServer) -> threading.Thread:
+def _start_server(server: _WorkerServer) -> threading.Thread:
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     return t
@@ -79,6 +89,15 @@ def _post_raw(url: str, body: bytes, *, bearer: str | None = None) -> tuple[int,
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
+
+
+def _raw_http_status(port: int, headers: bytes, body: bytes = b"") -> int:
+    request = b"POST /v1/evidence HTTP/1.0\r\nHost: localhost\r\n" + headers + b"\r\n" + body
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as conn:
+        conn.sendall(request)
+        conn.shutdown(socket.SHUT_WR)
+        response = conn.recv(4096)
+    return int(response.split(b" ", 2)[1])
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +129,7 @@ def test_sat_work_good_round_trip():
     assert isinstance(cert, SatCertificate)
     assert cert.satisfiable is True
     assert cert.challenge_id == item.challenge_id
-    assert cert.miner_hotkey == HOTKEY
+    assert cert.assigned_hotkey == HOTKEY
     # Verify the assignment is actually satisfying
     true_lits = set(cert.assignment)
     for clause in item.instance.clauses:
@@ -141,7 +160,7 @@ def test_evidence_wrong_hotkey_in_response_rejected():
     with WorkerServer(evidence_collector=wrong_hotkey_collector) as srv:
         _start_server(srv)
         remote = RemoteMiner(srv.base_url, HOTKEY)
-        with pytest.raises(RemoteError, match="hotkey mismatch"):
+        with pytest.raises(RemoteError, match="HTTP 500"):
             remote.fetch_evidence(nonce)
 
 
@@ -156,7 +175,7 @@ def test_evidence_wrong_nonce_in_response_rejected():
     with WorkerServer(evidence_collector=wrong_nonce_collector) as srv:
         _start_server(srv)
         remote = RemoteMiner(srv.base_url, HOTKEY)
-        with pytest.raises(RemoteError, match="nonce mismatch"):
+        with pytest.raises(RemoteError, match="HTTP 500"):
             remote.fetch_evidence(nonce)
 
 
@@ -177,7 +196,7 @@ def test_sat_wrong_challenge_id_response_rejected():
                 "assignment": [1, -2, 3],
                 "work_units": 3.0,
                 "challenge_id": "wrong-id-000",
-                "miner_hotkey": HOTKEY,
+                "assigned_hotkey": HOTKEY,
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -291,6 +310,29 @@ def test_sat_work_instance_unknown_key_rejected():
     assert code == 400
 
 
+@pytest.mark.parametrize(
+    "instance",
+    [
+        {"n_vars": 0, "clauses": []},
+        {"n_vars": True, "clauses": []},
+        {"n_vars": 1, "clauses": [[0]]},
+        {"n_vars": 1, "clauses": [[2]]},
+        {"n_vars": 4097, "clauses": []},
+    ],
+)
+def test_sat_work_rejects_invalid_variable_and_literal_bounds(instance):
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        payload = json.dumps({
+            "challenge_id": "0" * 64,
+            "assigned_hotkey": HOTKEY,
+            "instance": instance,
+            "seed": 0,
+        }).encode()
+        code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
+    assert code == 400
+
+
 def test_unknown_path_returns_404():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
@@ -319,6 +361,53 @@ def test_evidence_empty_hotkey_rejected():
         }).encode()
         code, _ = _post_raw(f"{srv.base_url}/v1/evidence", payload)
     assert code == 400
+
+
+def test_assigned_hotkey_mismatch_rejected_at_both_endpoints():
+    item = _make_sat_item()
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        evidence = json.dumps({
+            "nonce_hex": os.urandom(32).hex(),
+            "assigned_hotkey": OTHER_HOTKEY,
+        }).encode()
+        sat = json.dumps({
+            "challenge_id": item.challenge_id,
+            "assigned_hotkey": OTHER_HOTKEY,
+            "instance": {"n_vars": item.instance.n_vars, "clauses": item.instance.clauses},
+            "seed": item.seed,
+        }).encode()
+        evidence_code, _ = _post_raw(f"{srv.base_url}/v1/evidence", evidence)
+        sat_code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", sat)
+    assert evidence_code == 403
+    assert sat_code == 403
+
+
+def test_nonce_must_be_exactly_32_bytes_on_client_and_worker():
+    remote = RemoteMiner("http://127.0.0.1:1", HOTKEY)
+    with pytest.raises(RemoteError, match="exactly 32 bytes"):
+        remote.collect_evidence(b"short")
+
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        payload = json.dumps({"nonce_hex": "aa" * 31, "assigned_hotkey": HOTKEY}).encode()
+        code, _ = _post_raw(f"{srv.base_url}/v1/evidence", payload)
+    assert code == 400
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        (b"", 411),
+        (b"Content-Length: nope\r\n", 400),
+        (b"Content-Length: -1\r\n", 400),
+        (b"Content-Length: 999999\r\n", 413),
+    ],
+)
+def test_worker_rejects_absent_invalid_negative_and_oversized_lengths(headers, expected):
+    with WorkerServer(evidence_collector=_fake_evidence, max_body=64) as srv:
+        _start_server(srv)
+        assert _raw_http_status(srv.port, headers) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +443,7 @@ def test_oversized_response_rejected():
                 "kind": "tdx",
                 "quote_hex": "aa" * 70_000,  # ~140KB hex
                 "nonce_hex": "bb" * 32,
-                "miner_hotkey": HOTKEY,
+                "assigned_hotkey": HOTKEY,
                 "cert_chain_hex": [],
             }).encode()
             self.send_response(200)
@@ -369,10 +458,52 @@ def test_oversized_response_rejected():
     try:
         url = f"http://127.0.0.1:{fake_srv.server_address[1]}"
         remote = RemoteMiner(url, HOTKEY, max_response_body=1024)  # tiny cap
-        with pytest.raises(RemoteError, match="cap"):
+        with pytest.raises(RemoteError, match="body limit"):
             remote.fetch_evidence(os.urandom(32))
     finally:
         fake_srv.shutdown()
+
+
+def test_actual_response_body_over_cap_rejected_without_content_length():
+    class _UndeclaredBigHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{" + b"x" * 4096 + b"}")
+
+    server = HTTPServer(("127.0.0.1", 0), _UndeclaredBigHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        remote = RemoteMiner(
+            f"http://127.0.0.1:{server.server_address[1]}",
+            HOTKEY,
+            max_response_body=128,
+        )
+        with pytest.raises(RemoteError, match="body limit"):
+            remote.fetch_evidence(os.urandom(32))
+    finally:
+        server.shutdown()
+
+
+def test_worker_caps_generated_response_and_hides_collector_error():
+    secret = "private collector failure"
+
+    def failing_collector(nonce, hotkey):
+        raise RuntimeError(secret)
+
+    with WorkerServer(evidence_collector=failing_collector) as srv:
+        _start_server(srv)
+        payload = json.dumps({
+            "nonce_hex": os.urandom(32).hex(),
+            "assigned_hotkey": HOTKEY,
+        }).encode()
+        code, body = _post_raw(f"{srv.base_url}/v1/evidence", payload)
+    assert code == 500
+    assert secret.encode() not in body
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +566,67 @@ def test_timeout_raises_remote_error():
         remote.fetch_evidence(os.urandom(32))
 
 
+def test_read_timeout_is_typed_and_does_not_leak_details():
+    secret = "internal-secret-that-must-not-leak"
+
+    class _SlowHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            time.sleep(0.2)
+            try:
+                self.wfile.write(secret.encode())
+            except OSError:
+                pass
+
+    server = HTTPServer(("127.0.0.1", 0), _SlowHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        remote = RemoteMiner(
+            f"http://127.0.0.1:{server.server_address[1]}", HOTKEY, timeout=0.02
+        )
+        with pytest.raises(RemoteError) as caught:
+            remote.fetch_evidence(os.urandom(32))
+        assert str(caught.value) == "worker request timed out"
+        assert secret not in str(caught.value)
+    finally:
+        server.shutdown()
+
+
+def test_redirect_is_rejected_without_following_location():
+    followed = threading.Event()
+
+    class _RedirectHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_POST(self):
+            if self.path == "/followed":
+                followed.set()
+                self.send_response(200)
+            else:
+                self.send_response(307)
+                self.send_header("Location", "/followed")
+            self.end_headers()
+
+    server = HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        remote = RemoteMiner(f"http://127.0.0.1:{server.server_address[1]}", HOTKEY)
+        with pytest.raises(RemoteError, match="redirect rejected"):
+            remote.fetch_evidence(os.urandom(32))
+        assert not followed.is_set()
+    finally:
+        server.shutdown()
+
+
+def test_https_required_without_explicit_test_flag():
+    with pytest.raises(ValueError, match="HTTPS"):
+        _RemoteMiner("http://127.0.0.1:8080", HOTKEY)
+
+
 def test_connection_error_does_not_leak_exception_type():
     """RemoteError wraps urllib errors; callers never see raw urllib exceptions."""
     with socket.socket() as s:
@@ -487,7 +679,7 @@ def test_work_units_not_trusted():
                 "assignment": [1, 2, 3],
                 "work_units": 1e300,  # forged / inflated
                 "challenge_id": item.challenge_id,
-                "miner_hotkey": HOTKEY,
+                "assigned_hotkey": HOTKEY,
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -556,7 +748,7 @@ def test_extra_key_in_evidence_response_raises_remote_error():
                 "kind": "tdx",
                 "quote_hex": "aa" * 4,
                 "nonce_hex": req["nonce_hex"],
-                "miner_hotkey": req["assigned_hotkey"],
+                "assigned_hotkey": req["assigned_hotkey"],
                 "cert_chain_hex": [],
                 "surprise_field": "evil",  # extra
             }).encode()
@@ -592,7 +784,7 @@ def test_missing_key_in_sat_response_raises_remote_error():
             body = json.dumps({
                 "satisfiable": True,
                 "assignment": [1, 2, 3],
-                # missing: work_units, challenge_id, miner_hotkey
+                # missing: work_units, challenge_id, assigned_hotkey
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -610,6 +802,37 @@ def test_missing_key_in_sat_response_raises_remote_error():
             remote.do_sat_work(item)
     finally:
         fake_srv.shutdown()
+
+
+def test_malformed_assignment_response_is_rejected():
+    item = _make_sat_item()
+
+    class _BadAssignmentHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.dumps({
+                "satisfiable": True,
+                "assignment": [1, -1, 3],
+                "work_units": 3.0,
+                "challenge_id": item.challenge_id,
+                "assigned_hotkey": HOTKEY,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = HTTPServer(("127.0.0.1", 0), _BadAssignmentHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        remote = RemoteMiner(f"http://127.0.0.1:{server.server_address[1]}", HOTKEY)
+        with pytest.raises(RemoteError, match="invalid assignment"):
+            remote.do_sat_work(item)
+    finally:
+        server.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -655,8 +878,22 @@ def test_certificate_scores_correctly_in_lane():
     assert lane.score(OTHER_HOTKEY, [verified]) == 0.0
 
 
-def test_sat_miner_hotkey_field_backward_compat():
-    """SatCertificate.miner_hotkey defaults to '' — existing construction still works."""
+def test_sat_lane_rejects_certificate_owned_by_another_hotkey():
+    item = _make_sat_item()
+    lane = SatLane()
+    lane._issued_ids.add(item.challenge_id)
+    lane._challenge_owner[item.challenge_id] = HOTKEY
+    forged = SatCertificate(
+        satisfiable=True,
+        assignment=[1, -2, 3],
+        work_units=3.0,
+        challenge_id=item.challenge_id,
+        assigned_hotkey=OTHER_HOTKEY,
+    )
+    assert lane.verify(item, forged) is None
+
+
+def test_sat_assigned_hotkey_defaults_for_existing_construction():
     from cathedral.lanes.sat_types import SatCertificate
     cert = SatCertificate(
         satisfiable=True,
@@ -664,9 +901,36 @@ def test_sat_miner_hotkey_field_backward_compat():
         work_units=3.0,
         challenge_id="abc",
     )
-    assert cert.miner_hotkey == ""
+    assert cert.assigned_hotkey == ""
 
 
 def test_remote_miner_empty_hotkey_raises():
     with pytest.raises(ValueError, match="hotkey"):
         RemoteMiner("http://127.0.0.1:9999", "")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"timeout": 0},
+        {"timeout": float("nan")},
+        {"max_response_body": 0},
+    ],
+)
+def test_remote_miner_rejects_invalid_limits(kwargs):
+    with pytest.raises(ValueError):
+        RemoteMiner("http://127.0.0.1:9999", HOTKEY, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"timeout": 0},
+        {"max_body": 0},
+        {"max_response_body": 0},
+        {"max_concurrent": 0},
+    ],
+)
+def test_worker_server_rejects_invalid_limits(kwargs):
+    with pytest.raises(ValueError):
+        WorkerServer(evidence_collector=_fake_evidence, **kwargs)

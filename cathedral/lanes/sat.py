@@ -232,6 +232,9 @@ class SatLane(Lane):
             return None  # unissued
         if result.challenge_id in self._verified_credits:
             return None  # already verified and credited
+        owner = self._challenge_owner.get(result.challenge_id)
+        if result.assigned_hotkey and result.assigned_hotkey != owner:
+            return None
 
         instance = item.instance
 
@@ -265,6 +268,7 @@ class SatLane(Lane):
                 assignment=result.assignment,
                 work_units=validator_work_units,
                 challenge_id=result.challenge_id,
+                assigned_hotkey=result.assigned_hotkey,
             )
 
         # UNSAT claim: testable core re-solves to confirm (Phase-2: DRAT proof).
@@ -277,6 +281,7 @@ class SatLane(Lane):
             assignment=None,
             work_units=validator_work_units,
             challenge_id=result.challenge_id,
+            assigned_hotkey=result.assigned_hotkey,
         )
 
     def score(self, miner: str, certs: list[Certificate]) -> float:
