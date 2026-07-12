@@ -148,6 +148,24 @@ CATHEDRAL_RUN_TDX_NEGATIVE=1 \
 python -m pytest tests/test_attest_tdx_negative.py -q
 ```
 
+## Cross-Repository Scoring Gate
+
+After the hardware gates, run the local launch proof against the exact scorer
+checkout intended for deployment. The environment must contain both projects'
+dependencies, including the installed Bittensor SDK used by validators:
+
+```bash
+python scripts/cross_repo_launch_verify.py \
+  --scorer-repo /absolute/path/to/cathedral-scorer
+```
+
+The gate starts the real scorer FastAPI app on an ephemeral localhost port,
+posts the ledger's frozen bytes through `cathedral.poster.Poster`, builds one
+signed positive vector, and exercises the production thin-validator and
+Bittensor u16 transforms. It exits nonzero on any contract mismatch and emits
+one compact JSON object with `"status":"PASS"` only after the subsequent
+complete-zero report revokes the confidential snapshot.
+
 ## Definition Of Done
 
 - Hardware-free suite stays green.
