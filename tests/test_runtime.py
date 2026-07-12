@@ -152,6 +152,76 @@ def test_canary_collision_is_rejected_even_when_enrollment_is_duplicated(tmp_pat
     assert ledger.blocking_epoch() is None
 
 
+def test_canary_chip_collision_at_distinct_endpoint_creates_no_epoch(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("canary-chip")})
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        specs,
+    )
+    with pytest.raises(RuntimeError, match="shares the dedicated canary TDX chip"):
+        runtime.run_epoch(1, CANARY)
+    assert ledger.blocking_epoch() is None
+    assert ledger.get_epoch(1) is None
+    assert "nonce:miner" in factory.log
+    assert "sat:canary" in factory.log
+    assert "sat:miner" not in factory.log
+
+
+def _production_runtime(
+    tmp_path: Path,
+    *,
+    enrolled_token: str | None,
+) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
+    registry = RegistryStore(str(tmp_path / "production-registry.sqlite"))
+    registry.enroll("miner", "https://1.1.1.1:9001")
+    ledger = Ledger(tmp_path / "production-ledger.sqlite")
+    specs = {
+        "https://8.8.8.8:9000": MinerSpec("canary-chip"),
+        "https://1.1.1.1:9001": MinerSpec("miner-chip"),
+    }
+    factory = FakeFactory(specs)
+    runtime = ConfidentialRuntime(
+        registry,
+        ledger,
+        Policy(allowed_measurements={"measurement"}),
+        token_provider=lambda _hotkey: enrolled_token,
+        verifier=verifier,
+        remote_factory=factory,
+        config=RuntimeConfig(production_mode=True),
+    )
+    return runtime, ledger, factory
+
+
+def test_production_missing_canary_token_fails_before_network_or_epoch(tmp_path: Path) -> None:
+    runtime, ledger, factory = _production_runtime(tmp_path, enrolled_token="miner-token")
+    canary = MinerTarget("canary", "https://8.8.8.8:9000")
+    with pytest.raises(ValueError, match="bearer token"):
+        runtime.run_epoch(1, canary)
+    assert factory.log == {}
+    assert ledger.blocking_epoch() is None
+
+
+def test_production_missing_enrollment_token_fails_before_network_or_epoch(
+    tmp_path: Path,
+) -> None:
+    runtime, ledger, factory = _production_runtime(tmp_path, enrolled_token=None)
+    canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
+    with pytest.raises(RuntimeError, match="authentication is required"):
+        runtime.run_epoch(1, canary)
+    assert factory.log == {}
+    assert ledger.blocking_epoch() is None
+
+
+def test_production_authenticated_targets_complete(tmp_path: Path) -> None:
+    runtime, _, factory = _production_runtime(tmp_path, enrolled_token="miner-token")
+    canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
+    run = runtime.run_epoch(1, canary)
+    assert run.status == "complete"
+    assert run.scores["miner"] == 1.0
+    assert "nonce:canary" in factory.log and "nonce:miner" in factory.log
+
+
 def test_two_unique_tdx_miners_complete_normalized(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")})
     runtime, _, _ = make_runtime(

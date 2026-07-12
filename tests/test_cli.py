@@ -10,8 +10,10 @@ import argparse
 import pytest
 
 from cathedral.cli import (
+    DEFAULT_WORKER_BEARER_ENV,
     _dict_to_item,
     _item_to_dict,
+    _load_tokens,
     build_parser,
     cmd_work_submit,
     cmd_work_status,
@@ -175,6 +177,8 @@ def test_runtime_restart_commands_only_require_ledger_path():
 def test_worker_serve_defaults_to_loopback():
     args = build_parser().parse_args(["worker", "serve", "--hotkey", "miner"])
     assert args.host == "127.0.0.1"
+    assert args.bearer_token_env == DEFAULT_WORKER_BEARER_ENV
+    assert args.development_no_auth is False
 
 
 def test_worker_serve_refuses_non_loopback_without_development_flag():
@@ -192,6 +196,58 @@ def test_worker_serve_refuses_non_loopback_without_development_flag():
 def test_plain_worker_server_itself_guards_non_loopback():
     with pytest.raises(ValueError, match="loopback"):
         WorkerServer("0.0.0.0", configured_hotkey="miner")
+
+
+def test_worker_serve_requires_default_bearer_environment_value(monkeypatch):
+    monkeypatch.delenv(DEFAULT_WORKER_BEARER_ENV, raising=False)
+    args = build_parser().parse_args(["worker", "serve", "--hotkey", "miner"])
+    with pytest.raises(ValueError, match=DEFAULT_WORKER_BEARER_ENV):
+        cmd_worker_serve(args)
+
+
+def test_worker_development_no_auth_is_explicit(monkeypatch):
+    calls = []
+
+    class FakeServer:
+        host = "127.0.0.1"
+        port = 8081
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    args = build_parser().parse_args(
+        ["worker", "serve", "--hotkey", "miner", "--development-no-auth"]
+    )
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["bearer_token"] is None
+
+
+def test_production_token_mapping_requires_owner_only_permissions(tmp_path: Path):
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text('{"miner":"secret-token"}', encoding="utf-8")
+    token_file.chmod(0o644)
+    with pytest.raises(ValueError, match="owner-only"):
+        _load_tokens(str(token_file), production_mode=True)
+
+    token_file.chmod(0o600)
+    assert _load_tokens(str(token_file), production_mode=True) == {
+        "miner": "secret-token"
+    }
+
+    link = tmp_path / "tokens-link.json"
+    link.symlink_to(token_file)
+    with pytest.raises(ValueError, match="securely open"):
+        _load_tokens(str(link), production_mode=True)
 
 
 def test_publisher_secrets_have_env_name_flags_only():

@@ -25,6 +25,8 @@ from cathedral.poster import Poster
 from cathedral.remote import RemoteMiner
 from cathedral.verify import verify
 
+MAX_BEARER_TOKEN_LENGTH = 4096
+
 
 class RuntimeError(Exception):
     """Raised when a confidential runtime invariant fails."""
@@ -115,6 +117,12 @@ class _AttestationResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class _CanaryResult:
+    outcome: MinerOutcome
+    attestation: _AttestationResult
+
+
 Verifier = Callable[[Evidence, bytes, Policy], Attested | None]
 NonceFactory = Callable[[], bytes]
 TokenProvider = Callable[[str], str | None]
@@ -148,6 +156,9 @@ class ConfidentialRuntime:
         self.config = config or RuntimeConfig()
 
     def check_canary(self, canary: MinerTarget) -> MinerOutcome:
+        return self._check_canary_result(canary).outcome
+
+    def _check_canary_result(self, canary: MinerTarget) -> _CanaryResult:
         target, endpoint = self._validate_target(canary)
         result = self._collect_attestation(target, endpoint)
         if result.attested is None or result.client is None:
@@ -164,13 +175,16 @@ class ConfidentialRuntime:
         units = lane.score(target.hotkey, [accepted])
         if units <= 0:
             raise RuntimeError("canary SAT produced no verified work")
-        return MinerOutcome(
-            hotkey=target.hotkey,
-            endpoint_url=endpoint,
-            status="canary_verified",
-            admitted=True,
-            challenge_id=item.challenge_id,
-            work_units=units,
+        return _CanaryResult(
+            outcome=MinerOutcome(
+                hotkey=target.hotkey,
+                endpoint_url=endpoint,
+                status="canary_verified",
+                admitted=True,
+                challenge_id=item.challenge_id,
+                work_units=units,
+            ),
+            attestation=result,
         )
 
     def run_epoch(
@@ -193,14 +207,24 @@ class ConfidentialRuntime:
             )
             for enrollment in enrollments
         ]
+        self._validate_required_auth((canary_target, *targets))
         prepared, outcomes, enrolled_endpoints = self._prepare_targets(targets)
         if canary_endpoint in enrolled_endpoints:
             raise RuntimeError("canary endpoint must be dedicated and not enrolled")
 
-        self.check_canary(canary_target)
+        canary_result = self._check_canary_result(canary_target)
+        attested = self._attest_targets(prepared, outcomes)
+        canary_attested = canary_result.attestation.attested
+        assert canary_attested is not None
+        if any(
+            result.attested is not None
+            and result.attested.chip_id == canary_attested.chip_id
+            for result in attested
+        ):
+            raise RuntimeError("an enrolled miner shares the dedicated canary TDX chip")
+
         epoch_id = self.ledger.begin_epoch(source_epoch)
         try:
-            attested = self._attest_targets(prepared, outcomes)
             admitted = self._admit_unique_chips(epoch_id, attested, outcomes)
             self._run_sat(epoch_id, source_epoch, admitted, outcomes)
 
@@ -469,10 +493,25 @@ class ConfidentialRuntime:
     def _validate_target(self, target: MinerTarget) -> tuple[MinerTarget, str]:
         if not isinstance(target, MinerTarget):
             raise TypeError("target must be a MinerTarget")
-        if not target.hotkey or not isinstance(target.hotkey, str):
+        if not isinstance(target.hotkey, str) or not target.hotkey:
             raise ValueError("target hotkey must be a nonempty string")
+        _validate_bearer_token(
+            target.bearer_token,
+            required=self.config.production_mode,
+        )
         endpoint = _canonical_endpoint(target.endpoint_url, self.config)
         return target, endpoint
+
+    def _validate_required_auth(self, targets: tuple[MinerTarget, ...]) -> None:
+        if not self.config.production_mode:
+            return
+        for target in targets:
+            try:
+                _validate_bearer_token(target.bearer_token, required=True)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"production bearer authentication is required for target {target.hotkey!r}"
+                ) from exc
 
 
 def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:
@@ -507,6 +546,18 @@ def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:
     default_port = 443 if parsed.scheme == "https" else 80
     authority = host if port in {None, default_port} else f"{host}:{port}"
     return f"{parsed.scheme}://{authority}"
+
+
+def _validate_bearer_token(token: str | None, *, required: bool) -> None:
+    if token is None and not required:
+        return
+    if (
+        not isinstance(token, str)
+        or not token
+        or len(token) > MAX_BEARER_TOKEN_LENGTH
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in token)
+    ):
+        raise ValueError("bearer token must be a nonempty bounded ASCII value")
 
 
 def _evidence_digest(evidence: Evidence) -> str:

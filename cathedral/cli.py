@@ -25,6 +25,7 @@ import argparse
 import ipaddress
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from cathedral.poster import Poster
 from cathedral.runtime import (
     ConfidentialRuntime,
     EpochRun,
+    MAX_BEARER_TOKEN_LENGTH,
     MinerOutcome,
     MinerTarget,
     RuntimeConfig,
@@ -48,6 +50,7 @@ from cathedral.worker import WorkerServer
 DEFAULT_QUEUE_FILE = Path(".cathedral_queue.json")
 DEFAULT_PUBLISHER_BEARER_ENV = "CATHEDRAL_PUBLISHER_BEARER_TOKEN"
 DEFAULT_PUBLISHER_HMAC_ENV = "CATHEDRAL_PUBLISHER_HMAC_SECRET"
+DEFAULT_WORKER_BEARER_ENV = "CATHEDRAL_WORKER_BEARER_TOKEN"
 
 
 # --------------------------------------------------------------------------
@@ -179,19 +182,56 @@ def _load_policy(path: str) -> Policy:
     return Policy(allowed_measurements=set(measurements), min_tcb=min_tcb)
 
 
-def _load_tokens(path: str | None) -> dict[str, str]:
+def _load_tokens(path: str | None, *, production_mode: bool = False) -> dict[str, str]:
     if path is None:
         return {}
-    raw = _load_json(path, "token mapping")
+    if production_mode and os.name == "posix":
+        raw = _load_production_tokens(path)
+    else:
+        raw = _load_json(path, "token mapping")
     if not isinstance(raw, dict) or any(
         not isinstance(hotkey, str)
         or not hotkey
-        or not isinstance(token, str)
-        or not token
+        or not _valid_bearer_token(token)
         for hotkey, token in raw.items()
     ):
-        raise ValueError("token mapping must map hotkeys to nonempty strings")
+        raise ValueError("token mapping must contain bounded bearer tokens")
     return dict(raw)
+
+
+def _load_production_tokens(path: str) -> object:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor: int | None = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError("unable to securely open token mapping file") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("production token mapping must be a regular file")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError("production token mapping permissions must be owner-only")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise ValueError("production token mapping must be owned by the current user")
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = None
+            try:
+                return json.load(handle)
+            except json.JSONDecodeError as exc:
+                raise ValueError("unable to load token mapping file") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _valid_bearer_token(token: object) -> bool:
+    return (
+        isinstance(token, str)
+        and 0 < len(token) <= MAX_BEARER_TOKEN_LENGTH
+        and all(0x21 <= ord(character) <= 0x7E for character in token)
+    )
 
 
 def _publisher_from_args(args: argparse.Namespace) -> Poster | None:
@@ -210,13 +250,17 @@ def _publisher_from_args(args: argparse.Namespace) -> Poster | None:
 
 
 def _build_runtime(args: argparse.Namespace) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
-    tokens = _load_tokens(getattr(args, "tokens_file", None))
+    development = getattr(args, "development", False)
     config = RuntimeConfig(
         miner_timeout_seconds=getattr(args, "miner_timeout_seconds", 10.0),
         miner_attempts=getattr(args, "miner_attempts", 2),
         max_workers=getattr(args, "max_workers", 8),
-        production_mode=not getattr(args, "development", False),
-        allow_insecure_http_for_tests=getattr(args, "development", False),
+        production_mode=not development,
+        allow_insecure_http_for_tests=development,
+    )
+    tokens = _load_tokens(
+        getattr(args, "tokens_file", None),
+        production_mode=config.production_mode,
     )
     ledger = Ledger(args.ledger_db)
     measurements_file = getattr(args, "measurements_file", None)
@@ -268,7 +312,17 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         raise ValueError(
             "plain worker HTTP must bind loopback unless development mode is explicit"
         )
-    token = os.environ.get(args.bearer_token_env) if args.bearer_token_env else None
+    if getattr(args, "development_no_auth", False):
+        token = None
+    else:
+        bearer_env = getattr(args, "bearer_token_env", DEFAULT_WORKER_BEARER_ENV)
+        if not isinstance(bearer_env, str) or not bearer_env:
+            raise ValueError("worker bearer environment variable name is required")
+        token = os.environ.get(bearer_env)
+        if not _valid_bearer_token(token):
+            raise ValueError(
+                f"worker bearer token must be set in {bearer_env}"
+            )
     with WorkerServer(
         args.host,
         args.port,
@@ -389,7 +443,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--hotkey", required=True)
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8081)
-    p_serve.add_argument("--bearer-token-env", default=None)
+    p_serve.add_argument("--bearer-token-env", default=DEFAULT_WORKER_BEARER_ENV)
+    p_serve.add_argument("--development-no-auth", action="store_true")
     p_serve.add_argument("--development-allow-non-loopback", action="store_true")
     p_serve.set_defaults(func=cmd_worker_serve)
 
