@@ -9,9 +9,18 @@ import argparse
 
 import pytest
 
-from cathedral.cli import _dict_to_item, _item_to_dict, cmd_work_submit, cmd_work_status, main
+from cathedral.cli import (
+    _dict_to_item,
+    _item_to_dict,
+    build_parser,
+    cmd_work_submit,
+    cmd_work_status,
+    cmd_worker_serve,
+    main,
+)
 from cathedral.lanes.sat import _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
+from cathedral.worker import WorkerServer
 
 
 # ---------------------------------------------------------------------------
@@ -141,3 +150,51 @@ def test_cli_verify_quote_pass():
 def test_cli_verify_quote_fail():
     rc = main(["verify-quote", "--measurement", "xyz", "--allowed-measurement", "abc", "--tcb", "3", "--min-tcb", "1"])
     assert rc == 1
+
+
+def test_runtime_run_epoch_is_dry_by_default_and_publish_is_explicit():
+    parser = build_parser()
+    common = [
+        "runtime", "run-epoch",
+        "--registry-db", "registry.sqlite",
+        "--ledger-db", "ledger.sqlite",
+        "--measurements-file", "measurements.json",
+        "--canary-hotkey", "canary",
+        "--canary-endpoint", "https://8.8.8.8",
+        "--source-epoch", "9",
+    ]
+    assert parser.parse_args(common).publish is False
+    assert parser.parse_args([*common, "--publish"]).publish is True
+
+
+def test_runtime_restart_commands_only_require_ledger_path():
+    args = build_parser().parse_args(["runtime", "status", "--ledger-db", "ledger.sqlite"])
+    assert args.runtime_command == "status"
+
+
+def test_worker_serve_defaults_to_loopback():
+    args = build_parser().parse_args(["worker", "serve", "--hotkey", "miner"])
+    assert args.host == "127.0.0.1"
+
+
+def test_worker_serve_refuses_non_loopback_without_development_flag():
+    args = argparse.Namespace(
+        host="0.0.0.0",
+        port=8081,
+        hotkey="miner",
+        bearer_token_env=None,
+        development_allow_non_loopback=False,
+    )
+    with pytest.raises(ValueError, match="loopback"):
+        cmd_worker_serve(args)
+
+
+def test_plain_worker_server_itself_guards_non_loopback():
+    with pytest.raises(ValueError, match="loopback"):
+        WorkerServer("0.0.0.0", configured_hotkey="miner")
+
+
+def test_publisher_secrets_have_env_name_flags_only():
+    help_text = build_parser().format_help()
+    assert "--publisher-bearer-token" not in help_text
+    assert "--publisher-hmac-secret" not in help_text

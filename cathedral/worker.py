@@ -1,10 +1,12 @@
 """Bounded plain-HTTP server for evidence collection and canonical SAT work.
 
-``WorkerServer`` is intended to listen on a private interface behind an HTTPS
-terminator. The corresponding ``RemoteMiner`` client requires HTTPS by default.
+``WorkerServer`` listens on loopback behind an HTTPS terminator unless an
+explicit development-only override is supplied. The corresponding
+``RemoteMiner`` client requires HTTPS by default.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import re
@@ -261,7 +263,7 @@ def _parse_instance(raw: object) -> SatInstance | None:
 class WorkerServer:
     """Expose one miner identity over bounded plain HTTP.
 
-    Production deployments must place this server behind an HTTPS terminator.
+    Production deployments must keep this server on loopback behind an HTTPS terminator.
     SAT work is restricted to deterministic ``SatLane`` canonical backfill by
     default; ``allow_noncanonical_sat`` exists only for tests and development.
     """
@@ -279,7 +281,16 @@ class WorkerServer:
         max_response_body: int = MAX_RESPONSE_BODY,
         timeout: float = 10.0,
         allow_noncanonical_sat: bool = False,
+        allow_non_loopback_for_development: bool = False,
     ) -> None:
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host == "localhost"
+        if not isinstance(allow_non_loopback_for_development, bool):
+            raise ValueError("allow_non_loopback_for_development must be a boolean")
+        if not loopback and not allow_non_loopback_for_development:
+            raise ValueError("plain worker HTTP must bind a loopback address")
         if (
             not isinstance(configured_hotkey, str)
             or not configured_hotkey
