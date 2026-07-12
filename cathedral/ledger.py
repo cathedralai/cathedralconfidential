@@ -10,7 +10,8 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping, Protocol
 
 
 class LedgerError(Exception):
@@ -69,6 +70,21 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _validated_generated_at(value: str | None) -> str:
+    if value is None:
+        return _now()
+    if not isinstance(value, str):
+        raise LedgerError("generated_at must be a timezone-aware ISO-8601 string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        offset = parsed.utcoffset()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise LedgerError("generated_at must be a timezone-aware ISO-8601 string") from exc
+    if offset is None:
+        raise LedgerError("generated_at must be a timezone-aware ISO-8601 string")
+    return value
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -77,6 +93,10 @@ def _canonical_json(value: Any) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode("utf-8")
+
+
+class ReportPoster(Protocol):
+    def post(self, report_body: bytes) -> dict[str, Any]: ...
 
 
 class Ledger:
@@ -264,6 +284,7 @@ class Ledger:
         generated_at: str | None = None,
     ) -> dict[str, float]:
         """Freeze scores and canonical report bytes in one durable transaction."""
+        stable_generated_at = _validated_generated_at(generated_at)
         universe = set(all_hotkeys)
         if any(not isinstance(hotkey, str) or not hotkey for hotkey in universe):
             raise LedgerError("all hotkeys must be nonempty strings")
@@ -337,7 +358,6 @@ class Ledger:
                 hotkey: (units / maximum if maximum > 0 else 0.0)
                 for hotkey, units in gated.items()
             }
-            stable_generated_at = generated_at or _now()
             report = {
                 "complete": True,
                 "epoch": epoch["source_epoch"],
@@ -402,6 +422,35 @@ class Ledger:
                 "UPDATE epochs SET status = 'published', published_at = ? WHERE epoch_id = ?",
                 (_now(), epoch_id),
             )
+
+    def blocking_epoch(self) -> Mapping[str, Any] | None:
+        """Return immutable restart data for the sole running/complete epoch."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT epoch_id, source_epoch, status, started_at, completed_at, "
+                "generated_at, report_digest FROM epochs "
+                "WHERE status IN ('running', 'complete') LIMIT 1"
+            ).fetchone()
+            return MappingProxyType(dict(row)) if row else None
+
+    def pending_epoch(self) -> Mapping[str, Any] | None:
+        """Alias for :meth:`blocking_epoch` for restart-oriented callers."""
+        return self.blocking_epoch()
+
+    def post_and_mark_published(
+        self, epoch_id: int, poster: ReportPoster
+    ) -> dict[str, Any]:
+        """Post frozen bytes, then mark published after an accepted response.
+
+        The network call occurs after ``report_bytes`` releases the ledger lock
+        and before ``mark_published`` opens its short database transaction.
+        """
+        body = self.report_bytes(epoch_id)
+        acknowledgement = poster.post(body)
+        if acknowledgement.get("status") != "accepted":
+            raise LedgerError("publication acknowledgement status must be 'accepted'")
+        self.mark_published(epoch_id, hashlib.sha256(body).hexdigest())
+        return acknowledgement
 
     def get_epoch(self, epoch_id: int) -> dict[str, Any] | None:
         with self._lock:

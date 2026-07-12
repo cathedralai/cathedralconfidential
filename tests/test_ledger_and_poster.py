@@ -6,6 +6,7 @@ import json
 import socket
 import threading
 import urllib.error
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -135,6 +136,27 @@ class TestEpochStateMachine:
         reopened.mark_published(epoch_id, digest)
         assert reopened.get_epoch(epoch_id)["status"] == "published"
 
+    def test_reopen_exposes_immutable_blocking_epoch(self, tmp_path: Path) -> None:
+        path = tmp_path / "ledger.sqlite3"
+        first = Ledger(path)
+        epoch_id = first.begin_epoch(12)
+        first.close()
+
+        reopened = Ledger(path)
+        blocking = reopened.blocking_epoch()
+        assert blocking is not None
+        assert blocking["epoch_id"] == epoch_id
+        assert blocking["source_epoch"] == 12
+        assert blocking["status"] == "running"
+        assert reopened.pending_epoch() == blocking
+        with pytest.raises(TypeError):
+            blocking["status"] = "published"  # type: ignore[index]
+
+        reopened.complete_epoch(epoch_id, set())
+        assert reopened.blocking_epoch()["status"] == "complete"
+        reopened.mark_published(epoch_id)
+        assert reopened.blocking_epoch() is None
+
 
 class TestEvidenceAndResolution:
     @pytest.mark.parametrize(
@@ -221,6 +243,26 @@ class TestEvidenceAndResolution:
 
 
 class TestReportSnapshot:
+    @pytest.mark.parametrize("generated_at", ["not-a-date", "2026-01-01T00:00:00"])
+    def test_generated_at_must_be_timezone_aware_before_mutation(
+        self, generated_at: str
+    ) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        with pytest.raises(LedgerError, match="timezone-aware ISO-8601"):
+            ledger.complete_epoch(epoch_id, {"hk"}, generated_at=generated_at)
+        assert ledger.get_epoch(epoch_id)["status"] == "running"
+        with pytest.raises(LedgerError, match="no completed report"):
+            ledger.report_bytes(epoch_id)
+
+    def test_default_generated_at_is_current_utc(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.complete_epoch(epoch_id, set())
+        generated_at = datetime.fromisoformat(report(ledger, epoch_id)["generated_at"])
+        assert generated_at.utcoffset() is not None
+        assert generated_at.utcoffset().total_seconds() == 0
+
     def test_full_universe_zero_revocation_fresh_gate_and_max_normalization(self) -> None:
         ledger = Ledger()
         epoch_id = ledger.begin_epoch(1)
@@ -391,10 +433,19 @@ class TestPoster:
         with pytest.raises(PosterError, match="endpoint path"):
             Poster("https://publisher.example/other", "token", "secret")
 
+    @pytest.mark.parametrize("secret", ["", b""])
+    def test_requires_nonempty_hmac_secret(self, secret: str | bytes) -> None:
+        with pytest.raises(PosterError, match="HMAC secret must be a nonempty"):
+            Poster(
+                "https://publisher.example/v1/external-scores/violet",
+                "token",
+                secret,
+            )
+
     def test_posts_exact_body_with_required_headers_and_signature(self) -> None:
         poster = make_poster()
         body = b'{"complete":true,"epoch":1}'
-        response = FakeResponse([b'{"accepted":true}', b""])
+        response = FakeResponse([b'{"status":"accepted"}', b""])
         captured = {}
 
         def open_request(request, *, timeout):
@@ -403,7 +454,7 @@ class TestPoster:
             return response
 
         poster._opener.open = open_request
-        assert poster.post(body) == {"accepted": True}
+        assert poster.post(body) == {"status": "accepted"}
         request = captured["request"]
         assert request.data is body
         assert request.get_method() == "POST"
@@ -421,7 +472,7 @@ class TestPoster:
 
         def open_request(request, *, timeout):
             seen.append(request.data)
-            return FakeResponse([b"{}", b""])
+            return FakeResponse([b'{"status":"accepted"}', b""])
 
         poster._opener.open = open_request
         poster.post(body)
@@ -473,10 +524,22 @@ class TestPoster:
         with pytest.raises(PosterError, match="JSON must be an object"):
             poster.post(b"{}")
 
+    @pytest.mark.parametrize(
+        "body",
+        [b"{}", b'{"status":"rejected"}', b'{"status":true}'],
+    )
+    def test_requires_accepted_acknowledgement(self, body: bytes) -> None:
+        poster = make_poster()
+        poster._opener.open = lambda *args, **kwargs: FakeResponse([body, b""])
+        with pytest.raises(PosterError, match="acknowledgement status"):
+            poster.post(b"{}")
+
     def test_non_2xx_is_rejected(self) -> None:
         poster = make_poster()
-        poster._opener.open = lambda *args, **kwargs: FakeResponse([b"{}"], status=299)
-        assert poster.post(b"{}") == {}
+        poster._opener.open = lambda *args, **kwargs: FakeResponse(
+            [b'{"status":"accepted"}'], status=299
+        )
+        assert poster.post(b"{}") == {"status": "accepted"}
         poster._opener.open = lambda *args, **kwargs: FakeResponse([b"{}"], status=300)
         with pytest.raises(PosterError, match="unexpected HTTP status 300"):
             poster.post(b"{}")
@@ -487,7 +550,7 @@ class TestPoster:
             poster.post({"scores": []})  # type: ignore[arg-type]
 
 
-def test_ledger_report_is_posted_byte_for_byte() -> None:
+def test_ledger_report_is_posted_byte_for_byte_and_then_marked() -> None:
     ledger = Ledger()
     epoch_id = ledger.begin_epoch(1)
     verified_work(ledger, epoch_id, "challenge", "hk", 1)
@@ -500,9 +563,46 @@ def test_ledger_report_is_posted_byte_for_byte() -> None:
 
     def open_request(request, *, timeout):
         seen.append(request.data)
-        return FakeResponse([b'{"accepted":true}', b""])
+        return FakeResponse([b'{"status":"accepted"}', b""])
 
     poster._opener.open = open_request
-    assert poster.post(body) == {"accepted": True}
+    assert ledger.post_and_mark_published(epoch_id, poster) == {"status": "accepted"}
     assert seen == [body]
-    ledger.mark_published(epoch_id, hashlib.sha256(seen[0]).hexdigest())
+    assert ledger.get_epoch(epoch_id)["status"] == "published"
+
+
+def test_post_and_mark_leaves_epoch_complete_without_accepted_ack() -> None:
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(epoch_id, set())
+
+    class RejectingPoster:
+        def post(self, report_body: bytes) -> dict:
+            return {"status": "rejected"}
+
+    with pytest.raises(LedgerError, match="acknowledgement status"):
+        ledger.post_and_mark_published(epoch_id, RejectingPoster())
+    assert ledger.get_epoch(epoch_id)["status"] == "complete"
+
+
+def test_post_and_mark_does_not_hold_database_lock_during_network_call() -> None:
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(epoch_id, set())
+
+    class InspectingPoster:
+        def post(self, report_body: bytes) -> dict:
+            finished = threading.Event()
+
+            def inspect() -> None:
+                assert ledger.blocking_epoch()["epoch_id"] == epoch_id
+                finished.set()
+
+            thread = threading.Thread(target=inspect)
+            thread.start()
+            thread.join(timeout=1)
+            assert finished.is_set(), "ledger lock was held during network I/O"
+            return {"status": "accepted"}
+
+    ledger.post_and_mark_published(epoch_id, InspectingPoster())
+    assert ledger.get_epoch(epoch_id)["status"] == "published"

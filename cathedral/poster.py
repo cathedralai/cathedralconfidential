@@ -53,6 +53,8 @@ class Poster:
             raise PosterError("endpoint must include a host")
         if not bearer_token:
             raise PosterError("bearer token is required")
+        if not isinstance(secret, (str, bytes)) or not secret:
+            raise PosterError("HMAC secret must be a nonempty string or bytes")
         if connect_timeout <= 0 or read_timeout <= 0 or total_timeout <= 0:
             raise PosterError("timeouts must be positive")
         if response_cap_bytes <= 0:
@@ -113,6 +115,8 @@ class Poster:
             raise PosterError("response must be valid UTF-8 JSON") from exc
         if not isinstance(decoded, dict):
             raise PosterError("response JSON must be an object")
+        if decoded.get("status") != "accepted":
+            raise PosterError("response acknowledgement status must be 'accepted'")
         return decoded
 
     def _read_response(self, response: Any, deadline: float) -> bytes:
