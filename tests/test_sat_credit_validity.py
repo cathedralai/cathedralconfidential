@@ -81,8 +81,13 @@ class TestInvalidCreditValues:
             instance=inst, seed=0, challenge_id=challenge_id
         )
         lane._issued_ids.add(challenge_id)
+        lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
-            satisfiable=True, assignment=[1], work_units=float("nan"), challenge_id=challenge_id
+            satisfiable=True,
+            assignment=[1],
+            work_units=float("nan"),
+            challenge_id=challenge_id,
+            assigned_hotkey="miner-x",
         )
         verified = lane.verify(item, cert)
         assert verified is not None
@@ -98,8 +103,13 @@ class TestInvalidCreditValues:
             instance=inst, seed=0, challenge_id=challenge_id
         )
         lane._issued_ids.add(challenge_id)
+        lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
-            satisfiable=True, assignment=[1], work_units=float("inf"), challenge_id=challenge_id
+            satisfiable=True,
+            assignment=[1],
+            work_units=float("inf"),
+            challenge_id=challenge_id,
+            assigned_hotkey="miner-x",
         )
         verified = lane.verify(item, cert)
         assert verified is not None
@@ -115,8 +125,13 @@ class TestInvalidCreditValues:
             instance=inst, seed=0, challenge_id=challenge_id
         )
         lane._issued_ids.add(challenge_id)
+        lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
-            satisfiable=True, assignment=[1], work_units=float("-inf"), challenge_id=challenge_id
+            satisfiable=True,
+            assignment=[1],
+            work_units=float("-inf"),
+            challenge_id=challenge_id,
+            assigned_hotkey="miner-x",
         )
         verified = lane.verify(item, cert)
         assert verified is not None
@@ -132,8 +147,13 @@ class TestInvalidCreditValues:
             instance=inst, seed=0, challenge_id=challenge_id
         )
         lane._issued_ids.add(challenge_id)
+        lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
-            satisfiable=True, assignment=[1], work_units=1e300, challenge_id=challenge_id
+            satisfiable=True,
+            assignment=[1],
+            work_units=1e300,
+            challenge_id=challenge_id,
+            assigned_hotkey="miner-x",
         )
         verified = lane.verify(item, cert)
         assert verified is not None
@@ -149,8 +169,13 @@ class TestInvalidCreditValues:
             instance=inst, seed=0, challenge_id=challenge_id
         )
         lane._issued_ids.add(challenge_id)
+        lane._challenge_owner[challenge_id] = "miner-x"
         cert = SatCertificate(
-            satisfiable=True, assignment=[1], work_units=-5.0, challenge_id=challenge_id
+            satisfiable=True,
+            assignment=[1],
+            work_units=-5.0,
+            challenge_id=challenge_id,
+            assigned_hotkey="miner-x",
         )
         verified = lane.verify(item, cert)
         assert verified is not None
@@ -220,6 +245,7 @@ class TestDuplicateCreditPrevention:
             assignment=assignment,
             work_units=1.0,
             challenge_id=item.challenge_id,
+            assigned_hotkey="miner-1",
         )
 
         # First verification should succeed
@@ -283,6 +309,7 @@ class TestDuplicateCreditPrevention:
             assignment=assignment,
             work_units=1.0,
             challenge_id=item.challenge_id,
+            assigned_hotkey="miner-1",
         )
         verified = lane.verify(item, cert)
         assert verified is not None
@@ -466,6 +493,7 @@ class TestScoreDeduplication:
             assignment=assignment,
             work_units=1.0,
             challenge_id=item.challenge_id,
+            assigned_hotkey="miner-1",
         )
 
         # Verify once; adds to _verified_credits
@@ -507,6 +535,7 @@ class TestChallengeOwnership:
             assignment=assignment,
             work_units=1.0,
             challenge_id=item.challenge_id,
+            assigned_hotkey="miner-x",
         )
 
         verified = lane.verify(item, cert)
@@ -527,6 +556,7 @@ class TestChallengeOwnership:
             assignment=assignment,
             work_units=1.0,
             challenge_id=item.challenge_id,
+            assigned_hotkey="miner-a",
         )
 
         # Verify as miner-a (owner)
@@ -554,6 +584,7 @@ class TestChallengeOwnership:
             assignment=assignment,
             work_units=1.0,
             challenge_id=item.challenge_id,
+            assigned_hotkey="miner-a",
         )
 
         # Verify and score for same miner
@@ -580,12 +611,14 @@ class TestChallengeOwnership:
             assignment=assignment_a,
             work_units=1.0,
             challenge_id=item_a.challenge_id,
+            assigned_hotkey="miner-1",
         )
         cert_b = SatCertificate(
             satisfiable=True,
             assignment=assignment_b,
             work_units=2.0,
             challenge_id=item_b.challenge_id,
+            assigned_hotkey="miner-2",
         )
 
         verified_a = lane.verify(item_a, cert_a)

@@ -233,7 +233,7 @@ class SatLane(Lane):
         if result.challenge_id in self._verified_credits:
             return None  # already verified and credited
         owner = self._challenge_owner.get(result.challenge_id)
-        if result.assigned_hotkey and result.assigned_hotkey != owner:
+        if not result.assigned_hotkey or result.assigned_hotkey != owner:
             return None
 
         instance = item.instance

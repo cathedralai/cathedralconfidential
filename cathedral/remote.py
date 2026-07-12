@@ -1,4 +1,4 @@
-"""Typed, bounded HTTP client for a Cathedral miner worker."""
+"""Typed, bounded HTTPS-by-default client for a Cathedral miner worker."""
 from __future__ import annotations
 
 import json

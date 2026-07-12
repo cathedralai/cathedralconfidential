@@ -24,7 +24,7 @@ from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.verify.mock import mock_evidence, verify_mock
 
 
-def _solve_sat_work(item: SatWorkItem) -> SatCertificate:
+def _solve_sat_work(item: SatWorkItem, assigned_hotkey: str) -> SatCertificate:
     assignment = solve_sat(item.instance)
     if assignment is None:
         return SatCertificate(
@@ -32,12 +32,14 @@ def _solve_sat_work(item: SatWorkItem) -> SatCertificate:
             assignment=None,
             work_units=1.0,
             challenge_id=item.challenge_id,
+            assigned_hotkey=assigned_hotkey,
         )
     return SatCertificate(
         satisfiable=True,
         assignment=assignment,
         work_units=float(len(item.instance.clauses)),
         challenge_id=item.challenge_id,
+        assigned_hotkey=assigned_hotkey,
     )
 
 
@@ -85,7 +87,7 @@ class MockMiner:
         is claimed with no assignment (DRAT proof in production).
         """
 
-        return _solve_sat_work(item)
+        return _solve_sat_work(item, self.uid)
 
 
 @dataclass
@@ -105,7 +107,7 @@ class TdxMiner:
         return collect_tdx(nonce, self.hotkey, self.ssh_host_key)
 
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate:
-        return _solve_sat_work(item)
+        return _solve_sat_work(item, self.uid)
 
 
 def main() -> None:

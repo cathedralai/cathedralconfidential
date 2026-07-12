@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from cathedral.common import Evidence, EvidenceKind
-from cathedral.lanes.sat import SatLane, _compute_challenge_id
+from cathedral.lanes.sat import SatLane, _canonical_instance, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.remote import RemoteError, RemoteMiner as _RemoteMiner
 from cathedral.worker import WorkerServer as _WorkerServer
@@ -42,6 +42,7 @@ OTHER_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 def WorkerServer(*args, **kwargs):
     kwargs.setdefault("configured_hotkey", HOTKEY)
+    kwargs.setdefault("allow_noncanonical_sat", True)
     return _WorkerServer(*args, **kwargs)
 
 
@@ -134,6 +135,50 @@ def test_sat_work_good_round_trip():
     true_lits = set(cert.assignment)
     for clause in item.instance.clauses:
         assert any(lit in true_lits for lit in clause), f"clause {clause} not satisfied"
+
+
+def test_canonical_sat_happy_path_with_production_default():
+    seed = 17
+    instance = _canonical_instance(seed)
+    item = SatWorkItem(
+        instance=instance,
+        seed=seed,
+        challenge_id=_compute_challenge_id(instance, seed),
+    )
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+    ) as srv:
+        _start_server(srv)
+        cert = RemoteMiner(srv.base_url, HOTKEY).do_sat_work(item)
+    assert cert.assigned_hotkey == HOTKEY
+    assert cert.satisfiable is True
+
+
+def test_default_worker_rejects_valid_hash_noncanonical_instance(monkeypatch):
+    item = _make_sat_item()
+
+    def must_not_solve(instance):
+        raise AssertionError("noncanonical work reached solver")
+
+    monkeypatch.setattr("cathedral.worker.solve_sat", must_not_solve)
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+    ) as srv:
+        _start_server(srv)
+        payload = json.dumps({
+            "challenge_id": item.challenge_id,
+            "assigned_hotkey": HOTKEY,
+            "instance": {
+                "n_vars": item.instance.n_vars,
+                "clauses": item.instance.clauses,
+            },
+            "seed": item.seed,
+        }).encode()
+        code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
+    assert code == 400
+    assert b"noncanonical" in body
 
 
 def test_evidence_with_bearer_good_round_trip():
@@ -893,15 +938,19 @@ def test_sat_lane_rejects_certificate_owned_by_another_hotkey():
     assert lane.verify(item, forged) is None
 
 
-def test_sat_assigned_hotkey_defaults_for_existing_construction():
-    from cathedral.lanes.sat_types import SatCertificate
+def test_sat_lane_rejects_legacy_empty_owner():
+    lane = SatLane()
+    item = lane.dispatch(HOTKEY, 0)
+    assignment = solve_sat(item.instance)
+    assert assignment is not None
     cert = SatCertificate(
         satisfiable=True,
-        assignment=[1, 2, 3],
-        work_units=3.0,
-        challenge_id="abc",
+        assignment=assignment,
+        work_units=float(len(item.instance.clauses)),
+        challenge_id=item.challenge_id,
     )
     assert cert.assigned_hotkey == ""
+    assert lane.verify(item, cert) is None
 
 
 def test_remote_miner_empty_hotkey_raises():

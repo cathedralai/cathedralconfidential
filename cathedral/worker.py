@@ -1,4 +1,8 @@
-"""Bounded stdlib HTTP server for evidence collection and SAT work."""
+"""Bounded plain-HTTP server for evidence collection and canonical SAT work.
+
+``WorkerServer`` is intended to listen on a private interface behind an HTTPS
+terminator. The corresponding ``RemoteMiner`` client requires HTTPS by default.
+"""
 from __future__ import annotations
 
 import json
@@ -11,7 +15,7 @@ from typing import Callable
 
 from cathedral.attest import collect_tdx
 from cathedral.common import Evidence
-from cathedral.lanes.sat import _compute_challenge_id, solve_sat
+from cathedral.lanes.sat import _canonical_instance, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatInstance
 
 MAX_REQUEST_BODY: int = 64 * 1024
@@ -40,6 +44,7 @@ def _make_handler(
     max_body: int,
     max_response_body: int,
     request_timeout: float,
+    allow_noncanonical_sat: bool,
 ) -> type[BaseHTTPRequestHandler]:
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
@@ -199,6 +204,9 @@ def _make_handler(
             if instance is None:
                 self._send_json(400, {"error": "invalid instance"})
                 return
+            if not allow_noncanonical_sat and instance != _canonical_instance(seed):
+                self._send_json(400, {"error": "noncanonical SAT instance"})
+                return
             if _compute_challenge_id(instance, seed) != challenge_id:
                 self._send_json(400, {"error": "challenge_id mismatch"})
                 return
@@ -251,7 +259,12 @@ def _parse_instance(raw: object) -> SatInstance | None:
 
 
 class WorkerServer:
-    """Expose one configured miner identity over bounded HTTP endpoints."""
+    """Expose one miner identity over bounded plain HTTP.
+
+    Production deployments must place this server behind an HTTPS terminator.
+    SAT work is restricted to deterministic ``SatLane`` canonical backfill by
+    default; ``allow_noncanonical_sat`` exists only for tests and development.
+    """
 
     def __init__(
         self,
@@ -265,6 +278,7 @@ class WorkerServer:
         max_concurrent: int = MAX_CONCURRENT,
         max_response_body: int = MAX_RESPONSE_BODY,
         timeout: float = 10.0,
+        allow_noncanonical_sat: bool = False,
     ) -> None:
         if (
             not isinstance(configured_hotkey, str)
@@ -286,6 +300,8 @@ class WorkerServer:
             or timeout <= 0
         ):
             raise ValueError("timeout must be a positive finite number")
+        if not isinstance(allow_noncanonical_sat, bool):
+            raise ValueError("allow_noncanonical_sat must be a boolean")
 
         semaphore = threading.Semaphore(max_concurrent)
         handler = _make_handler(
@@ -296,6 +312,7 @@ class WorkerServer:
             max_body,
             max_response_body,
             float(timeout),
+            allow_noncanonical_sat,
         )
         self._server = ThreadingHTTPServer((host, port), handler)
 

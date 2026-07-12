@@ -34,12 +34,14 @@ class EvidenceBackedMiner:
                 assignment=None,
                 work_units=1.0,
                 challenge_id=item.challenge_id,
+                assigned_hotkey=self.uid,
             )
         return SatCertificate(
             satisfiable=True,
             assignment=assignment,
             work_units=float(len(item.instance.clauses)),
             challenge_id=item.challenge_id,
+            assigned_hotkey=self.uid,
         )
 
 

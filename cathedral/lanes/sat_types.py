@@ -59,10 +59,13 @@ class SatCertificate(Certificate):
 
     ``challenge_id`` echoes the ID from the SatWorkItem to prevent duplicate
     crediting and detect mismatched submissions.
+
+    ``assigned_hotkey`` must exactly match the identity to which the lane
+    dispatched the challenge. Empty owners are never accepted by ``SatLane``.
     """
 
     satisfiable: bool
     assignment: list[int] | None
     work_units: float
     challenge_id: str  # echoed from SatWorkItem
-    assigned_hotkey: str = ""  # hotkey of the miner that produced this certificate
+    assigned_hotkey: str = ""  # dispatch identity that produced this certificate

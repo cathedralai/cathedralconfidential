@@ -42,7 +42,13 @@ def test_verify_accepts_true_certificate():
     item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
     lane._issued_ids.add(challenge_id)
     lane._challenge_owner[challenge_id] = "miner-x"
-    cert = SatCertificate(satisfiable=True, assignment=assignment, work_units=1.0, challenge_id=challenge_id)
+    cert = SatCertificate(
+        satisfiable=True,
+        assignment=assignment,
+        work_units=1.0,
+        challenge_id=challenge_id,
+        assigned_hotkey="miner-x",
+    )
     assert lane.verify(item, cert) is not None
 
 
@@ -77,7 +83,13 @@ def test_verify_accepts_true_unsat_certificate():
     item = SatWorkItem(instance=inst, seed=0, challenge_id=challenge_id)
     lane._issued_ids.add(challenge_id)
     lane._challenge_owner[challenge_id] = "miner-x"
-    cert = SatCertificate(satisfiable=False, assignment=None, work_units=1.0, challenge_id=challenge_id)
+    cert = SatCertificate(
+        satisfiable=False,
+        assignment=None,
+        work_units=1.0,
+        challenge_id=challenge_id,
+        assigned_hotkey="miner-x",
+    )
     assert lane.verify(item, cert) is not None
 
 
@@ -99,6 +111,7 @@ def test_score_sums_verified_work_units():
             assignment=assignment,
             work_units=10.0,  # miner's claim, will be replaced by validator value
             challenge_id=item.challenge_id,
+            assigned_hotkey=miner,
         )
         verified = lane.verify(item, cert)
         assert verified is not None
@@ -234,6 +247,7 @@ def test_score_only_counts_verified_certificates():
         assignment=assignment,
         work_units=100.0,  # miner's claim is ignored
         challenge_id=item.challenge_id,
+        assigned_hotkey=miner,
     )
     verified = lane.verify(item, cert_good)
     assert verified is not None
@@ -313,6 +327,7 @@ def test_score_accumulates_multiple_verified_certs():
             assignment=assignment,
             work_units=10.0,  # miner's claim, will be replaced by validator value
             challenge_id=item.challenge_id,
+            assigned_hotkey=miner,
         )
         verified = lane.verify(item, cert)
         assert verified is not None
