@@ -84,6 +84,7 @@ validator-derived accounting, complete score reports, and zero revocation.
 
 ## Documentation
 
+- [`BUILD_STATUS.md`](BUILD_STATUS.md) - current live proof and testnet boundary
 - [`docs/DESIGN.md`](docs/DESIGN.md) - protocol and scoring design
 - [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX deployment
 - [`HANDOFF.md`](HANDOFF.md) - operator setup
