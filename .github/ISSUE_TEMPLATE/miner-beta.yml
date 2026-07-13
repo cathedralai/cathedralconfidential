@@ -1,0 +1,60 @@
+name: Miner beta request
+description: Request operator-assisted onboarding for the Cathedral SN292 TDX beta
+title: "[Miner beta] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to request a beta slot. This issue is public.
+
+        **Never include a wallet seed, private key, bearer token, cloud credential, or SSH credential.** A maintainer will arrange the private bearer-token exchange only after reviewing the request.
+
+  - type: input
+    id: hotkey
+    attributes:
+      label: Testnet hotkey address
+      description: Public SS58 hotkey address registered on testnet SN292.
+      placeholder: 5...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      description: The current beta accepts Intel TDX only.
+      options:
+        - Intel TDX confidential VM
+        - I do not have Intel TDX yet
+    validations:
+      required: true
+
+  - type: input
+    id: provider_region
+    attributes:
+      label: Provider and region
+      description: Do not include account, project, instance, or credential identifiers.
+      placeholder: Cloud provider, country or region
+    validations:
+      required: true
+
+  - type: input
+    id: contact
+    attributes:
+      label: Preferred private contact
+      description: Optional public handle a maintainer can use. Remember that this issue is public.
+      placeholder: Discord, Telegram, or another non-secret handle
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Readiness
+      options:
+        - label: My hotkey is registered on testnet SN292.
+          required: true
+        - label: "Cathedral census reports `Intel TDX : yes` and the configfs-tsm report root exists."
+          required: true
+        - label: I understand this is a scored beta and on-chain emissions are not active yet.
+          required: true
+        - label: I have not included any secret in this public issue.
+          required: true

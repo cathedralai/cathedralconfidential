@@ -4,7 +4,7 @@ Inverted trust topology: the miner *serves* attestation on request and runs
 lane work; the validator never SSHes in.
 See docs/DESIGN.md §4, §9.
 
-    register on SN39  ->  serve /evidence + /info  ->  subscribe to lanes  ->  do work
+    register hotkey  ->  serve /v1/evidence + /v1/sat-work  ->  do verified work
 
 Hardware-free testable core: ``MockMiner`` serves MOCK evidence (the real
 REPORT_DATA binding + policy check, no vendor crypto) and does real SAT work.

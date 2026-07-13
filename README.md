@@ -16,6 +16,18 @@ second scoring mechanism.
 - **Current proof:** a testnet SN292 dry run on real Intel TDX hardware. Chain
   broadcast is not yet live. See [`BUILD_STATUS.md`](BUILD_STATUS.md).
 
+## Start Mining
+
+The current miner path is an operator-assisted Intel TDX beta on testnet SN292.
+Follow **[Mining Cathedral](MINING.md)** for hardware requirements, hotkey
+registration, worker setup, a real-quote smoke test, enrollment, acceptance
+signals, and troubleshooting. Test workers can be admitted and scored today;
+on-chain emissions are not active yet.
+
+```bash
+cathedral worker serve --help
+```
+
 ## How It Works
 
 1. A worker enrolls a registered hotkey and an authenticated worker endpoint.
@@ -64,18 +76,8 @@ Future product direction, not yet scored on chain:
 | NVIDIA H100/H200 CC | Planned |
 | NVIDIA B200-class | Planned |
 
-Attestation grants admission. Emissions come from verified delivery.
-
-## Mining
-
-Workers serve confidential compute from their own infrastructure. Cathedral
-never requires root access or operator SSH. The scored workload today is
-deterministic validator-dispatched audit work.
-
-```bash
-cathedral worker --help
-cathedral work status
-```
+Attestation grants admission. Emissions come from verified delivery. Validators
+never require SSH or remote root access to miner machines.
 
 ## Validating
 
@@ -108,6 +110,7 @@ the real `verify()` interface; the real Intel TDX path runs on hardware (see
 ## Documentation
 
 - [`BUILD_STATUS.md`](BUILD_STATUS.md) - canonical launch evidence and testnet boundary
+- [`MINING.md`](MINING.md) - step-by-step miner onboarding
 - [`docs/DESIGN.md`](docs/DESIGN.md) - protocol and scoring design
 - [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path
 - [`HANDOFF.md`](HANDOFF.md) - commissioning and test handoff
