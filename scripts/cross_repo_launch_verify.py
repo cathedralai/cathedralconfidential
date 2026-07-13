@@ -9,6 +9,7 @@ import hashlib
 import io
 import itertools
 import json
+import math
 import os
 import socket
 import subprocess
@@ -28,6 +29,7 @@ from cathedral.poster import Poster
 
 SOURCE = "cathedral_confidential_tdx"
 CAP = 0.10
+SIGNED_FRACTION_TOLERANCE = 1e-12
 NETWORK = "finney"
 NETUID = 39
 KEY_ID = "cathedral-weight-policy"
@@ -197,10 +199,42 @@ def signed_component_ratios(payload: Mapping[str, Any]) -> dict[str, float]:
         require(weight > 0.0, f"signed row {hotkey!r} has nonpositive weight")
         require(abs(weight - (base + external)) <= 1e-15, f"component sum mismatch for {hotkey!r}")
         ratio = external / weight
-        require(ratio <= CAP, f"signed confidential attribution exceeds 10% for {hotkey!r}")
+        require(
+            ratio <= CAP + SIGNED_FRACTION_TOLERANCE,
+            f"signed confidential attribution exceeds 10% for {hotkey!r}",
+        )
         ratios[hotkey] = ratio
     require(bool(ratios), "signed vector has no component-bearing rows")
     return ratios
+
+
+def signed_confidential_fraction(payload: Mapping[str, Any]) -> float:
+    total_base = 0.0
+    total_external = 0.0
+    total_weight = 0.0
+    for row in payload.get("weights") or []:
+        try:
+            weight = float(row["weight"])
+            base = float(row["base_component"])
+            external = float(row["external_component"])
+        except (KeyError, TypeError, ValueError) as exc:
+            hotkey = str(row.get("miner_hotkey") or "")
+            raise LaunchProofError(f"invalid signed components for {hotkey!r}") from exc
+        total_weight += weight
+        total_base += base
+        total_external += external
+    require(total_weight > 0.0, "signed vector has zero total weight")
+    require(total_base > 0.0, "signed vector has zero base attribution")
+    require(
+        total_external > 0.0,
+        "signed vector has zero confidential attribution after payable filtering",
+    )
+    fraction = total_external / total_weight
+    require(
+        math.isclose(fraction, CAP, rel_tol=0.0, abs_tol=SIGNED_FRACTION_TOLERANCE),
+        f"signed confidential attribution {fraction:.16f} does not match the 10% target",
+    )
+    return fraction
 
 
 def audit_quantized_case(
@@ -447,6 +481,7 @@ def run_proof(scorer_repo: Path) -> dict[str, Any]:
                     fence_version=0,
                 )
                 ratios = signed_component_ratios(signed)
+                aggregate_fraction = signed_confidential_fraction(signed)
                 require(CONFIDENTIAL_ONLY not in ratios, "confidential-only hotkey received weight")
                 require(
                     set(ratios) == set(BASE_WORK), "signed vector differs from base-payable miners"
@@ -519,6 +554,7 @@ def run_proof(scorer_repo: Path) -> dict[str, Any]:
                 "signed_rows": len(signed["weights"]),
                 "survivor_cases": len(cases),
                 "quantized_uid_rows": sum(audit["quantized_uids"] for audit in audits),
+                "aggregate_signed_confidential_fraction": aggregate_fraction,
                 "max_signed_confidential_fraction": max(ratios.values()),
                 "max_u16_confidential_fraction": max(
                     audit["realized_fraction"] for audit in audits

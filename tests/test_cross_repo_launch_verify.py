@@ -29,6 +29,26 @@ def _payload() -> dict:
     }
 
 
+def _exact_ten_percent_payload() -> dict:
+    return {
+        "burn_snapshot": {"burn_uid": None, "forced_burn_percentage": 0.0},
+        "weights": [
+            {
+                "miner_hotkey": "alpha",
+                "weight": 0.60,
+                "base_component": 0.54,
+                "external_component": 0.06,
+            },
+            {
+                "miner_hotkey": "bravo",
+                "weight": 0.40,
+                "base_component": 0.36,
+                "external_component": 0.04,
+            },
+        ],
+    }
+
+
 def _vector_to_uid_weights(payload: dict, mapping: dict[str, int]) -> dict[int, float]:
     merged: dict[int, float] = {}
     for row in payload["weights"]:
@@ -128,6 +148,43 @@ def test_signed_component_ratio_over_cap_fails_closed() -> None:
 
     with pytest.raises(gate.LaunchProofError, match="exceeds 10%"):
         gate.signed_component_ratios(payload)
+
+
+def test_signed_confidential_fraction_requires_exact_10_percent() -> None:
+    fraction = gate.signed_confidential_fraction(_exact_ten_percent_payload())
+
+    assert fraction == pytest.approx(gate.CAP)
+
+
+def test_signed_confidential_fraction_fails_when_external_mass_drops_to_zero() -> None:
+    payload = _payload()
+    for row in payload["weights"]:
+        row["weight"] = row["base_component"]
+        row["external_component"] = 0.0
+
+    with pytest.raises(gate.LaunchProofError, match="zero confidential attribution"):
+        gate.signed_confidential_fraction(payload)
+
+
+def test_signed_confidential_fraction_fails_on_sub_ten_percent_positive_mass() -> None:
+    payload = _payload()
+    payload["weights"] = [
+        {
+            "miner_hotkey": "alpha",
+            "weight": 0.56,
+            "base_component": 0.50,
+            "external_component": 0.06,
+        },
+        {
+            "miner_hotkey": "bravo",
+            "weight": 0.44,
+            "base_component": 0.42,
+            "external_component": 0.02,
+        },
+    ]
+
+    with pytest.raises(gate.LaunchProofError, match="does not match the 10% target"):
+        gate.signed_confidential_fraction(payload)
 
 
 def test_temporary_environment_restores_values(monkeypatch: pytest.MonkeyPatch) -> None:
