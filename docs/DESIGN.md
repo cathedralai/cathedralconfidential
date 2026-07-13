@@ -5,17 +5,18 @@
 Status: founding design for Cathedral's confidential-compute architecture. This
 document is design and direction. For what is currently live, see
 [`BUILD_STATUS.md`](../BUILD_STATUS.md): the proven path today is Intel TDX CPU
-workers with deterministic validator-dispatched audit work, proven on testnet
-SN292 in dry-run mode. The products, lanes, and hardware classes below beyond
-that are planned direction, not current launch evidence.
+workers with deterministic validator-dispatched audit work. Mainnet SN39 chain
+submission is live; testnet SN292 remains the non-paying dry-run integration
+lane. The products, lanes, and hardware classes below beyond that are planned
+direction, not current launch evidence.
 
 ---
 
 ## 1. Thesis
 
-Cathedral's production target is Bittensor SN39. Its admission rule is hardware
-attestation and its currency is verified work. Production chain submission is
-not live; the current integration proof is the SN292 dry run described above.
+Cathedral runs on Bittensor mainnet SN39. Its admission rule is hardware
+attestation and its currency is verified work. Mainnet chain submission is
+live; SN292 provides the corresponding non-paying integration path.
 
 Two sentences hold the whole design:
 
@@ -136,9 +137,9 @@ scorer or reserve a fixed secondary allocation.
 - **Complete signed stream:** every epoch contains the latest state for every
   observed hotkey, including explicit zeros that revoke stale credit.
 - **Validator path:** Cathedral publishes the signed compute vector to the
-  validator feed. In production, SN39 validators will verify it, map registered
-  hotkeys to current UIDs, reject duplicate mappings, and submit weights to
-  Bittensor. The current SN292 proof stops before chain submission.
+  validator feed. The SN39 validator verifies it, maps registered hotkeys to
+  current UIDs, rejects duplicate mappings, and submits weights to Bittensor.
+  The SN292 validator runs the same checks without chain submission.
 - **Fail closed:** an invalid signature, incomplete identity map, stale report,
   failed attestation, or failed job cannot preserve old weight.
 - **Open entry:** admission follows published hardware and measurement policy,
@@ -225,8 +226,8 @@ receipts, gates payment release, and slashes collateral on invalid evidence.
 
 The attestor, verifier, policy engine, CVM stack, and lane engine are Cathedral
 components. Miners serve attestation and work endpoints; validators never need
-root access to miner machines. The production target remains SN39, while the
-current integration proof runs on testnet SN292.
+root access to miner machines. Production runs on SN39, while the non-paying
+integration path runs on testnet SN292.
 
 **Language:** Python (mature `bittensor` SDK; NVIDIA nvtrust, AMD/Intel tooling all have Python paths). Attestor may become a small static Rust binary later if distribution demands.
 

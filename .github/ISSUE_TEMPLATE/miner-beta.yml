@@ -1,5 +1,5 @@
 name: Miner beta request
-description: Request operator-assisted onboarding for the Cathedral SN292 TDX beta
+description: Request operator-assisted TDX onboarding for mainnet SN39 or testnet SN292
 title: "[Miner beta] "
 body:
   - type: markdown
@@ -12,9 +12,20 @@ body:
   - type: input
     id: hotkey
     attributes:
-      label: Testnet hotkey address
-      description: Public SS58 hotkey address registered on testnet SN292.
+      label: Hotkey address
+      description: Public SS58 hotkey address registered on the selected subnet.
       placeholder: 5...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      description: Mainnet SN39 is live and paying; testnet SN292 is non-paying integration.
+      options:
+        - Mainnet SN39
+        - Testnet SN292
     validations:
       required: true
 
@@ -50,11 +61,11 @@ body:
     attributes:
       label: Readiness
       options:
-        - label: My hotkey is registered on testnet SN292.
+        - label: My hotkey is registered on the subnet selected above.
           required: true
         - label: "Cathedral census reports `Intel TDX : yes` and the configfs-tsm report root exists."
           required: true
-        - label: I understand this is a scored beta and on-chain emissions are not active yet.
+        - label: I understand SN39 earns only after verified work produces positive live weight, while SN292 never pays emissions.
           required: true
         - label: I have not included any secret in this public issue.
           required: true

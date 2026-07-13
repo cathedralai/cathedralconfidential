@@ -3,11 +3,10 @@
 This guide is the shortest honest path from a new machine to an accepted
 Cathedral worker.
 
-> **Current status:** miner onboarding is an operator-assisted testnet SN292
-> beta. Real Intel TDX evidence and verified work are running, but the validator
-> does not submit weights on chain yet. Test workers can be admitted and scored;
-> they do not receive token emissions until the chain gate in
-> [`BUILD_STATUS.md`](BUILD_STATUS.md) is complete.
+> **Current status:** miner onboarding is operator-assisted on both networks.
+> Mainnet SN39 is the live production lane and submits confidential weights on
+> chain. Testnet SN292 is the non-paying integration lane for proving the same
+> worker, attestation, work, scoring, and UID-mapping path before mainnet.
 
 ## What A Miner Does
 
@@ -30,8 +29,9 @@ You need:
 
 - an Intel TDX confidential VM that exposes Linux configfs-tsm;
 - Ubuntu or another recent Linux distribution with Python 3.11 or newer;
-- a Bittensor wallet and hotkey registered on **testnet SN292**;
-- a public IPv4 address reachable by the Cathedral test validator;
+- a Bittensor wallet and hotkey registered on **mainnet SN39** for live mining,
+  or **testnet SN292** for non-paying integration testing;
+- a public IPv4 address reachable by the selected Cathedral validator;
 - Git and OpenSSL; and
 - approval through the public
   [Miner beta request](https://github.com/cathedralai/cathedralconfidential/issues/new?template=miner-beta.yml)
@@ -47,12 +47,22 @@ bearer token.
 
 ## 1. Register The Hotkey
 
-Register the same hotkey that the worker will serve:
+Register the same hotkey that the worker will serve. Choose one network; use
+mainnet SN39 to compete for emissions or testnet SN292 to prove the setup
+without emissions.
 
 The command below uses the current `btcli` command layout. Check your installed
 version with `btcli --version` before registering.
 
 ```bash
+# Mainnet production
+btcli subnet register \
+  --network finney \
+  --netuid 39 \
+  --wallet-name <wallet-name> \
+  --hotkey <hotkey-name>
+
+# Testnet integration
 btcli subnet register \
   --network test \
   --netuid 292 \
@@ -120,10 +130,10 @@ openssl rand -hex 32 > "$HOME/.config/cathedral/worker-token"
 export CATHEDRAL_WORKER_BEARER_TOKEN="$(tr -d '\n' < "$HOME/.config/cathedral/worker-token")"
 ```
 
-## 5. Start The Testnet Worker
+## 5. Start The Worker
 
-The current SN292 beta uses a temporary, explicitly marked development bind so
-the remote validator can reach the worker:
+The current operator-assisted beta uses a temporary, explicitly marked
+development bind so the selected network's validator can reach the worker:
 
 ```bash
 sudo --preserve-env=CATHEDRAL_WORKER_BEARER_TOKEN \
@@ -200,7 +210,8 @@ supply the validator source IP, and arrange a private channel for these three
 values:
 
 ```text
-hotkey:  <ss58-hotkey-address registered on testnet SN292>
+network: mainnet SN39 or testnet SN292
+hotkey:  <ss58-hotkey-address registered on that network>
 endpoint: http://<public-ip>:8081
 bearer token: <contents of ~/.config/cathedral/worker-token>
 ```
@@ -211,7 +222,7 @@ shell history shared with others, or a public message.
 
 The validator operator will confirm:
 
-1. the hotkey is registered on SN292;
+1. the hotkey is registered on the selected subnet;
 2. the endpoint is reachable from the validator;
 3. fresh TDX evidence verifies and matches the hotkey;
 4. the physical platform is not already assigned to another hotkey;
@@ -225,13 +236,13 @@ these properties:
 
 | Gate | Required result |
 |---|---|
-| Registration | Hotkey maps to exactly one current SN292 UID |
+| Registration | Hotkey maps to exactly one UID on the selected subnet |
 | Reachability | Validator can call the authenticated endpoint |
 | Attestation | `admit=Y`; fresh TDX quote passes policy |
 | Work | `work=verified`; validator-derived work units are positive |
 | Score | Score is positive in the complete signed vector |
 | Publication | Signed vector is accepted by the thin validator |
-| Chain | **Not active yet**; no testnet emissions until broadcast is enabled |
+| Chain | SN39 submits live weights; SN292 remains non-paying dry-run |
 
 Example validator-side outcome:
 
@@ -239,9 +250,9 @@ Example validator-side outcome:
 [2026-07-13T15:23:09Z] OK  5Aaaa..aaaa  ep=7/1  admit=Y  work=verified  wu=20.00  score=1.000  pub=YES  ch=ababab..ababab
 ```
 
-The final proof of live mining will be an on-chain `set_weights` followed by a
-zero-revocation test. Until both are recorded in `BUILD_STATUS.md`, treat the
-network as a scored hardware beta, not a paying subnet.
+Mainnet chain submission is live. A miner earns only after its registered SN39
+hotkey passes attestation and verified work and appears with positive weight in
+the signed vector. Testnet SN292 results never imply token emissions.
 
 ## Troubleshooting
 
@@ -254,19 +265,18 @@ network as a scored hardware beta, not a paying subnet.
 | HTTP `403 assigned_hotkey mismatch` | Worker was started with a different hotkey address |
 | HTTP `500 evidence collection failed` | Check TDX availability and permission to write the configfs report directory |
 | Endpoint unreachable | Check cloud firewall, public IP, process, and port `8081` |
-| Enrollment rejected | Confirm the hotkey is registered on SN292 and the endpoint uses the expected public IP |
+| Enrollment rejected | Confirm the hotkey is registered on the selected subnet and the endpoint uses the expected public IP |
 | `admit=N` | Quote crypto, measurement, TCB, hotkey binding, or platform policy failed |
 | `score=0` | No verified work, stale evidence, failed work, or explicit revocation |
 
 ## What Comes Next
 
-Before production mining on SN39, Cathedral still needs:
+The live operator-assisted path still needs:
 
 - public self-service signed enrollment;
 - a production HTTPS worker deployment without development flags;
-- a registered validator hotkey and monitored chain submission;
-- a successful zero-revocation acceptance test; and
-- published policy and onboarding endpoints for SN39.
+- a positive-miner-to-zero on-chain revocation acceptance test; and
+- published self-service policy and onboarding endpoints.
 
 The current source of truth is [`BUILD_STATUS.md`](BUILD_STATUS.md). If that
 file and an announcement disagree, follow `BUILD_STATUS.md`.

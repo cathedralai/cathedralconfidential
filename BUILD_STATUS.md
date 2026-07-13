@@ -2,8 +2,8 @@
 
 Last verified: 2026-07-13
 
-Current integration proof is **testnet SN292 in dry-run mode**. Production
-target is SN39; SN39 chain submission is not live.
+**Mainnet SN39 chain submission is live.** Testnet SN292 remains the non-paying
+dry-run integration lane.
 
 ## Working now
 
@@ -15,8 +15,14 @@ target is SN39; SN39 chain submission is not live.
 - The scorer enrolls workers, issues fresh challenges, verifies TDX evidence and
   hotkey binding, runs deterministic validator-dispatched audit work, derives
   the score itself, and publishes a complete signed score vector.
-- A dedicated thin validator has repeatedly accepted fresh signed vectors,
-  mapped the worker hotkey to UID 41, and computed dry-run UID41 = 1.0.
+- On testnet SN292, a dedicated thin validator repeatedly accepted fresh signed
+  vectors, mapped the proven worker hotkey to UID 41, and computed dry-run
+  UID41 = 1.0.
+- On mainnet SN39, the confidential validator hotkey at UID 144 submitted the
+  first live vector at block 8614435. The old validator is disabled.
+- Mainnet currently has no eligible confidential miners. The signed fail-closed
+  vector therefore has one nonzero destination: burn UID 0 = 1.0. An admitted
+  miner replaces burn only after verified work produces positive score.
 - Hardware epochs run on a 60-second cycle; each verified epoch produces 20
   validator-derived work units at score 1.0.
 - Post-migration foreign-key integrity is clean.
@@ -98,21 +104,31 @@ cathedral runtime abandon-complete \
 Older on-disk ledgers created before this status existed are migrated
 automatically (in place, preserving all rows) the first time they are opened.
 
-## Testnet boundary
+## Network boundary
 
-**Chain broadcast is NOT live.** The validator hotkey is not registered on
-SN292, so the validator cannot submit extrinsics. Everything above is dry-run:
-the vector is signed, verified, and mapped, but no weights land on chain.
+### Mainnet SN39
 
-Remaining before chain-live:
+Chain broadcast is live. The production validator:
 
-1. Register and stake the validator hotkey on SN292, or supply a hotkey that
-   already holds a permitted validator slot.
-2. Explicitly enable chain broadcast in the validator config.
-3. Confirm one monitored on-chain `set_weights` extrinsic lands.
-4. Confirm zero-revocation acceptance: a stale or failed-evidence epoch removes
-   prior weight (burn behavior).
+1. requires the signed `confidential_primary_v1` policy;
+2. verifies the `finney` / netuid 39 envelope and freshness;
+3. maps every positive hotkey against the live metagraph; and
+4. submits the complete confidential vector.
 
-Production (SN39) submission is a separate step. The scorer integration for
-production is under review in `cathedralai/cathedral` PR #378, not merged to
-production main.
+The first monitored submission succeeded at 2026-07-13T18:56:54Z and updated
+the validator at block 8614435. The deployed scorer/validator change is merged
+in `cathedralai/cathedral` PR #378.
+
+### Testnet SN292
+
+SN292 remains dry-run. It verifies real worker evidence, work, scoring, signed
+publication, and UID mapping, but does not submit weights or pay emissions.
+
+## Remaining acceptance work
+
+1. Admit a registered SN39 miner and observe positive on-chain weight after a
+   verified work epoch.
+2. Make that miner stale or fail evidence and confirm its prior positive weight
+   is revoked to zero on chain.
+3. Replace the operator-assisted plain-HTTP worker path with production HTTPS
+   and self-service signed enrollment.

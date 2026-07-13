@@ -12,17 +12,22 @@ zero.
 Cathedral owns its complete score vector. It does not share emissions with a
 second scoring mechanism.
 
-- **Production target:** Bittensor SN39.
-- **Current proof:** a testnet SN292 dry run on real Intel TDX hardware. Chain
-  broadcast is not yet live. See [`BUILD_STATUS.md`](BUILD_STATUS.md).
+- **Production:** Bittensor mainnet SN39. The confidential validator is live and
+  submits the complete compute vector on chain.
+- **Testing:** Bittensor testnet SN292. It remains the non-paying integration
+  lane for proving worker setup, attestation, work, scoring, and UID mapping.
+
+SN39 currently has no eligible confidential miners, so its signed zero-supply
+fallback assigns the complete vector to burn UID 0. See
+[`BUILD_STATUS.md`](BUILD_STATUS.md) for current evidence.
 
 ## Start Mining
 
-The current miner path is an operator-assisted Intel TDX beta on testnet SN292.
-Follow **[Mining Cathedral](MINING.md)** for hardware requirements, hotkey
-registration, worker setup, a real-quote smoke test, enrollment, acceptance
-signals, and troubleshooting. Test workers can be admitted and scored today;
-on-chain emissions are not active yet.
+The current miner path is an operator-assisted Intel TDX beta. Register on
+mainnet SN39 to compete for live emissions, or use testnet SN292 to prove the
+same setup without emissions. Follow **[Mining Cathedral](MINING.md)** for
+hardware requirements, hotkey registration, worker setup, a real-quote smoke
+test, enrollment, acceptance signals, and troubleshooting.
 
 ```bash
 cathedral worker serve --help
@@ -50,12 +55,14 @@ cathedral worker serve --help
   60-second epochs, 20 validator-derived work units, score 1.0.
 - A signed, complete compute vector with explicit zeros for missing, failed,
   stale, and revoked workers.
-- A dedicated Cathedral validator that maps the worker hotkey to UID 41 and
-  computes UID 41 = 1.0 in a dry run.
+- On testnet SN292, a dedicated Cathedral validator maps the proven worker
+  hotkey to UID 41 and computes UID 41 = 1.0 in a dry run.
+- On mainnet SN39, the production validator submitted its first confidential
+  vector at block 8614435. With no eligible miners, the on-chain vector has one
+  nonzero destination: burn UID 0 = 1.0.
 
-Chain broadcast is not yet live because the validator hotkey is not registered
-on testnet SN292. Registration, one monitored `set_weights`, and a subsequent
-zero-revocation check remain before the testnet chain gate is complete.
+Mainnet chain broadcast is live. Testnet SN292 remains dry-run and does not pay
+token emissions.
 
 ## Roadmap
 
@@ -109,7 +116,7 @@ the real `verify()` interface; the real Intel TDX path runs on hardware (see
 
 ## Documentation
 
-- [`BUILD_STATUS.md`](BUILD_STATUS.md) - canonical launch evidence and testnet boundary
+- [`BUILD_STATUS.md`](BUILD_STATUS.md) - canonical mainnet and testnet launch evidence
 - [`MINING.md`](MINING.md) - step-by-step miner onboarding
 - [`docs/DESIGN.md`](docs/DESIGN.md) - protocol and scoring design
 - [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path

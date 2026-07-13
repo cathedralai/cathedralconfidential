@@ -144,10 +144,10 @@ python -m pytest tests/test_attest_tdx_negative.py -q
 ## Dedicated Compute Stream Launch Gate
 
 After the hardware gates, test the compute publisher and the thin validator
-together. The current integration proof runs on testnet SN292 in dry-run mode;
-production target is SN39. The gate below is written against the production
-metagraph and applies identically to the SN292 dry-run except that chain
-submission stays disabled until the validator hotkey is registered.
+together. Production chain submission is live on mainnet SN39; testnet SN292
+remains the non-paying dry-run integration lane. The gate below is written
+against the production metagraph and applies identically to SN292 except that
+testnet chain submission stays disabled.
 Launch acceptance requires all of the following:
 
 1. A real TDX miner enrolls with its registered hotkey and passes fresh-nonce,
@@ -164,9 +164,9 @@ Launch acceptance requires all of the following:
    validators consuming the same signed epoch submit the same mapped vector.
 
 `scripts/cross_repo_launch_verify.py` still encodes the retired mixed-vector
-contract and is not launch evidence for this mechanism. Replace it with a
-sole-input compute-stream gate against `cathedralai/cathedral` PR #378 before
-using it for production acceptance.
+contract and is not launch evidence for this mechanism. Production acceptance
+uses the sole-input `confidential_primary_v1` policy merged in
+`cathedralai/cathedral` PR #378 plus the monitored SN39 chain submission.
 
 ## Definition Of Done
 
