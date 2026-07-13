@@ -1,120 +1,118 @@
-<p align="center"><em>Rent a GPU like on Lium, trust it like a TEE enclave —<br/>and every idle cycle in between goes to solving, evaluating, and hosting in the open.</em></p>
-
 # Cathedral
 
-A Bittensor subnet (SN39) where **confidentiality is the admission rule** and
-**verified work is the currency**. This repo is the confidential-compute
-sidecar: it collects and verifies confidential attestation, freezes payable
-confidential reports, and publishes them to the scorer-owned weight path.
-Miners prove they run inside a genuine Trusted Execution Environment; that
-attestation is the ticket to participate, not the paycheck.
+**Confidential compute for Bittensor. Attestation is admission. Verified work is the score.**
 
-This is a **greenfield build**. The trust topology of prior marketplace designs
-(validator SSHes into miners as root) is deliberately inverted here — miners
-*serve* attestation, validators never touch miner machines.
+Cathedral is a standalone confidential-compute mechanism. Independently
+operated Intel TDX machines prove, cryptographically, that they run inside a
+genuine Trusted Execution Environment. That attestation admits a worker. It
+never pays. Emissions come only from work the validator dispatches, verifies,
+and scores itself. Missing, stale, failed, or revoked work receives an explicit
+zero.
 
-## For miners
+Cathedral owns its complete score vector. It does not share emissions with a
+second scoring mechanism.
 
-The current promotion path keeps the existing scorer authoritative and adds a
-demand-driven confidential-compute component under the global v3 contract:
+- **Production target:** Bittensor SN39.
+- **Current proof:** a testnet SN292 dry run on real Intel TDX hardware. Chain
+  broadcast is not yet live. See [`BUILD_STATUS.md`](BUILD_STATUS.md).
 
-1. When payable base and confidential populations both exist, the scorer
-   allocates exactly 90% of aggregate mass to base and 10% to confidential
-   compute across the union of their hotkeys. Compute-only hotkeys can earn.
-2. With base scores but no payable confidential compute, the result is 100%
-   base. With no base scores, composition fails closed to an empty vector.
-3. If the thin validator is missing any hotkey from the signed vector, it drops
-   all confidential mass and reconstructs a base-only vector from the mapped
-   signed base components. Duplicate UID mappings are rejected.
-4. The launch gate checks the aggregate contract through Bittensor u16
-   quantization; with both populations present, the quantized confidential
-   share must remain within tolerance of 10%.
+## How It Works
 
-Cathedral does not mine its own confidential lane. Cathedral-operated TDX
-infrastructure exists to attest, verify, and publish the confidential snapshot;
-it is not registered for emissions.
+1. A worker enrolls a registered hotkey and an authenticated worker endpoint.
+2. Cathedral issues a fresh nonce and verifies the worker's Intel TDX quote:
+   measurement, TCB, platform policy, and hotkey binding.
+3. Attestation grants admission only. A worker with no verified work earns zero.
+4. Cathedral dispatches deterministic audit work, verifies delivery, and derives
+   the credit itself. Workers never declare their own score.
+5. Cathedral freezes and signs one complete compute vector per epoch, including
+   explicit zeros that revoke stale credit.
+6. A dedicated Cathedral validator verifies the signed vector, requires every
+   hotkey to map exactly once to the current metagraph, and submits weights.
 
-`cathedralai/cathedral` remains the sole Bittensor weight setter. This repo
-intentionally carries **no direct Bittensor SDK dependency** and does not submit
-weights on chain.
+## What Is Proven Today
 
-What you can do today:
+- Real Intel TDX quote collection and external DCAP / Trust Authority
+  verification on live hardware, with fresh 8000-byte quotes.
+- Fresh-nonce, measurement, TCB, and platform policy enforced at admission.
+- Deterministic validator-dispatched audit work as the scored workload:
+  60-second epochs, 20 validator-derived work units, score 1.0.
+- A signed, complete compute vector with explicit zeros for missing, failed,
+  stale, and revoked workers.
+- A dedicated Cathedral validator that maps the worker hotkey to UID 41 and
+  computes UID 41 = 1.0 in a dry run.
 
-1. **Run the testable core** — clone this repo, `pip install -e '.[dev]'`,
-   `python -m pytest -q`. Understand the evidence flow in
-   `cathedral/attest`, the verifier logic in `cathedral/verify`, and the SAT
-   lane in `cathedral/lanes/sat.py`.
-2. **Use the current scoring runtime** — TDX CPU is the active confidential
-   scoring path in this repo. SNP cryptographic verification exists, but SNP
-   runtime scoring is not enabled here today.
-3. **Inspect the launch gate** — `scripts/cross_repo_launch_verify.py` proves
-   the global v3 scorer integration against the external scorer checkout,
-   including base-only fallback, duplicate-UID rejection, quantized aggregate
-   attribution, and revocation when no payable verified compute remains.
+Chain broadcast is not yet live because the validator hotkey is not registered
+on testnet SN292. Registration, one monitored `set_weights`, and a subsequent
+zero-revocation check remain before the testnet chain gate is complete.
 
-Truthful working commands in this repo today:
+## Roadmap
 
-- `cathedral --help`
-- `cathedral runtime --help`
-- `cathedral worker --help`
-- `cathedral-validator --help`
-- `cathedral-miner --help`
-- `cathedral verify-quote --measurement abc --allowed-measurement abc --tcb 3 --min-tcb 1`
-- `cathedral work submit --n-vars 3 --clauses '[[1,-2,3]]'`
-- `cathedral work status`
+Future product direction, not yet scored on chain:
 
-The live claim in this branch is the attestation, runtime, worker, ledger,
-poster, and cross-repo scoring path. The five-lane earning model remains future
-design, not the current public earning surface of this sidecar.
+- Customer jobs, long-running agents, inference, and evaluation as scored
+  workloads.
+- Confidential GPU workloads (NVIDIA H100/H200 in CC mode); B200-class later.
+- AMD SEV-SNP as a second CPU platform. Quote parsing and cryptographic
+  verification exist in-repo; runtime scoring is not yet enabled.
 
-## Read first
+## Hardware
 
-- [`HANDOFF.md`](HANDOFF.md) — **start here to run or commission.** Run the
-  testable core in 5 minutes. The original handoff is SNP-first; launch work is
-  now TDX CPU first because live Cathedral supply is already on a GCP TDX CVM.
-- [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) — **current launch path.** Use the
-  live TDX CPU box to prove real attestation, then port the same interface to
-  SNP after launch.
-- [`docs/DESIGN.md`](docs/DESIGN.md) — the founding design. Products, supply
-  chains, the lane model, emissions, attestation core, rental delivery, the
-  thin on-chain cut, and the phased build plan.
-- [`RUNTEST.md`](RUNTEST.md) — per-command test breakdown.
+| Hardware | Status |
+|---|---|
+| Intel TDX CPU | Proven launch path |
+| AMD SEV-SNP CPU | Planned second platform (crypto exists, scoring not enabled) |
+| NVIDIA H100/H200 CC | Planned |
+| NVIDIA B200-class | Planned |
 
-## Two products
+Attestation grants admission. Emissions come from verified delivery.
 
-| | Secure Sandbox | Core |
-|---|---|---|
-| Guarantee | integrity **+ confidentiality** | integrity only |
-| Worker | subnet TEE hardware (CC-mode) | open-market commodity GPU (untrusted) |
-| Sold for | proprietary models, agent secrets, regulated data | reproducible, checkable work |
+## Mining
 
-> Core jobs run on machines whose owners can observe the workload. Core
-> guarantees the correctness of results, not the privacy of inputs.
-> Data-sensitive workloads belong on Secure Sandbox.
+Workers serve confidential compute from their own infrastructure. Cathedral
+never requires root access or operator SSH. The scored workload today is
+deterministic validator-dispatched audit work.
 
-## Layout
-
-```
-proto/evidence.proto     TEE attestation evidence schema (SNP | TDX | GPU)
-cathedral/
-  common.py              config, tiers, nonces, evidence types
-  census.py              Phase 0 — CC capability probe (real, hardware-free to run)
-  attest/                miner-side evidence collectors (SNP / TDX / GPU)
-  verify/                validator-side verifiers + measurement policy
-  lanes/                 the five-lane work engine (dispatch / verify / score)
-  neuron/                miner.py, validator.py
-docs/DESIGN.md           founding design
+```bash
+cathedral worker --help
+cathedral work status
 ```
 
-## Status
+## Validating
 
-Phase 0 / Phase 1 bridge. The hardware-free core is green, and the launch path
-is TDX CPU first. The TDX collector uses Linux configfs-tsm; validator-side
-verification delegates DCAP / Trust Authority crypto to an external verifier and
-then enforces Cathedral's nonce, hotkey, measurement, TCB, and platform-id
-policy. SNP quote parsing and cryptographic verification are implemented, but
-runtime scoring still targets the TDX CPU path.
+The dedicated Cathedral validator consumes the signed compute vector. It
+verifies signature and freshness, requires a complete hotkey-to-UID mapping,
+rejects identity conflicts, and fails closed. It submits the resulting weight
+vector only when its hotkey is registered and chain broadcast is enabled.
+
+```bash
+cathedral runtime --help
+```
+
+## Run Locally
+
+Hardware-free core. Requires Python 3.11+.
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -e '.[dev]'
+python -m pytest -q            # 469 passed, 3 skipped
+```
+
+The hardware-free suite exercises TDX policy verification, signed enrollment,
+authenticated workers, deterministic audit work, validator-derived accounting,
+complete score reports, and zero revocation. Attestation crypto is mocked behind
+the real `verify()` interface; the real Intel TDX path runs on hardware (see
+[`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md)).
+
+## Documentation
+
+- [`BUILD_STATUS.md`](BUILD_STATUS.md) - canonical launch evidence and testnet boundary
+- [`docs/DESIGN.md`](docs/DESIGN.md) - protocol and scoring design
+- [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path
+- [`HANDOFF.md`](HANDOFF.md) - commissioning and test handoff
+- [`RUNTEST.md`](RUNTEST.md) - test commands
 
 ## License
 
-MIT.
+MIT

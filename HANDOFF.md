@@ -6,18 +6,22 @@ Everything you need to (A) run the hardware-free testable core right now, and
 file is the how.
 
 > **Launch update.** This handoff was originally written SNP-first. For launch,
-> Cathedral is going TDX CPU first because a live GCP TDX CVM is already running
-> the Cathedral publisher. Use `docs/TDX_LAUNCH.md` for the current real
+> Cathedral is going TDX CPU first because a live Intel TDX CVM is already
+> running the Cathedral publisher. Use `docs/TDX_LAUNCH.md` for the current real
 > attestation path; keep the SNP sections below as the next CPU platform port.
 > SNP quote parsing and cryptographic verification exist in-repo, but runtime
 > scoring remains TDX CPU first.
 
 > **The one-line status.** The subnet mechanics + the SAT lane are real and
-> tested. The attestation verdict is currently **mocked** in the validator epoch
-> and real TDX collection / external-verifier adapter code is now scaffolded
-> behind the same `verify()` interface. Commissioning a box is about replacing
-> that mock with a genuine vendor-verified quote — that is Phase 1, and it is
-> the critical path. Nothing downstream of an `Attested` verdict changes.
+> tested. The **Intel TDX** hardware path is now proven end to end on a live TDX
+> box: real quote collection, external-verifier adapter, and a full scoring epoch
+> (see `docs/TDX_LAUNCH.md` and `BUILD_STATUS.md`). The hardware-free core still
+> runs attestation **mocked** behind the same `verify()` interface so the suite
+> runs on any machine. **SEV-SNP** quote parsing and crypto exist in-repo but
+> runtime scoring is not yet enabled; commissioning an SNP box and wiring its
+> collector/verifier into the scoring path is the next CPU platform port. The
+> SNP sections below are that port. Nothing downstream of an `Attested` verdict
+> changes when a new hardware path is added.
 
 ---
 
@@ -59,7 +63,7 @@ cathedral-miner --help          # compatibility wrapper -> cathedral worker ...
 
 **What the hardware-free pass is telling you:** the nonce/REPORT_DATA binding,
 the SAT solve→verify→reject-forgery→reject-contradiction loop,
-emission-conserving economics (floor + routing + burn = 1.0), the work queue /
+emission-conserving economics (the current mechanism passes a zero floor), the work queue /
 tier-gated allocator, mock attestation with `chip_id` sybil dedup, TDX verifier
 adapter policy checks, and a full validator epoch (admit → run SAT → weights sum
 to ~1.0). See `RUNTEST.md` for the per-command breakdown.
@@ -282,7 +286,7 @@ cathedral/
   lanes/__init__.py       Lane ABC + ROUTING_VECTOR
   lanes/sat.py            SAT lane: DPLL solver + self-certifying verifier + score
   lanes/sat_types.py      SAT dataclasses (DIMACS)
-  economics.py            apply_routing: floor + routing-weighted work + burn = 1.0
+  economics.py            apply_routing; current mechanism passes floor=0
   api.py                  in-process control plane: WorkQueue / Inventory / Allocator
   cli.py                  argparse CLI (census, verify-quote, work)
   neuron/validator.py     hardware-free epoch (mock)        ← swap-in at §4.4
@@ -316,7 +320,7 @@ scripts/demo_sat.py       dispatch → solve → verify → PASS
 
 ## 8. Procurement notes
 
-- **Launch test:** the live GCP `c3` TDX CVM. Treat it as production-adjacent:
+- **Launch test:** the live Intel TDX CVM. Treat it as production-adjacent:
   collect a quote, verify it, and avoid service/config changes.
 - **SNP test (next CPU port):** one cloud SNP CVM (Azure DCasv5 or GCP SEV-SNP),
   Ubuntu 24.04, ~$0.50–$2/hr. Tear it down after — this is a dev box, not
@@ -337,4 +341,5 @@ build, point them at: this file §4, the two swap-in files
 (`cathedral/attest/__init__.py`, `cathedral/verify/__init__.py`), the binding in
 `cathedral/common.py`, and `docs/DESIGN.md §6`. The task is bounded and the
 interface is frozen — it is "make `test_attest_snp_hw.py` green on the box
-without changing the 40 existing tests."
+without changing the existing hardware-free suite" (current count in
+`RUNTEST.md`).

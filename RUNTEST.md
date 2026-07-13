@@ -3,9 +3,9 @@
 Hardware-free, stdlib-only. The only third-party dependency is `pytest` (dev).
 No network, no TEE, no hardware: attestation is **mocked** behind the real
 `verify()` interface (see `cathedral/verify/mock.py` and `docs/DESIGN.md §6`).
-This repo is the confidential-compute sidecar only; `cathedralai/cathedral`
-remains the sole Bittensor weight setter, so there is no direct SDK dependency
-here.
+This service publishes a signed score stream. The existing Cathedral validator
+owns metagraph mapping and on-chain weight submission, so this core has no
+direct Bittensor SDK dependency.
 
 ## 1. Create the venv and install
 
@@ -27,9 +27,9 @@ points import cleanly) and pulls in `pytest`. No runtime deps beyond the stdlib.
 .venv/bin/python -m pytest -q
 ```
 
-Expected: all hardware-free tests pass. Hardware-gated coverage includes the
-TDX quote round trip, SAT lane e2e, and non-TDX negative controls; those cases
-are skipped unless `CATHEDRAL_RUN_TDX_HW=1` or
+Expected: **469 passed, 3 skipped**. All hardware-free tests pass. Hardware-gated
+coverage includes the TDX quote round trip, SAT lane e2e, and non-TDX negative
+controls; those cases are skipped unless `CATHEDRAL_RUN_TDX_HW=1` or
 `CATHEDRAL_RUN_TDX_NEGATIVE=1` is set on the appropriate machine.
 
 ## 3. Run the SAT demo

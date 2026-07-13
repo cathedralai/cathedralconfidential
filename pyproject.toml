@@ -6,9 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-  # No direct bittensor SDK here: cathedralai/cathedral remains the sole
-  # weight-setting scorer, and this repo stays the confidential sidecar.
-  # "bittensor>=8.0",
+  # This service publishes a signed score stream. The existing Cathedral
+  # validator owns metagraph mapping and on-chain weight submission.
 ]
 
 [project.optional-dependencies]
@@ -18,7 +17,7 @@ dev = ["pytest>=8.0", "substrate-interface>=1.7.0"]
 [project.scripts]
 cathedral = "cathedral.cli:main"
 cathedral-census = "cathedral.census:main"
-# Compatibility wrappers into the operator CLI; they do not add chain logic.
+# Operator aliases for the worker and score-publication runtime.
 cathedral-validator = "cathedral.neuron.validator:main"
 cathedral-miner = "cathedral.neuron.miner:main"
 

@@ -3,7 +3,7 @@
 Covers three fault injection points per miner:
   1. collect_evidence raises       -> miner not admitted, others unaffected
   2. verifier() raises             -> miner not admitted, others unaffected
-  3. do_sat_work raises            -> miner admitted (floor) but no work score
+  3. do_sat_work raises            -> miner admitted but receives zero
 
 Each test pairs a faulty miner with a healthy miner and asserts that the healthy
 miner is admitted, receives a positive weight, and the full weight+burn sum
@@ -213,8 +213,9 @@ def test_do_sat_work_exception_does_not_abort_peer():
         verifier=_verifier,
     )
 
-    # Both admitted; miner-a has work failure so only floor, miner-b has work score.
+    # Both admitted; miner-a has work failure and zero, miner-b has work score.
     assert set(result.admitted) == {"uid-work-bad", "uid-work-good"}
+    assert result.weights.get("uid-work-bad", 0) == 0.0
     assert result.weights.get("uid-work-good", 0) > result.weights.get("uid-work-bad", 0), (
         "healthy miner should out-earn faulty miner"
     )

@@ -288,6 +288,26 @@ class ConfidentialRuntime:
         self.ledger.abort_epoch(epoch_id)
         return epoch_id
 
+    def abandon_completed(self, epoch_id: int, reason: str) -> int:
+        """Recovery path for a completed report that can never be published.
+
+        Use when a 'complete' epoch's frozen report has aged past what the
+        downstream ingest service accepts for a first publish (retry-publish
+        can only resend identical bytes, so that report is permanently stuck).
+        Requires a nonempty operator reason; see
+        ``Ledger.abandon_completed_epoch`` for the full audit and payability
+        guarantees.
+        """
+        blocking = self.ledger.blocking_epoch()
+        if (
+            blocking is None
+            or blocking["status"] != "complete"
+            or blocking["epoch_id"] != epoch_id
+        ):
+            raise RuntimeError("epoch_id must identify the exact completed blocking epoch")
+        self.ledger.abandon_completed_epoch(epoch_id, reason)
+        return epoch_id
+
     def _prepare_targets(
         self, targets: list[MinerTarget]
     ) -> tuple[list[tuple[MinerTarget, str]], dict[str, MinerOutcome], frozenset[str]]:

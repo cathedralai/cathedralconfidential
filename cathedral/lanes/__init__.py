@@ -64,8 +64,8 @@ class Lane(abc.ABC):
 
 
 # Emission routing across lanes — the "directing compute" control surface,
-# tuned per epoch (docs/DESIGN.md §5). Placeholder weights; sum need not be 1
-# (the attestation floor + burn take the remainder).
+# tuned per epoch (docs/DESIGN.md §5). Placeholder weights; normalization and
+# any unallocated mass are handled by the router.
 ROUTING_VECTOR: dict[str, float] = {
     "inference": 0.30,
     "training": 0.20,
