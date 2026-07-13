@@ -5,9 +5,17 @@ Everything you need to (A) run the hardware-free testable core right now, and
 *real* attestation test on it. Read `docs/DESIGN.md` first for the why; this
 file is the how.
 
+> **Launch update.** This handoff was originally written SNP-first. For launch,
+> Cathedral is going TDX CPU first because a live GCP TDX CVM is already running
+> the Cathedral publisher. Use `docs/TDX_LAUNCH.md` for the current real
+> attestation path; keep the SNP sections below as the next CPU platform port.
+> SNP quote parsing and cryptographic verification exist in-repo, but runtime
+> scoring remains TDX CPU first.
+
 > **The one-line status.** The subnet mechanics + the SAT lane are real and
-> tested (40 passing tests). The attestation verdict is currently **mocked**
-> behind the real `verify()` interface. Commissioning a box is about replacing
+> tested. The attestation verdict is currently **mocked** in the validator epoch
+> and real TDX collection / external-verifier adapter code is now scaffolded
+> behind the same `verify()` interface. Commissioning a box is about replacing
 > that mock with a genuine vendor-verified quote — that is Phase 1, and it is
 > the critical path. Nothing downstream of an `Attested` verdict changes.
 
@@ -42,26 +50,32 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 
-python -m pytest -q             # expect: 40 passed
+python -m pytest -q             # expect the current full suite count from RUNTEST.md
 python scripts/demo_sat.py      # expect: ... PASS
 python -m cathedral.census      # prints CC capability of THIS box (exit 1 if none)
+cathedral-validator --help      # compatibility wrapper -> cathedral runtime ...
+cathedral-miner --help          # compatibility wrapper -> cathedral worker ...
 ```
 
-**What "40 passed" is telling you:** the nonce/REPORT_DATA binding, the SAT
-solve→verify→reject-forgery→reject-contradiction loop, emission-conserving
-economics (floor + routing + burn = 1.0), the work queue / tier-gated allocator,
-mock attestation with `chip_id` sybil dedup, and a full validator epoch
-(admit → run SAT → weights sum to ~1.0). See `RUNTEST.md` for the per-command
-breakdown.
+**What the hardware-free pass is telling you:** the nonce/REPORT_DATA binding,
+the SAT solve→verify→reject-forgery→reject-contradiction loop,
+emission-conserving economics (floor + routing + burn = 1.0), the work queue /
+tier-gated allocator, mock attestation with `chip_id` sybil dedup, TDX verifier
+adapter policy checks, and a full validator epoch (admit → run SAT → weights sum
+to ~1.0). See `RUNTEST.md` for the per-command breakdown.
 
 If Track A is green, the subnet's logic is sound. Everything below is about
 swapping the *mock* attestation for the *real* thing.
 
 ---
 
-## 2. Track B — commission a real SEV-SNP box
+## 2. Track B — real CPU attestation
 
-### 2.1 Why SEV-SNP first
+Launch path is TDX CPU first; see `docs/TDX_LAUNCH.md`. The SEV-SNP notes below
+are preserved because SNP is the next CPU platform port and uses the same
+collector / verifier boundary.
+
+### 2.1 Why the original draft chose SEV-SNP first
 
 Per `docs/DESIGN.md §3`, SEV-SNP is the widest confidential-compute supply
 (every AMD EPYC since 7003 "Milan", 2021) and the simplest quote path. TDX and
@@ -180,10 +194,10 @@ rd = report_data(nonce, miner_hotkey)          # -> pass as request-data.bin to 
 
 If `REPORT_DATA` in the returned report ≠ `report_data(nonce, hotkey)`, **reject**.
 
-### 4.2 Implement the collector — `cathedral/attest/__init__.py`
+### 4.2 Next SNP runtime step — `cathedral/attest/__init__.py`
 
-`collect_snp(nonce, hotkey, ssh_host_key=None)` currently raises
-`NotImplementedError`. Implement it to:
+The remaining SNP runtime task is wiring a real collector into the scoring path.
+That collector should:
 
 1. compute `rd = report_data(nonce, hotkey, ssh_host_key)`, write to a temp file
 2. shell out to `snpguest report <out> <rd-file>` (or call the sev-guest ioctl
@@ -192,10 +206,10 @@ If `REPORT_DATA` in the returned report ≠ `report_data(nonce, hotkey)`, **reje
 4. return an `Evidence(kind=SEV_SNP, quote=<report bytes>, cert_chain=[...],
    nonce=nonce, miner_hotkey=hotkey, ssh_host_key=ssh_host_key)`
 
-### 4.3 Implement the verifier — `cathedral/verify/__init__.py`
+### 4.3 Next SNP runtime step — `cathedral/verify/__init__.py`
 
-`verify(evidence, nonce, policy)` currently raises for each kind. Implement the
-SNP branch to:
+SNP verification code exists now; the remaining runtime task is making the SNP
+collector/verifier pair part of an enabled scoring path. The SNP verifier must:
 
 1. verify the AMD signature chain (`snpguest verify`, or the `sev` Rust crate /
    a Python binding) — **this is the crypto you must not hand-roll**
@@ -224,7 +238,7 @@ tests/test_attest_snp_hw.py   (mark: requires /dev/sev-guest; skip otherwise)
 ```
 
 Guard it with `pytest.mark.skipif(not os.path.exists('/dev/sev-guest'))` so the
-40 hardware-free tests still run everywhere and the HW test runs only on the box.
+hardware-free tests still run everywhere and the HW test runs only on the box.
 
 **Definition of done for the box:** `test_attest_snp_hw.py` green on the SNP VM,
 and a validator epoch that admits a *real*-attested miner (mock replaced) and
@@ -236,7 +250,7 @@ produces weights. That is the first real proof the subnet gates on hardware.
 
 Track A (any box):
 - [ ] `pip install -e '.[dev]'` succeeds
-- [ ] `python -m pytest -q` → **40 passed**
+- [ ] `python -m pytest -q` matches the current count in `RUNTEST.md`
 - [ ] `python scripts/demo_sat.py` → **PASS**
 
 Track B (SNP box):
@@ -274,7 +288,7 @@ cathedral/
   neuron/validator.py     hardware-free epoch (mock)        ← swap-in at §4.4
   neuron/miner.py         MockMiner serves evidence + SAT   ← swap-in at §4.4
 
-tests/                    40 hardware-free tests
+tests/                    hardware-free tests + hardware-gated TDX round trip
 scripts/demo_sat.py       dispatch → solve → verify → PASS
 ```
 
@@ -294,7 +308,7 @@ scripts/demo_sat.py       dispatch → solve → verify → PASS
   image/firmware changes. For production, pin a known image and add its
   measurement to `Policy.allowed_measurements` (this is the whole point of the
   measured-image discipline in `docs/DESIGN.md §7`).
-- **Tests fail after your edits** — the 40 hardware-free tests are the contract;
+- **Tests fail after your edits** — the hardware-free tests are the contract;
   if your Phase-1 changes break them, you changed an interface, not just an
   implementation. Re-read the swap-in comments.
 
@@ -302,10 +316,11 @@ scripts/demo_sat.py       dispatch → solve → verify → PASS
 
 ## 8. Procurement notes
 
-- **First test:** one cloud SNP CVM (Azure DCasv5 or GCP SEV-SNP), Ubuntu 24.04,
-  ~$0.50–$2/hr. Tear it down after — this is a dev box, not standing supply.
-- **TDX test (next):** an Azure DCesv5/DCasv6 or GCP `c3` TDX CVM. Same shape,
-  different collector/verifier branch.
+- **Launch test:** the live GCP `c3` TDX CVM. Treat it as production-adjacent:
+  collect a quote, verify it, and avoid service/config changes.
+- **SNP test (next CPU port):** one cloud SNP CVM (Azure DCasv5 or GCP SEV-SNP),
+  Ubuntu 24.04, ~$0.50–$2/hr. Tear it down after — this is a dev box, not
+  standing supply.
 - **GPU-CC test (later, hardest):** a bare-metal H100/H200 with CC mode, from a
   Latitude/Voltage-Park-tier provider; NVIDIA nvtrust for verification. Only
   needed for the Sandbox GPU tier — defer until CPU attestation is solid.

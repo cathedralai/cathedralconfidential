@@ -8,12 +8,15 @@ from __future__ import annotations
 
 from cathedral.api import Allocator, Inventory, Request, WorkQueue
 from cathedral.common import Attested, Tier
-from cathedral.lanes.sat import SatLane
+from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 
 
 def _canonical() -> SatWorkItem:
-    return SatWorkItem(instance=SatInstance(n_vars=1, clauses=[[1]]), seed=0)
+    inst = SatInstance(n_vars=1, clauses=[[1]])
+    return SatWorkItem(
+        instance=inst, seed=0, challenge_id=_compute_challenge_id(inst, 0)
+    )
 
 
 def test_workqueue_backfills_when_empty():
@@ -25,7 +28,8 @@ def test_workqueue_backfills_when_empty():
 
 def test_workqueue_serves_customer_job_before_backfill():
     q = WorkQueue(backfill=_canonical)
-    job = SatWorkItem(instance=SatInstance(n_vars=2, clauses=[[1, 2]]), seed=7)
+    inst = SatInstance(n_vars=2, clauses=[[1, 2]])
+    job = SatWorkItem(instance=inst, seed=7, challenge_id=_compute_challenge_id(inst, 7))
     q.enqueue(job)
     assert q.claim() is job                 # customer job first
     assert q.claim().seed == 0              # then back to canonical backfill
@@ -33,8 +37,10 @@ def test_workqueue_serves_customer_job_before_backfill():
 
 def test_workqueue_is_fifo():
     q = WorkQueue(backfill=_canonical)
-    a = SatWorkItem(instance=SatInstance(1, [[1]]), seed=1)
-    b = SatWorkItem(instance=SatInstance(1, [[1]]), seed=2)
+    inst_a = SatInstance(1, [[1]])
+    inst_b = SatInstance(1, [[1]])
+    a = SatWorkItem(instance=inst_a, seed=1, challenge_id=_compute_challenge_id(inst_a, 1))
+    b = SatWorkItem(instance=inst_b, seed=2, challenge_id=_compute_challenge_id(inst_b, 2))
     q.enqueue(a)
     q.enqueue(b)
     assert q.claim() is a

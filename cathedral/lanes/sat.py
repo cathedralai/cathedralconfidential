@@ -15,6 +15,10 @@ the satisfiable-accept path.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import math
 import random
 
 from cathedral.common import Attested, Tier
@@ -22,6 +26,39 @@ from cathedral.lanes import Certificate, Lane, WorkItem
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
 _QUALIFIED_TIERS = {Tier.CC_CPU_SNP, Tier.CC_CPU_TDX}
+_MAX_NONNEGATIVE_SIGNED_I64 = (1 << 63) - 1
+
+
+def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
+    """Deterministic hash of instance + seed to prevent duplicate crediting.
+
+    Returns the hex digest of sha256(json(instance) + seed). This challenge_id
+    is immutable after dispatch — it cannot be forged or duplicated.
+    """
+    payload = {
+        "n_vars": instance.n_vars,
+        "clauses": instance.clauses,
+        "seed": seed,
+    }
+    h = hashlib.sha256(json.dumps(payload, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def _derive_canonical_seed(namespace: str, counter: int) -> int:
+    """Derive a reproducible canonical SAT seed from namespace + counter.
+
+    Uses the first 64 HMAC bits and masks to the nonnegative signed-64-bit
+    range already accepted by the remote worker protocol. Retaining these high
+    bits avoids collapsing the seed space to 31 bits, which would sharply raise
+    challenge-id collision risk once ledger challenge IDs are globally unique.
+    """
+
+    seed_bytes = hmac.new(
+        namespace.encode(),
+        str(counter).encode(),
+        hashlib.sha256,
+    ).digest()
+    return int.from_bytes(seed_bytes[:8], "big") & _MAX_NONNEGATIVE_SIGNED_I64
 
 
 def solve_sat(instance: SatInstance) -> list[int] | None:
@@ -140,33 +177,86 @@ class SatLane(Lane):
 
     name = "sat_benchmark"
 
-    def __init__(self) -> None:
+    def __init__(self, namespace: str | None = None) -> None:
         self._queue: list[SatWorkItem] = []
+        # Fresh instances should not emit the same first ID. Use a random
+        # namespace to prevent collision across epochs while keeping the SAT
+        # instance reproducible from (namespace, counter).
+        self._namespace = namespace or hashlib.sha256(random.randbytes(16)).hexdigest()[:8]
         self._seed_counter = 0
+        self._issued_ids: set[str] = set()
+        # Map challenge_id -> owner miner (tracked at dispatch time).
+        self._challenge_owner: dict[str, str] = {}
+        # Map challenge_id -> work_units for verified certificates only.
+        # This ensures score() only counts certs that passed verify().
+        self._verified_credits: dict[str, float] = {}
 
     def qualify(self, attested: Attested) -> bool:
         return attested.tier in _QUALIFIED_TIERS
 
     def enqueue(self, item: SatWorkItem) -> None:
-        """Add a customer job to the internal queue (dispatch prefers these)."""
+        """Add a customer job to the internal queue (dispatch prefers these).
 
+        The item must have a valid challenge_id matching _compute_challenge_id(
+        instance, seed). This prevents duplicate crediting and internal consistency
+        errors across epochs.
+        """
+        if not item.challenge_id:
+            raise ValueError("enqueue: item.challenge_id must be non-empty")
+        computed_id = _compute_challenge_id(item.instance, item.seed)
+        if item.challenge_id != computed_id:
+            raise ValueError(
+                f"enqueue: challenge_id mismatch: provided {item.challenge_id}, "
+                f"computed {computed_id} from instance + seed"
+            )
         self._queue.append(item)
 
     def dispatch(self, miner: str, budget: int) -> WorkItem:
         if self._queue:
-            return self._queue.pop(0)
+            item = self._queue.pop(0)
+            self._issued_ids.add(item.challenge_id)
+            self._challenge_owner[item.challenge_id] = miner
+            return item
 
-        seed = self._seed_counter
+        # Derive seed from namespace + counter using stable HMAC, not Python
+        # hash() which is process-salted and not reproducible. HMAC-SHA256
+        # ensures identical namespace/counter always yields identical seed
+        # across different PYTHONHASHSEED values.
+        seed = _derive_canonical_seed(self._namespace, self._seed_counter)
         self._seed_counter += 1
         instance = _canonical_instance(seed)
-        return SatWorkItem(instance=instance, seed=seed)
+        challenge_id = _compute_challenge_id(instance, seed)
+        self._issued_ids.add(challenge_id)
+        self._challenge_owner[challenge_id] = miner
+        return SatWorkItem(instance=instance, seed=seed, challenge_id=challenge_id)
 
     def verify(self, item: WorkItem, result: object) -> Certificate | None:
         assert isinstance(item, SatWorkItem)
         if not isinstance(result, SatCertificate):
             return None
 
+        # Challenge accounting: require matching challenge_id, reject unissued,
+        # or mismatched IDs. Duplicate verification is prevented by checking if
+        # challenge_id is already in _verified_credits.
+        if result.challenge_id != item.challenge_id:
+            return None  # mismatch
+        if result.challenge_id not in self._issued_ids:
+            return None  # unissued
+        if result.challenge_id in self._verified_credits:
+            return None  # already verified and credited
+        owner = self._challenge_owner.get(result.challenge_id)
+        if not result.assigned_hotkey or result.assigned_hotkey != owner:
+            return None
+
         instance = item.instance
+
+        # Validator-derived difficulty: clause count — never the miner's claimed
+        # work_units. The returned certificate always carries the validator's
+        # value so score() never touches a miner-supplied number. Defending
+        # against 1e300, NaN, Infinity, negative, or any forged claim.
+        validator_work_units = float(len(instance.clauses))
+        if not math.isfinite(validator_work_units) or validator_work_units < 0:
+            return None  # defense-in-depth (should never happen)
 
         if result.satisfiable:
             if result.assignment is None:
@@ -183,12 +273,50 @@ class SatLane(Lane):
             for clause in instance.clauses:
                 if not any(lit in true_lits for lit in clause):
                     return None
-            return result
+            # Record verified credit only after full validation passes.
+            self._verified_credits[result.challenge_id] = validator_work_units
+            return SatCertificate(
+                satisfiable=True,
+                assignment=result.assignment,
+                work_units=validator_work_units,
+                challenge_id=result.challenge_id,
+                assigned_hotkey=result.assigned_hotkey,
+            )
 
         # UNSAT claim: testable core re-solves to confirm (Phase-2: DRAT proof).
         if solve_sat(instance) is not None:
             return None
-        return result
+        # Record verified credit only after full validation passes.
+        self._verified_credits[result.challenge_id] = validator_work_units
+        return SatCertificate(
+            satisfiable=False,
+            assignment=None,
+            work_units=validator_work_units,
+            challenge_id=result.challenge_id,
+            assigned_hotkey=result.assigned_hotkey,
+        )
 
     def score(self, miner: str, certs: list[Certificate]) -> float:
-        return sum(c.work_units for c in certs)  # type: ignore[union-attr]
+        """Sum validator-derived work_units for verified certificates only.
+
+        Only certificates that passed verify() are recorded in _verified_credits.
+        This ensures that hand-constructed certs with forged work_units, unknown
+        challenge_ids, or unverified assignments contribute zero.
+
+        Additionally, each challenge_id is counted at most once per call (deduplication),
+        and only when the challenge owner matches the miner being scored.
+
+        Returns the total accumulated work_units, or 0.0 if no verified certs.
+        """
+        total = 0.0
+        seen_challenge_ids: set[str] = set()
+        for c in certs:
+            # Only count if challenge_id is in the verified_credits map.
+            cid = getattr(c, "challenge_id", None)
+            if cid in self._verified_credits and cid not in seen_challenge_ids:
+                # Only count if this challenge belongs to the miner being scored.
+                owner = self._challenge_owner.get(cid)
+                if owner == miner:
+                    total += self._verified_credits[cid]
+                    seen_challenge_ids.add(cid)
+        return total

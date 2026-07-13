@@ -35,10 +35,14 @@ class SatWorkItem(WorkItem):
 
     The seed makes canonical work reproducible — anyone can regenerate the exact
     instance and independently check the returned certificate.
+
+    challenge_id is a deterministic hash of (n_vars, clauses, seed), used to
+    prevent duplicate crediting of the same challenge across epochs.
     """
 
     instance: SatInstance
     seed: int
+    challenge_id: str  # sha256 hex digest of instance + seed
 
 
 @dataclass(frozen=True)
@@ -52,8 +56,16 @@ class SatCertificate(Certificate):
 
     ``work_units`` is the difficulty-weighted credit for the solve; the lane's
     score() sums it across a miner's accepted certificates.
+
+    ``challenge_id`` echoes the ID from the SatWorkItem to prevent duplicate
+    crediting and detect mismatched submissions.
+
+    ``assigned_hotkey`` must exactly match the identity to which the lane
+    dispatched the challenge. Empty owners are never accepted by ``SatLane``.
     """
 
     satisfiable: bool
     assignment: list[int] | None
     work_units: float
+    challenge_id: str  # echoed from SatWorkItem
+    assigned_hotkey: str = ""  # dispatch identity that produced this certificate
