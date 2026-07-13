@@ -30,6 +30,7 @@ from cathedral.poster import Poster
 SOURCE = "cathedral_confidential_tdx"
 CAP = 0.10
 SIGNED_FRACTION_TOLERANCE = 1e-12
+QUANTIZED_FRACTION_TOLERANCE = 1e-4
 NETWORK = "finney"
 NETUID = 39
 KEY_ID = "cathedral-weight-policy"
@@ -170,17 +171,15 @@ def create_zero_epoch(ledger: Ledger, *, generated_at: str) -> tuple[int, dict[s
 
 
 def survivor_cases(hotkeys: Sequence[str]) -> list[tuple[str, dict[str, int]]]:
-    """Generate every nonempty survivor subset with unique and merged UID cases."""
+    """Generate every proper nonempty unique survivor mapping."""
     ordered = tuple(sorted(set(hotkeys)))
     require(bool(ordered), "signed vector has no hotkeys to audit")
     cases: list[tuple[str, dict[str, int]]] = []
-    for size in range(1, len(ordered) + 1):
+    for size in range(1, len(ordered)):
         for members in itertools.combinations(ordered, size):
             label = "+".join(members)
             unique = {hotkey: 100 + ordered.index(hotkey) for hotkey in members}
             cases.append((f"unique:{label}", unique))
-            if len(members) > 1:
-                cases.append((f"merged:{label}", {hotkey: 900 for hotkey in members}))
     return cases
 
 
@@ -196,19 +195,20 @@ def signed_component_ratios(payload: Mapping[str, Any]) -> dict[str, float]:
             external = float(row["external_component"])
         except (KeyError, TypeError, ValueError) as exc:
             raise LaunchProofError(f"invalid signed components for {hotkey!r}") from exc
+        require(
+            all(math.isfinite(value) and value >= 0.0 for value in (base, external)),
+            f"signed row {hotkey!r} has invalid attribution components",
+        )
         require(weight > 0.0, f"signed row {hotkey!r} has nonpositive weight")
         require(abs(weight - (base + external)) <= 1e-15, f"component sum mismatch for {hotkey!r}")
         ratio = external / weight
-        require(
-            ratio <= CAP + SIGNED_FRACTION_TOLERANCE,
-            f"signed confidential attribution exceeds 10% for {hotkey!r}",
-        )
         ratios[hotkey] = ratio
     require(bool(ratios), "signed vector has no component-bearing rows")
     return ratios
 
 
 def signed_confidential_fraction(payload: Mapping[str, Any]) -> float:
+    signed_component_ratios(payload)
     total_base = 0.0
     total_external = 0.0
     total_weight = 0.0
@@ -244,44 +244,89 @@ def audit_quantized_case(
     vector_to_uid_weights: Callable[[dict[str, Any], dict[str, int]], dict[int, float]],
     quantize: Callable[[list[int], list[float]], tuple[Sequence[int], Sequence[int]]],
 ) -> dict[str, Any]:
-    """Audit one production drop/merge/renormalize/quantize transform."""
+    """Audit one production mapping, fallback, renormalization, and u16 transform."""
     rows = {str(row["miner_hotkey"]): row for row in payload["weights"]}
     require(set(hotkey_to_uid).issubset(rows), "survivor mapping contains an unsigned hotkey")
+    require(len(hotkey_to_uid) == len(set(hotkey_to_uid.values())), "audit mapping has duplicate UIDs")
+    complete = set(hotkey_to_uid) == set(rows)
 
-    merged: dict[int, dict[str, float]] = {}
+    components: dict[int, dict[str, float]] = {}
     for hotkey, uid in hotkey_to_uid.items():
         row = rows[hotkey]
-        state = merged.setdefault(int(uid), {"base": 0.0, "external": 0.0})
+        state = components.setdefault(int(uid), {"base": 0.0, "external": 0.0})
         state["base"] += float(row["base_component"])
-        state["external"] += float(row["external_component"])
+        if complete:
+            state["external"] += float(row["external_component"])
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        uid_weights = vector_to_uid_weights(dict(payload), dict(hotkey_to_uid))
-    require(set(uid_weights) == set(merged), "thin-validator UID output differs from survivor map")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            uid_weights = vector_to_uid_weights(dict(payload), dict(hotkey_to_uid))
+    except Exception as exc:
+        # A proper map containing only base_component=0 rows has no payable
+        # base mass. Production fails closed rather than manufacturing a UID.
+        require(
+            not complete and not any(state["base"] > 0.0 for state in components.values()),
+            f"thin-validator mapping failed unexpectedly: {exc}",
+        )
+        return {
+            "complete_mapping": False,
+            "fallback": True,
+            "input_uids": len(hotkey_to_uid),
+            "quantized_uids": 0,
+            "total_u16": 0,
+            "realized_fraction": 0.0,
+            "max_uid_fraction": 0.0,
+        }
+
+    expected_uids = {uid for uid, state in components.items() if state["base"] + state["external"] > 0.0}
+    require(set(uid_weights) == expected_uids, "thin-validator UID output violates base-only fallback")
+    if not complete:
+        zero_base_uids = {uid for uid, state in components.items() if state["base"] == 0.0}
+        require(
+            zero_base_uids.isdisjoint(uid_weights),
+            "base_component=0 row received fallback UID weight",
+        )
+    if not uid_weights:
+        return {
+            "complete_mapping": False,
+            "fallback": True,
+            "input_uids": len(hotkey_to_uid),
+            "quantized_uids": 0,
+            "total_u16": 0,
+            "realized_fraction": 0.0,
+            "max_uid_fraction": 0.0,
+        }
+
     ordered = sorted(uid_weights)
     q_uids_raw, q_values_raw = quantize(ordered, [uid_weights[uid] for uid in ordered])
     q_uids = [int(uid) for uid in q_uids_raw]
     q_values = [int(value) for value in q_values_raw]
     require(len(q_uids) == len(q_values), "Bittensor returned mismatched UID/value lengths")
     require(len(q_uids) == len(set(q_uids)), "Bittensor returned duplicate UIDs")
-    require(set(q_uids).issubset(merged), "Bittensor returned an unknown UID")
-    require(all(value > 0 for value in q_values), "Bittensor returned nonpositive u16 weight")
+    require(set(q_uids).issubset(components), "Bittensor returned an unknown UID")
+    require(all(0 < value <= 65535 for value in q_values), "Bittensor returned invalid u16 weight")
     total_u16 = sum(q_values)
     require(total_u16 > 0, "Bittensor quantizer returned zero total weight")
 
     attributed_u16 = 0.0
     max_uid_ratio = 0.0
     for uid, value in zip(q_uids, q_values, strict=True):
-        state = merged[uid]
+        state = components[uid]
         total_component = state["base"] + state["external"]
         require(total_component > 0.0, f"UID {uid} has no signed component mass")
         ratio = state["external"] / total_component
-        require(ratio <= CAP, f"merged UID {uid} exceeds 10% confidential attribution")
         max_uid_ratio = max(max_uid_ratio, ratio)
         attributed_u16 += value * ratio
     realized = attributed_u16 / total_u16
-    require(realized <= CAP, "realized u16 confidential attribution exceeds 10%")
+    expected_fraction = CAP if complete else 0.0
+    require(
+        math.isclose(realized, expected_fraction, rel_tol=0.0, abs_tol=QUANTIZED_FRACTION_TOLERANCE),
+        f"realized u16 confidential attribution {realized:.8f} does not match "
+        f"expected {expected_fraction:.2f}",
+    )
     return {
+        "complete_mapping": complete,
+        "fallback": not complete,
         "input_uids": len(ordered),
         "quantized_uids": len(q_uids),
         "total_u16": total_u16,
@@ -482,11 +527,20 @@ def run_proof(scorer_repo: Path) -> dict[str, Any]:
                 )
                 ratios = signed_component_ratios(signed)
                 aggregate_fraction = signed_confidential_fraction(signed)
-                require(CONFIDENTIAL_ONLY not in ratios, "confidential-only hotkey received weight")
                 require(
-                    set(ratios) == set(BASE_WORK), "signed vector differs from base-payable miners"
+                    set(ratios) == set(ALL_HOTKEYS),
+                    "signed vector is missing a positive compute-only hotkey",
                 )
 
+                full_mapping = {
+                    hotkey: 10 + index for index, hotkey in enumerate(sorted(ratios))
+                }
+                full_audit = audit_quantized_case(
+                    signed,
+                    full_mapping,
+                    vector_to_uid_weights=validator_thin.vector_to_uid_weights,
+                    quantize=scorer["quantize"],
+                )
                 cases = survivor_cases(tuple(ratios))
                 audits = [
                     audit_quantized_case(
@@ -497,6 +551,16 @@ def run_proof(scorer_repo: Path) -> dict[str, Any]:
                     )
                     for _, mapping in cases
                 ]
+                duplicate_mapping = dict(full_mapping)
+                duplicate_hotkeys = sorted(ratios)[:2]
+                duplicate_mapping[duplicate_hotkeys[1]] = duplicate_mapping[duplicate_hotkeys[0]]
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        validator_thin.vector_to_uid_weights(signed, duplicate_mapping)
+                except validator_thin.wire.VectorError:
+                    duplicate_uid_rejected = True
+                else:
+                    raise LaunchProofError("production validator accepted duplicate UID mapping")
 
                 zero_epoch, _zero_scores = create_zero_epoch(
                     ledger,
@@ -552,14 +616,30 @@ def run_proof(scorer_repo: Path) -> dict[str, Any]:
                 "zero_entries": len(persisted_zero["scores"]),
                 "signed_vectors": 1,
                 "signed_rows": len(signed["weights"]),
-                "survivor_cases": len(cases),
-                "quantized_uid_rows": sum(audit["quantized_uids"] for audit in audits),
-                "aggregate_signed_confidential_fraction": aggregate_fraction,
-                "max_signed_confidential_fraction": max(ratios.values()),
-                "max_u16_confidential_fraction": max(
-                    audit["realized_fraction"] for audit in audits
+                "signed_compute_only_weight": next(
+                    float(row["weight"])
+                    for row in signed["weights"]
+                    if row["miner_hotkey"] == CONFIDENTIAL_ONLY
                 ),
-                "confidential_only_weight": 0.0,
+                "survivor_cases": len(cases),
+                "quantized_uid_rows": full_audit["quantized_uids"] + sum(
+                    audit["quantized_uids"] for audit in audits
+                ),
+                "aggregate_signed_confidential_fraction": aggregate_fraction,
+                "max_signed_row_confidential_fraction": max(ratios.values()),
+                "full_map_quantized_confidential_fraction": full_audit["realized_fraction"],
+                "full_map_quantized_within_tolerance": True,
+                "max_u16_confidential_fraction": max(
+                    [full_audit["realized_fraction"]]
+                    + [audit["realized_fraction"] for audit in audits]
+                ),
+                "base_only_fallback_cases": sum(1 for audit in audits if audit["fallback"]),
+                "duplicate_uid_rejected": duplicate_uid_rejected,
+                "confidential_only_weight": next(
+                    float(row["weight"])
+                    for row in signed["weights"]
+                    if row["miner_hotkey"] == CONFIDENTIAL_ONLY
+                ),
                 "zero_revocation": True,
             }
         finally:

@@ -29,6 +29,30 @@ def _payload() -> dict:
     }
 
 
+def _v3_payload() -> dict:
+    return {
+        "burn_snapshot": {"burn_uid": None, "forced_burn_percentage": 0.0},
+        "policy_metadata": {"confidential_tdx_cap": {
+            "cap_version": "v3",
+            "configured_fraction": 0.10,
+        }},
+        "weights": [
+            {
+                "miner_hotkey": "base",
+                "weight": 0.90,
+                "base_component": 0.90,
+                "external_component": 0.0,
+            },
+            {
+                "miner_hotkey": "compute",
+                "weight": 0.10,
+                "base_component": 0.0,
+                "external_component": 0.10,
+            },
+        ],
+    }
+
+
 def _exact_ten_percent_payload() -> dict:
     return {
         "burn_snapshot": {"burn_uid": None, "forced_burn_percentage": 0.0},
@@ -50,11 +74,17 @@ def _exact_ten_percent_payload() -> dict:
 
 
 def _vector_to_uid_weights(payload: dict, mapping: dict[str, int]) -> dict[int, float]:
+    rows = {row["miner_hotkey"]: row for row in payload["weights"]}
+    if len(mapping.values()) != len(set(mapping.values())):
+        raise ValueError("duplicate UID")
+    complete = set(mapping) == set(rows)
     merged: dict[int, float] = {}
     for row in payload["weights"]:
         uid = mapping.get(row["miner_hotkey"])
         if uid is not None:
-            merged[uid] = merged.get(uid, 0.0) + row["weight"]
+            value = row["weight"] if complete else row["base_component"]
+            if value > 0.0:
+                merged[uid] = value
     total = sum(merged.values())
     return {uid: value / total for uid, value in merged.items()}
 
@@ -80,18 +110,13 @@ def test_ledger_helpers_freeze_positive_then_complete_zero(tmp_path: Path) -> No
     assert set(row["score"] for row in zero_report["scores"]) == {0.0}
 
 
-def test_survivor_cases_exhaust_subsets_and_include_uid_merges() -> None:
+def test_survivor_cases_exhaust_proper_nonempty_subsets() -> None:
     cases = gate.survivor_cases(("charlie", "alpha", "bravo"))
 
-    assert len(cases) == 11
+    assert len(cases) == 6
     mappings = dict(cases)
     assert mappings["unique:alpha"] == {"alpha": 100}
-    assert mappings["unique:alpha+bravo+charlie"] == {
-        "alpha": 100,
-        "bravo": 101,
-        "charlie": 102,
-    }
-    assert set(mappings["merged:alpha+bravo+charlie"].values()) == {900}
+    assert "unique:alpha+bravo+charlie" not in mappings
 
 
 def test_quantized_audit_uses_returned_u16_masses() -> None:
@@ -100,21 +125,19 @@ def test_quantized_audit_uses_returned_u16_masses() -> None:
         return uids, [65535, 1000]
 
     result = gate.audit_quantized_case(
-        _payload(),
+        _exact_ten_percent_payload(),
         {"alpha": 10, "bravo": 20},
         vector_to_uid_weights=_vector_to_uid_weights,
         quantize=quantize,
     )
 
-    alpha_ratio = 0.05 / 0.55
-    bravo_ratio = 0.03 / 0.45
-    expected = (65535 * alpha_ratio + 1000 * bravo_ratio) / 66535
+    expected = gate.CAP
     assert result["total_u16"] == 66535
     assert result["realized_fraction"] == pytest.approx(expected)
-    assert result["realized_fraction"] < gate.CAP
+    assert result["realized_fraction"] == pytest.approx(gate.CAP, abs=gate.QUANTIZED_FRACTION_TOLERANCE)
 
 
-def test_quantized_audit_handles_drop_and_duplicate_uid_merge() -> None:
+def test_quantized_audit_handles_base_only_drop_and_compute_only_row() -> None:
     def quantize(uids: list[int], _weights: list[float]) -> tuple[list[int], list[int]]:
         return uids, [65535]
 
@@ -124,30 +147,49 @@ def test_quantized_audit_handles_drop_and_duplicate_uid_merge() -> None:
         vector_to_uid_weights=_vector_to_uid_weights,
         quantize=quantize,
     )
-    merged = gate.audit_quantized_case(
-        _payload(),
-        {"alpha": 10, "bravo": 10},
+    fallback = gate.audit_quantized_case(
+        _v3_payload(),
+        {"base": 10},
         vector_to_uid_weights=_vector_to_uid_weights,
         quantize=quantize,
     )
 
     assert dropped["input_uids"] == 1
-    assert dropped["realized_fraction"] == pytest.approx(0.05 / 0.55)
-    assert merged["input_uids"] == 1
-    assert merged["realized_fraction"] == pytest.approx(0.08)
+    assert dropped["realized_fraction"] == 0.0
+    assert fallback["fallback"] is True
+    assert fallback["realized_fraction"] == 0.0
+
+    compute_only = gate.audit_quantized_case(
+        _v3_payload(),
+        {"compute": 12},
+        vector_to_uid_weights=_vector_to_uid_weights,
+        quantize=quantize,
+    )
+    assert compute_only["quantized_uids"] == 0
+    assert compute_only["realized_fraction"] == 0.0
 
 
-def test_signed_component_ratio_over_cap_fails_closed() -> None:
-    payload = _payload()
-    payload["weights"][0] = {
-        "miner_hotkey": "alpha",
-        "weight": 1.0,
-        "base_component": 0.89,
-        "external_component": 0.11,
-    }
+def test_quantized_audit_full_map_accepts_compute_only_row() -> None:
+    def quantize(uids: list[int], _weights: list[float]) -> tuple[list[int], list[int]]:
+        return uids, [58982, 6553]
 
-    with pytest.raises(gate.LaunchProofError, match="exceeds 10%"):
-        gate.signed_component_ratios(payload)
+    result = gate.audit_quantized_case(
+        _v3_payload(),
+        {"base": 10, "compute": 12},
+        vector_to_uid_weights=_vector_to_uid_weights,
+        quantize=quantize,
+    )
+
+    assert result["realized_fraction"] == pytest.approx(gate.CAP, abs=gate.QUANTIZED_FRACTION_TOLERANCE)
+
+
+def test_signed_component_ratio_allows_compute_only_row_under_global_cap() -> None:
+    payload = _v3_payload()
+
+    ratios = gate.signed_component_ratios(payload)
+
+    assert ratios["compute"] == 1.0
+    assert gate.signed_confidential_fraction(payload) == pytest.approx(gate.CAP)
 
 
 def test_signed_confidential_fraction_requires_exact_10_percent() -> None:
