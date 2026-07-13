@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cathedral.ledger import Ledger, LedgerError
+from cathedral.ledger import _EPOCHS_MIGRATION_TEMP_PREFIX, Ledger, LedgerError
 from cathedral.poster import Poster, PosterError
 
 
@@ -540,6 +540,21 @@ class TestEpochsTableMigration:
                 "'2020-01-01T00:00:00+00:00', ?, 'deadbeef')",
                 (b'{"complete":true}',),
             )
+            # Real child rows in all three tables that reference `epochs`, so
+            # migration regression tests can assert they survive the rebuild
+            # untouched (not just that the schema looks right).
+            cx.execute(
+                "INSERT INTO challenges "
+                "(challenge_id, epoch_id, hotkey, status, work_units, issued_at, resolved_at) "
+                "VALUES ('legacy-challenge', 1, 'hk', 'verified', 5, "
+                "'2020-01-01T00:00:00+00:00', '2020-01-01T00:00:01+00:00')"
+            )
+            cx.execute(
+                "INSERT INTO epoch_attestations "
+                "(epoch_id, hotkey, verdict, tee_type, workload, evidence_digest, attested_at) "
+                "VALUES (1, 'hk', 'VERIFIED', 'TDX', 'CPU', 'evidence-hk', "
+                "'2020-01-01T00:00:00+00:00')"
+            )
             cx.execute(
                 "INSERT INTO epoch_scores (epoch_id, hotkey, work_units, score) VALUES (1, 'hk', 5, 1.0)"
             )
@@ -646,14 +661,14 @@ class TestEpochsTableMigration:
     def test_rolls_back_atomically_when_copy_step_fails(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An error injected mid-rebuild must roll back the whole rename+rebuild+copy.
+        """An error injected mid-rebuild must roll back the whole create+copy+drop+rename.
 
         Proves the fix for the original bug: because the rebuild runs inside
         one explicit transaction instead of `executescript` (which
         auto-commits), a failure partway through -- here, the row-copy INSERT
-        -- undoes the index drops, the rename, and the new table/index
-        creation together. `epochs` is left exactly as it was, with no
-        `epochs_pre_abandon_migration` table stranded, and `PRAGMA
+        into the throwaway temp table -- undoes the temp table creation
+        together with anything after it. `epochs` is left exactly as it was,
+        with no `epochs_migration_new_*` temp table stranded, and `PRAGMA
         foreign_keys` is restored even though migration failed.
         """
         import sqlite3 as _sqlite3
@@ -665,7 +680,9 @@ class TestEpochsTableMigration:
             """Fails the migration's row-copy INSERT, simulating e.g. a full disk."""
 
             def execute(self, sql, *args, **kwargs):  # type: ignore[override]
-                if isinstance(sql, str) and sql.startswith("INSERT INTO epochs (epoch_id"):
+                if isinstance(sql, str) and sql.startswith(
+                    f"INSERT INTO {_EPOCHS_MIGRATION_TEMP_PREFIX}"
+                ):
                     raise _sqlite3.OperationalError("injected copy failure")
                 return super().execute(sql, *args, **kwargs)
 
@@ -699,19 +716,162 @@ class TestEpochsTableMigration:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
+            assert not any(name.startswith(_EPOCHS_MIGRATION_TEMP_PREFIX) for name in tables)
             assert "epochs_pre_abandon_migration" not in tables
+            assert "epochs" in tables
             columns = {row[1] for row in verify_cx.execute("PRAGMA table_info(epochs)")}
             assert "abandon_reason" not in columns
             row = verify_cx.execute(
                 "SELECT source_epoch, status, report_digest FROM epochs WHERE epoch_id = 1"
             ).fetchone()
             assert row == (1, "complete", "deadbeef")
+            # The child rows that predate the failed migration attempt must
+            # be untouched: rollback undid the parent-table rebuild, and it
+            # never touched child tables at all.
+            challenge_row = verify_cx.execute(
+                "SELECT epoch_id, status FROM challenges WHERE challenge_id = 'legacy-challenge'"
+            ).fetchone()
+            assert challenge_row == (1, "verified")
+            fk_violations = verify_cx.execute("PRAGMA foreign_key_check").fetchall()
+            assert fk_violations == []
         finally:
             verify_cx.close()
 
         # A later, uninterrupted open still migrates cleanly.
         ledger = Ledger(path)
         assert ledger.get_epoch(1)["abandon_reason"] is None
+
+    def test_refuses_to_open_with_leftover_new_temp_migration_table(
+        self, tmp_path: Path
+    ) -> None:
+        """A stranded temp table from an interrupted *new-style* rebuild is refused.
+
+        Mirrors `test_refuses_to_open_with_leftover_pre_abandon_table` but for
+        the current rebuild strategy: if the process died between creating
+        the `epochs_migration_new_*` temp table and dropping it (e.g. right
+        after the rename, before `DROP TABLE` of the old temp name would ever
+        run -- here simulated by leaving the temp table around directly),
+        the leftover must be surfaced rather than silently ignored on reopen.
+        """
+        import sqlite3 as _sqlite3
+
+        path = tmp_path / "legacy.sqlite3"
+        self._create_legacy_schema(path)
+
+        leftover_name = f"{_EPOCHS_MIGRATION_TEMP_PREFIX}deadbeefcafef00d"
+        cx = _sqlite3.connect(str(path))
+        try:
+            cx.execute(f"CREATE TABLE {leftover_name} (epoch_id INTEGER PRIMARY KEY)")
+            cx.commit()
+        finally:
+            cx.close()
+
+        with pytest.raises(LedgerError, match=f"leftover {leftover_name!r}"):
+            Ledger(path)
+
+        # The refusal must not have mutated anything: the original `epochs`
+        # table and the stray temp table are both exactly as left here.
+        verify_cx = _sqlite3.connect(str(path))
+        try:
+            tables = {
+                row[0]
+                for row in verify_cx.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            assert leftover_name in tables
+            assert "epochs" in tables
+            columns = {row[1] for row in verify_cx.execute("PRAGMA table_info(epochs)")}
+            assert "abandon_reason" not in columns
+        finally:
+            verify_cx.close()
+
+    def test_migration_preserves_child_rows_and_never_leaves_dangling_references(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end regression test for the rename-based-FK-rewrite bug.
+
+        Builds a legacy ledger with real rows in all three child tables
+        (`challenges`, `epoch_attestations`, `epoch_scores`), migrates it, and
+        asserts: `PRAGMA foreign_key_check` is clean, no child table's stored
+        schema mentions any `epochs_migration_new_*` temp name (the exact
+        defect that made `no such table: main.epochs_pre_abandon_migration`
+        possible under the old rename-the-real-table approach), the
+        pre-migration child rows are still there and still valid, and both
+        new epochs and new child rows referencing them can be created after
+        migration.
+        """
+        import sqlite3 as _sqlite3
+
+        path = tmp_path / "legacy.sqlite3"
+        self._create_legacy_schema(path)
+
+        ledger = Ledger(path)
+
+        raw = _sqlite3.connect(str(path))
+        try:
+            assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
+
+            child_sql = {
+                row[0]: row[1]
+                for row in raw.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('challenges', 'epoch_attestations', 'epoch_scores')"
+                )
+            }
+            assert set(child_sql) == {"challenges", "epoch_attestations", "epoch_scores"}
+            for table_name, sql in child_sql.items():
+                assert "epochs(" in sql or "epochs (" in sql, table_name
+                assert _EPOCHS_MIGRATION_TEMP_PREFIX not in sql, table_name
+                assert "epochs_pre_abandon_migration" not in sql, table_name
+
+            # No table anywhere -- parent or child -- mentions a temp name.
+            all_sql = [
+                row[0]
+                for row in raw.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL"
+                )
+            ]
+            assert not any(_EPOCHS_MIGRATION_TEMP_PREFIX in sql for sql in all_sql)
+
+            # Pre-migration child rows for epoch 1 survived the rebuild.
+            assert raw.execute(
+                "SELECT epoch_id, hotkey, status FROM challenges WHERE challenge_id = 'legacy-challenge'"
+            ).fetchone() == (1, "hk", "verified")
+            assert raw.execute(
+                "SELECT epoch_id, hotkey, evidence_digest FROM epoch_attestations "
+                "WHERE epoch_id = 1 AND hotkey = 'hk'"
+            ).fetchone() == (1, "hk", "evidence-hk")
+            assert raw.execute(
+                "SELECT epoch_id, hotkey, score FROM epoch_scores WHERE epoch_id = 1 AND hotkey = 'hk'"
+            ).fetchone() == (1, "hk", 1.0)
+        finally:
+            raw.close()
+
+        # New activity against the migrated schema works end to end: new
+        # epoch, new challenge/attestation/score rows referencing it, and the
+        # old epoch's data is unaffected.
+        ledger.abandon_completed_epoch(1, "legacy report too old for first ingest")
+        new_epoch_id = ledger.begin_epoch(2)
+        ledger.issue_challenge("new-challenge", "hk2", new_epoch_id)
+        ledger.resolve_challenge("new-challenge", "verified", 10, validator_derived=True)
+        attest(ledger, new_epoch_id, "hk2")
+        scores = ledger.complete_epoch(new_epoch_id, {"hk2"})
+        assert scores == {"hk2": 1.0}
+        assert ledger.get_epoch(1)["status"] == "abandoned"
+
+        raw = _sqlite3.connect(str(path))
+        try:
+            assert raw.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert raw.execute(
+                "SELECT epoch_id, hotkey, status FROM challenges WHERE challenge_id = 'legacy-challenge'"
+            ).fetchone() == (1, "hk", "verified")
+            assert raw.execute(
+                "SELECT epoch_id, hotkey, status FROM challenges WHERE challenge_id = 'new-challenge'"
+            ).fetchone() == (new_epoch_id, "hk2", "verified")
+        finally:
+            raw.close()
+        ledger.close()
 
 
 class FakeHeaders(dict):

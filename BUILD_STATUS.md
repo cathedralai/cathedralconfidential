@@ -13,7 +13,7 @@ Last verified: 2026-07-13
   `5CtobNq2yNmUKaaR9HL5eSY2jN4j43iz1GLXNeNp2tbkwawK`, verified 20 work units,
   assigned score `1.0`, and published the resulting vector.
 - The persistent confidential validator is running on a 60-second cycle. The
-  repository test suite passes with 467 tests passed and 3 skipped.
+  repository test suite passes with 469 tests passed and 3 skipped.
 
 ## Operator: pretty epoch logs
 

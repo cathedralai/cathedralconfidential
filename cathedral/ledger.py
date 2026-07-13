@@ -19,11 +19,17 @@ class LedgerError(Exception):
 
 
 # Single source of truth for the `epochs` table and its two partial indexes.
-# `_migrate_epochs_table_if_needed` below executes each of these individually
+# `_migrate_epochs_table_if_needed` below executes each statement individually
 # (never via `executescript`) so the rebuild can run inside one explicit,
-# rollback-able transaction.
-_EPOCHS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS epochs (
+# rollback-able transaction. The table name is parameterized because the
+# migration builds the widened schema under a throwaway temp name (never
+# under `epochs` itself -- see that method's docstring for why).
+_EPOCHS_MIGRATION_TEMP_PREFIX = "epochs_migration_new_"
+
+
+def _epochs_table_sql(table_name: str) -> str:
+    return f"""
+CREATE TABLE IF NOT EXISTS {table_name} (
     epoch_id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_epoch INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (
@@ -39,6 +45,9 @@ CREATE TABLE IF NOT EXISTS epochs (
     abandon_reason TEXT
 )
 """
+
+
+_EPOCHS_TABLE_SQL = _epochs_table_sql("epochs")
 
 _ONE_RUNNING_EPOCH_INDEX_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS one_running_epoch "
@@ -161,73 +170,118 @@ class Ledger:
         so this is a no-op for them. Ledgers created before the 'abandoned'
         status existed have an ``epochs`` table whose CHECK constraint and
         column set predate it; SQLite cannot alter a CHECK constraint in
-        place, so the table is rebuilt: its two partial indexes are dropped,
-        the table is renamed aside, a fresh ``epochs`` table (widened CHECK,
-        plus ``abandoned_at``/``abandon_reason`` columns) is created and its
-        indexes restored, every existing row is copied across unchanged
-        (including ``epoch_id``, so child rows in ``challenges``,
-        ``epoch_attestations`` and ``epoch_scores`` keep pointing at the same
-        logical epoch), and the renamed table is dropped.
+        place, so the table is rebuilt.
+
+        This never renames the live, referenced ``epochs`` table. An earlier
+        version of this migration renamed ``epochs`` itself aside (to
+        ``epochs_pre_abandon_migration``), rebuilt a fresh ``epochs``, copied
+        rows across, then dropped the rename-aside table. On modern SQLite,
+        ``ALTER TABLE ... RENAME`` rewrites *other* tables' schema text to
+        keep foreign keys pointing at the renamed table -- this rewrite is
+        governed by ``PRAGMA legacy_alter_table``, not ``PRAGMA
+        foreign_keys``, so setting ``foreign_keys = OFF`` does not suppress
+        it. That left ``challenges``/``epoch_attestations``/``epoch_scores``
+        permanently referencing ``epochs_pre_abandon_migration`` in their
+        stored schema, and once that table was dropped, every subsequent
+        insert into a child table failed with ``no such table: main.
+        epochs_pre_abandon_migration`` even though the schema, on its face,
+        said ``REFERENCES epochs(epoch_id)`` right up until the rename.
+
+        The fix: build the widened schema under a throwaway, never-referenced
+        temp name, copy every row across unchanged (including ``epoch_id``,
+        so child rows in ``challenges``, ``epoch_attestations`` and
+        ``epoch_scores`` keep pointing at the same logical epoch and so
+        SQLite's AUTOINCREMENT high-water mark carries over), drop the old
+        ``epochs`` table outright (no rename involved), then rename the temp
+        table to ``epochs``. Nothing ever references the temp table's name,
+        so the rename-time schema rewrite has nothing to rewrite -- child
+        tables' stored SQL keeps saying ``REFERENCES epochs(epoch_id)`` the
+        entire time. Indexes are (re)created fresh under the final name after
+        the rename.
 
         The whole rebuild runs inside one explicit ``BEGIN IMMEDIATE`` ...
         ``COMMIT``/``ROLLBACK`` transaction using plain ``execute`` calls (no
         ``executescript``, which implicitly commits and cannot be rolled back
         as a unit). If the process is interrupted or a step fails partway
-        through, SQLite rolls the whole rename+rebuild+copy+drop back on the
-        next connection, so ``epochs`` is left exactly as it was and no
-        ``epochs_pre_abandon_migration`` table can survive. Foreign keys are
-        held off for the duration (SQLite ignores changes to that pragma
-        inside a transaction, so it must be toggled outside the BEGIN/COMMIT)
-        so child tables keep referencing the table named ``epochs``
-        throughout, rather than being silently repointed at the renamed copy;
-        the prior pragma value is restored on every exit path.
+        through -- including the post-rebuild soundness checks below -- the
+        whole create+copy+drop+rename+index transaction rolls back, so
+        ``epochs`` is left exactly as it was and no temp table can survive.
+        Foreign keys are held off for the duration (SQLite ignores changes to
+        that pragma inside a transaction, so it must be toggled outside the
+        BEGIN/COMMIT); this is required for ``DROP TABLE epochs`` to succeed
+        while child rows still reference it (with foreign keys enabled, SQLite
+        treats ``DROP TABLE`` on a referenced parent like a bulk ``DELETE``
+        and enforces the FK, which would otherwise raise). The prior pragma
+        value is restored on every exit path.
 
-        A leftover ``epochs_pre_abandon_migration`` table (from an old,
-        non-atomic version of this migration that was interrupted after the
-        rename) is refused rather than silently ignored: without this check,
-        a fresh ``epochs`` table with the current schema would already exist
+        Before committing, ``PRAGMA foreign_key_check`` must come back empty
+        and every child table's stored schema must still mention ``epochs``
+        and must not mention the temp table -- if either check fails, the
+        transaction is rolled back and a ``LedgerError`` is raised rather than
+        persisting a broken schema. The same two checks are repeated once
+        more immediately after commit as a defense-in-depth assertion (using
+        the same connection, so nothing external could have changed the
+        schema in between); a failure there indicates a bug in this method
+        itself rather than a recoverable data problem.
+
+        A leftover temp-named table (from an old, interrupted migration --
+        either the legacy ``epochs_pre_abandon_migration`` rename-aside name,
+        or a temp table from this rebuild's own ``epochs_migration_new_*``
+        naming) is refused rather than silently ignored: without this check,
+        a fresh ``epochs`` table with the current schema could already exist
         so the ``abandon_reason`` probe below would treat migration as
-        already done, and the real history sitting in the renamed table would
-        be stranded and never surfaced.
+        already done, and the real history sitting in the leftover table
+        would be stranded and never surfaced.
         """
         cx = self._connection
-        leftover = cx.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'epochs_pre_abandon_migration'"
-        ).fetchone()
-        if leftover is not None:
+        existing_tables = {
+            row["name"]
+            for row in cx.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        leftover_name = next(
+            (
+                name
+                for name in existing_tables
+                if name == "epochs_pre_abandon_migration"
+                or name.startswith(_EPOCHS_MIGRATION_TEMP_PREFIX)
+            ),
+            None,
+        )
+        if leftover_name is not None:
             raise LedgerError(
-                "found leftover 'epochs_pre_abandon_migration' table from an "
-                "interrupted epochs-table migration; the ledger file needs "
-                "manual inspection before it can be reopened"
+                f"found leftover {leftover_name!r} table from an interrupted "
+                "epochs-table migration; the ledger file needs manual "
+                "inspection before it can be reopened"
             )
         columns = {row["name"] for row in cx.execute("PRAGMA table_info(epochs)")}
         if "abandon_reason" in columns:
             return
+        temp_name = f"{_EPOCHS_MIGRATION_TEMP_PREFIX}{uuid.uuid4().hex}"
         prior_foreign_keys = cx.execute("PRAGMA foreign_keys").fetchone()[0]
         cx.execute("PRAGMA foreign_keys = OFF")
         try:
             cx.execute("BEGIN IMMEDIATE")
             try:
-                cx.execute("DROP INDEX IF EXISTS one_running_epoch")
-                cx.execute("DROP INDEX IF EXISTS one_finalized_source_epoch")
-                cx.execute("ALTER TABLE epochs RENAME TO epochs_pre_abandon_migration")
-                cx.execute(_EPOCHS_TABLE_SQL)
-                cx.execute(_ONE_RUNNING_EPOCH_INDEX_SQL)
-                cx.execute(_ONE_FINALIZED_SOURCE_EPOCH_INDEX_SQL)
+                cx.execute(_epochs_table_sql(temp_name))
                 cx.execute(
-                    "INSERT INTO epochs (epoch_id, source_epoch, status, started_at, "
+                    f"INSERT INTO {temp_name} (epoch_id, source_epoch, status, started_at, "
                     "completed_at, published_at, generated_at, report_body, report_digest) "
                     "SELECT epoch_id, source_epoch, status, started_at, completed_at, "
                     "published_at, generated_at, report_body, report_digest "
-                    "FROM epochs_pre_abandon_migration"
+                    "FROM epochs"
                 )
-                cx.execute("DROP TABLE epochs_pre_abandon_migration")
-            except sqlite3.DatabaseError:
+                cx.execute("DROP TABLE epochs")
+                cx.execute(f"ALTER TABLE {temp_name} RENAME TO epochs")
+                cx.execute(_ONE_RUNNING_EPOCH_INDEX_SQL)
+                cx.execute(_ONE_FINALIZED_SOURCE_EPOCH_INDEX_SQL)
+                self._assert_epochs_migration_is_sound(temp_name)
+            except BaseException:
                 cx.execute("ROLLBACK")
                 raise
             else:
                 cx.execute("COMMIT")
+        except LedgerError:
+            raise
         except sqlite3.DatabaseError as exc:
             raise LedgerError(
                 "failed to migrate epochs table for the 'abandoned' status; "
@@ -235,6 +289,51 @@ class Ledger:
             ) from exc
         finally:
             cx.execute(f"PRAGMA foreign_keys = {'ON' if prior_foreign_keys else 'OFF'}")
+        # Defense in depth: re-run the same checks once more now that the
+        # rebuild is durably committed. A failure here means this method has
+        # a bug, since the pre-commit checks above already passed on the same
+        # connection with nothing else able to touch the schema in between.
+        self._assert_epochs_migration_is_sound(temp_name)
+
+    def _assert_epochs_migration_is_sound(self, temp_name: str) -> None:
+        """Raise ``LedgerError`` unless the epochs rebuild left a sound schema.
+
+        Checks, in order: (1) no foreign key violations anywhere in the
+        database, (2) no table's stored schema still mentions the throwaway
+        temp table name, and (3) each child table (``challenges``,
+        ``epoch_attestations``, ``epoch_scores``) still declares a reference
+        to ``epochs``. Called once before COMMIT (so a failure rolls back the
+        whole migration) and once more immediately after COMMIT as a
+        defense-in-depth assertion.
+        """
+        cx = self._connection
+        violations = cx.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise LedgerError(
+                "post-migration PRAGMA foreign_key_check reported violations "
+                f"{[tuple(row) for row in violations]!r}; the ledger file "
+                "needs manual inspection"
+            )
+        stray = cx.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND sql LIKE ?",
+            (f"%{temp_name}%",),
+        ).fetchall()
+        if stray:
+            raise LedgerError(
+                "post-migration schema still references the temporary "
+                f"migration table {temp_name!r} in {[row['name'] for row in stray]!r}; "
+                "the ledger file needs manual inspection"
+            )
+        for child_table in ("challenges", "epoch_attestations", "epoch_scores"):
+            row = cx.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (child_table,),
+            ).fetchone()
+            if row is None or "epochs" not in row["sql"]:
+                raise LedgerError(
+                    f"post-migration schema for {child_table!r} no longer "
+                    "references 'epochs'; the ledger file needs manual inspection"
+                )
 
     def close(self) -> None:
         with self._lock:
