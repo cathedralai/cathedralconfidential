@@ -22,9 +22,11 @@ out.
 from __future__ import annotations
 
 import argparse
+import datetime
 import ipaddress
 import json
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -51,6 +53,155 @@ DEFAULT_QUEUE_FILE = Path(".cathedral_queue.json")
 DEFAULT_PUBLISHER_BEARER_ENV = "CATHEDRAL_PUBLISHER_BEARER_TOKEN"
 DEFAULT_PUBLISHER_HMAC_ENV = "CATHEDRAL_PUBLISHER_HMAC_SECRET"
 DEFAULT_WORKER_BEARER_ENV = "CATHEDRAL_WORKER_BEARER_TOKEN"
+
+
+# --------------------------------------------------------------------------
+# pretty output helpers: human-readable operator logs for run-epoch and
+# retry-publish.  JSON is still the default; --pretty opts in.
+# --------------------------------------------------------------------------
+
+
+def _utc_ts() -> str:
+    """Current UTC timestamp in compact ISO format for operator logs."""
+    return datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _abbrev(s: str | None, prefix: int = 5, suffix: int = 4) -> str:
+    """Abbreviate a long identifier (hotkey, challenge ID) for single-line display."""
+    if not s:
+        return "-"
+    if len(s) <= prefix + suffix + 2:
+        return s
+    return f"{s[:prefix]}..{s[-suffix:]}"
+
+
+# Patterns that identify a credential value inside an error string.
+# Conservative: require an explicit keyword followed by = or : and a
+# non-whitespace token.  The key name is preserved; only the value is
+# replaced.  Redaction runs before truncation so no partial secret can
+# survive at the length boundary.
+_REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Authorization: Bearer <token>  (HTTP header echoed in error text)
+    re.compile(r"(Authorization\s*:\s*Bearer\s+)\S+", re.IGNORECASE),
+    # bearer=, token=, secret=, hmac=, api_key=, api-key=, apikey=
+    re.compile(
+        r"((?:bearer|token|secret|hmac|api[-_]?key)\s*[=:]\s*)\S+",
+        re.IGNORECASE,
+    ),
+)
+_REDACT_REPLACEMENT = r"\g<1>[REDACTED]"
+
+
+def _sanitize_error(err: str | None, maxlen: int = 100) -> str:
+    """Flatten, redact credential patterns, and truncate an error string.
+
+    Redaction targets obvious credential assignments embedded in upstream
+    error messages:
+
+    * ``Authorization: Bearer <token>`` (HTTP header echoed verbatim)
+    * ``bearer=``, ``token=``, ``secret=``, ``hmac=``, ``api_key=``,
+      ``api-key=`` assignments (``=`` or ``:`` separator, case-insensitive)
+
+    Non-secret text is preserved.  Redaction runs before truncation so a
+    partial credential cannot survive at the length boundary.
+    """
+    if not err:
+        return ""
+    # 1. Flatten to a single line.
+    flat = err.replace("\n", " ").replace("\r", " ").strip()
+    # 2. Redact credential-shaped patterns.
+    for pattern in _REDACT_PATTERNS:
+        flat = pattern.sub(_REDACT_REPLACEMENT, flat)
+    # 3. Truncate.
+    return flat[:maxlen]
+
+
+def _pretty_outcome_indicator(outcome: MinerOutcome) -> str:
+    """Return a fixed-width 4-char status indicator: OK, ZERO, or FAIL."""
+    if outcome.admitted and outcome.score > 0.0:
+        return "OK  "
+    if outcome.admitted:
+        return "ZERO"
+    return "FAIL"
+
+
+def _format_run_pretty(run: EpochRun, *, out: object = None) -> None:
+    """Write a concise ASCII epoch summary to *out* (default: sys.stdout).
+
+    One lifecycle header, one line per worker, one summary footer::
+
+        [TIMESTAMP] EPOCH START  source=N  ep=N
+        [TIMESTAMP] OK    5Ctob..awK  ep=7/1  admit=Y  work=verified
+                    wu=20.00  score=1.000  pub=NO  ch=ababab..bababa
+        [TIMESTAMP] ZERO  5Zero..ero  ep=7/1  admit=Y  work=sat_failed
+                    wu=0.00  score=0.000  pub=NO  ch=cdcdcd..dcdcdc
+                    err=invalid SAT certificate
+        [TIMESTAMP] FAIL  5Fail..ail  ep=7/1  admit=N  work=attestation_failed
+                    wu=0.00  score=0.000  pub=NO  err=worker returned HTTP 401
+        [TIMESTAMP] EPOCH END  ep=7/1  status=complete  published=NO
+                    ok=1  zeros=1  fail=1
+    """
+    if out is None:
+        out = sys.stdout
+
+    pub_str = "YES" if run.published else "NO"
+
+    print(
+        f"[{_utc_ts()}] EPOCH START  source={run.source_epoch}  ep={run.epoch_id}",
+        file=out,
+    )
+
+    ok_count = zero_count = fail_count = 0
+    for outcome in run.outcomes:
+        ind = _pretty_outcome_indicator(outcome)
+        if ind == "OK  ":
+            ok_count += 1
+        elif ind == "ZERO":
+            zero_count += 1
+        else:
+            fail_count += 1
+
+        hotkey_str = _abbrev(outcome.hotkey, prefix=5, suffix=4)
+        ch_str = _abbrev(outcome.challenge_id, prefix=6, suffix=6)
+        admit_str = "Y" if outcome.admitted else "N"
+        err_part = f"  err={_sanitize_error(outcome.error)}" if outcome.error else ""
+
+        print(
+            f"[{_utc_ts()}] {ind}  {hotkey_str:<14}"
+            f"  ep={run.source_epoch}/{run.epoch_id}"
+            f"  admit={admit_str}"
+            f"  work={outcome.status:<22}"
+            f"  wu={outcome.work_units:>8.2f}"
+            f"  score={outcome.score:.3f}"
+            f"  pub={pub_str}"
+            f"  ch={ch_str}"
+            f"{err_part}",
+            file=out,
+        )
+
+    status_flag = "  !! EPOCH FAILED" if run.status not in {"complete", "published"} else ""
+    print(
+        f"[{_utc_ts()}] EPOCH END"
+        f"  ep={run.source_epoch}/{run.epoch_id}"
+        f"  status={run.status}{status_flag}"
+        f"  published={pub_str}"
+        f"  workers={len(run.outcomes)}"
+        f"  ok={ok_count}  zeros={zero_count}  fail={fail_count}",
+        file=out,
+    )
+
+
+def _format_publish_pretty(
+    epoch_id: int, ack: dict[str, object], *, out: object = None
+) -> None:
+    """Write a concise human-readable publish acknowledgement to *out*."""
+    if out is None:
+        out = sys.stdout
+    ack_status = ack.get("status", "?")
+    print(
+        f"[{_utc_ts()}] PUBLISH  epoch={epoch_id}  ok  ack={ack_status}",
+        file=out,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -280,6 +431,9 @@ def _target(args: argparse.Namespace, tokens: dict[str, str]) -> MinerTarget:
 
 
 def _outcome_json(outcome: MinerOutcome) -> dict[str, object]:
+    # Miner/upstream error text may echo request context (headers, URLs) that
+    # embeds a credential; sanitize it here too so the default JSON path gets
+    # the same redaction as --pretty, not just a narrower one applied later.
     return {
         "hotkey": outcome.hotkey,
         "endpoint_url": outcome.endpoint_url,
@@ -288,7 +442,7 @@ def _outcome_json(outcome: MinerOutcome) -> dict[str, object]:
         "challenge_id": outcome.challenge_id,
         "work_units": outcome.work_units,
         "score": outcome.score,
-        "error": outcome.error,
+        "error": _sanitize_error(outcome.error, maxlen=300) if outcome.error else None,
     }
 
 
@@ -356,7 +510,10 @@ def cmd_runtime_run_epoch(args: argparse.Namespace) -> int:
             _target(args, tokens),
             publish=args.publish,
         )
-        print(json.dumps(_run_json(run), sort_keys=True))
+        if getattr(args, "pretty", False):
+            _format_run_pretty(run)
+        else:
+            print(json.dumps(_run_json(run), sort_keys=True))
         return 0
     finally:
         ledger.close()
@@ -375,7 +532,10 @@ def cmd_runtime_retry_publish(args: argparse.Namespace) -> int:
     runtime, ledger, _ = _build_runtime(args)
     try:
         acknowledgement = runtime.publish_completed(args.epoch_id)
-        print(json.dumps(dict(acknowledgement), sort_keys=True))
+        if getattr(args, "pretty", False):
+            _format_publish_pretty(args.epoch_id, dict(acknowledgement))
+        else:
+            print(json.dumps(dict(acknowledgement), sort_keys=True))
         return 0
     finally:
         ledger.close()
@@ -386,6 +546,32 @@ def cmd_runtime_abort_running(args: argparse.Namespace) -> int:
     try:
         epoch_id = runtime.abort_running()
         print(json.dumps({"aborted_epoch_id": epoch_id}, sort_keys=True))
+        return 0
+    finally:
+        ledger.close()
+
+
+def cmd_runtime_abandon_complete(args: argparse.Namespace) -> int:
+    """Recovery command: abandon a 'complete' epoch that can never publish.
+
+    See ``ConfidentialRuntime.abandon_completed`` / ``Ledger.abandon_completed_epoch``
+    for the invariants (audited, one-way, never payable, never mutates report bytes).
+    """
+    runtime, ledger, _ = _build_runtime(args)
+    try:
+        epoch_id = runtime.abandon_completed(args.epoch_id, args.reason)
+        row = ledger.get_epoch(epoch_id)
+        assert row is not None
+        print(
+            json.dumps(
+                {
+                    "abandoned_epoch_id": epoch_id,
+                    "reason": row["abandon_reason"],
+                    "abandoned_at": row["abandoned_at"],
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     finally:
         ledger.close()
@@ -480,6 +666,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_canary(p_run)
     p_run.add_argument("--source-epoch", type=int, required=True)
     p_run.add_argument("--publish", action="store_true")
+    p_run.add_argument(
+        "--pretty",
+        action="store_true",
+        help="human-readable epoch summary (default: JSON)",
+    )
     p_run.set_defaults(func=cmd_runtime_run_epoch)
 
     p_runtime_status = runtime_sub.add_parser("status", help="show restart-blocking state")
@@ -494,11 +685,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_retry.add_argument("--publisher-hmac-env", default=DEFAULT_PUBLISHER_HMAC_ENV)
     p_retry.add_argument("--epoch-id", type=int, required=True)
+    p_retry.add_argument(
+        "--pretty",
+        action="store_true",
+        help="human-readable publish summary (default: JSON)",
+    )
     p_retry.set_defaults(func=cmd_runtime_retry_publish)
 
     p_abort = runtime_sub.add_parser("abort-running", help="abort the running epoch")
     p_abort.add_argument("--ledger-db", required=True)
     p_abort.set_defaults(func=cmd_runtime_abort_running)
+
+    p_abandon = runtime_sub.add_parser(
+        "abandon-complete",
+        help=(
+            "abandon a completed-but-unpublished epoch that can never publish "
+            "(e.g. its report is too old for the ingest service's first-publish window)"
+        ),
+    )
+    p_abandon.add_argument("--ledger-db", required=True)
+    p_abandon.add_argument("--epoch-id", type=int, required=True)
+    p_abandon.add_argument(
+        "--reason",
+        required=True,
+        help="nonempty operator justification; recorded in the ledger audit trail",
+    )
+    p_abandon.set_defaults(func=cmd_runtime_abandon_complete)
 
     return parser
 
@@ -509,7 +721,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except Exception as exc:
-        print(json.dumps({"error": str(exc)[:300]}), file=sys.stderr)
+        # Any exception text may echo request/response context that embeds a
+        # credential (e.g. a token-mapping load error); sanitize before it
+        # reaches logs, same as the outcome/run JSON and --pretty paths.
+        print(json.dumps({"error": _sanitize_error(str(exc), maxlen=300)}), file=sys.stderr)
         return 2
 
 

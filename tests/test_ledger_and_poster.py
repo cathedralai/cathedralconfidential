@@ -363,6 +363,357 @@ class TestReportSnapshot:
         ledger.mark_published(epoch_id, ledger.report_digest(epoch_id))
 
 
+class TestAbandonCompletedEpoch:
+    """Audited recovery for a 'complete' epoch that can never publish."""
+
+    def test_abandon_transitions_status_and_records_audit_fields(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.complete_epoch(epoch_id, set())
+        assert ledger.get_epoch(epoch_id)["abandon_reason"] is None
+
+        ledger.abandon_completed_epoch(epoch_id, "report too old for first ingest")
+        row = ledger.get_epoch(epoch_id)
+        assert row["status"] == "abandoned"
+        assert row["abandon_reason"] == "report too old for first ingest"
+        assert row["abandoned_at"] is not None
+
+    def test_abandon_strips_reason_whitespace(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.complete_epoch(epoch_id, set())
+        ledger.abandon_completed_epoch(epoch_id, "  stale report  ")
+        assert ledger.get_epoch(epoch_id)["abandon_reason"] == "stale report"
+
+    @pytest.mark.parametrize("reason", ["", "   ", None])
+    def test_abandon_requires_nonempty_reason(self, reason) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.complete_epoch(epoch_id, set())
+        with pytest.raises(LedgerError, match="nonempty"):
+            ledger.abandon_completed_epoch(epoch_id, reason)
+        assert ledger.get_epoch(epoch_id)["status"] == "complete"
+
+    def test_abandon_does_not_mutate_frozen_report_bytes(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        verified_work(ledger, epoch_id, "challenge", "hk", 5)
+        attest(ledger, epoch_id, "hk")
+        ledger.complete_epoch(epoch_id, {"hk"}, generated_at="2020-01-01T00:00:00Z")
+        body_before = ledger.report_bytes(epoch_id)
+        digest_before = ledger.report_digest(epoch_id)
+
+        ledger.abandon_completed_epoch(epoch_id, "too old for first ingest")
+        assert ledger.report_bytes(epoch_id) == body_before
+        assert ledger.report_digest(epoch_id) == digest_before
+
+    def test_only_a_complete_epoch_can_be_abandoned_running_rejected(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        with pytest.raises(LedgerError, match="running.*cannot|only a complete"):
+            ledger.abandon_completed_epoch(epoch_id, "reason")
+        assert ledger.get_epoch(epoch_id)["status"] == "running"
+
+    def test_only_a_complete_epoch_can_be_abandoned_aborted_rejected(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.abort_epoch(epoch_id)
+        with pytest.raises(LedgerError, match="only a complete"):
+            ledger.abandon_completed_epoch(epoch_id, "reason")
+
+    def test_only_a_complete_epoch_can_be_abandoned_published_rejected(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.complete_epoch(epoch_id, set())
+        ledger.mark_published(epoch_id)
+        with pytest.raises(LedgerError, match="only a complete"):
+            ledger.abandon_completed_epoch(epoch_id, "reason")
+
+    def test_abandoned_epoch_cannot_be_abandoned_again(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.complete_epoch(epoch_id, set())
+        ledger.abandon_completed_epoch(epoch_id, "first reason")
+        with pytest.raises(LedgerError, match="only a complete"):
+            ledger.abandon_completed_epoch(epoch_id, "second reason")
+        assert ledger.get_epoch(epoch_id)["abandon_reason"] == "first reason"
+
+    def test_abandoned_epoch_can_never_be_published(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.complete_epoch(epoch_id, set())
+        ledger.abandon_completed_epoch(epoch_id, "reason")
+        with pytest.raises(LedgerError, match="cannot publish"):
+            ledger.mark_published(epoch_id)
+
+    def test_abandon_unblocks_begin_epoch(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.complete_epoch(epoch_id, set())
+        with pytest.raises(LedgerError, match="publish it"):
+            ledger.begin_epoch(2)
+        ledger.abandon_completed_epoch(epoch_id, "reason")
+        assert ledger.begin_epoch(2)
+
+    def test_abandoned_epoch_scores_never_enter_the_trailing_window(self) -> None:
+        ledger = Ledger(window_size=3)
+        epoch_id = ledger.begin_epoch(1)
+        verified_work(ledger, epoch_id, "challenge", "hk", 1000)
+        attest(ledger, epoch_id, "hk")
+        ledger.complete_epoch(epoch_id, {"hk"})
+        ledger.abandon_completed_epoch(epoch_id, "too old for first ingest")
+
+        next_epoch = ledger.begin_epoch(2)
+        attest(ledger, next_epoch, "hk")
+        scores = ledger.complete_epoch(next_epoch, {"hk"})
+        # The abandoned epoch's 1000 verified work units contribute nothing:
+        # with no other published history, "hk" has zero prior credited work.
+        assert scores == {"hk": 0.0}
+
+    def test_abandon_nonexistent_epoch_raises(self) -> None:
+        ledger = Ledger()
+        with pytest.raises(LedgerError, match="not found"):
+            ledger.abandon_completed_epoch(999, "reason")
+
+
+class TestEpochsTableMigration:
+    """A pre-existing on-disk ledger without 'abandoned' support is migrated in place."""
+
+    @staticmethod
+    def _create_legacy_schema(path: Path) -> None:
+        """Build a ledger file using the schema that predates 'abandoned'."""
+        import sqlite3 as _sqlite3
+
+        cx = _sqlite3.connect(str(path))
+        try:
+            cx.executescript(
+                """
+                CREATE TABLE epochs (
+                    epoch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_epoch INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('running', 'aborted', 'complete', 'published')),
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    published_at TEXT,
+                    generated_at TEXT,
+                    report_body BLOB,
+                    report_digest TEXT
+                );
+                CREATE UNIQUE INDEX one_running_epoch ON epochs ((1)) WHERE status = 'running';
+                CREATE UNIQUE INDEX one_finalized_source_epoch
+                    ON epochs (source_epoch) WHERE status IN ('complete', 'published');
+
+                CREATE TABLE challenges (
+                    challenge_id TEXT PRIMARY KEY,
+                    epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
+                    hotkey TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('issued', 'verified', 'failed', 'abandoned')),
+                    work_units REAL NOT NULL DEFAULT 0 CHECK (work_units >= 0),
+                    issued_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+
+                CREATE TABLE epoch_attestations (
+                    epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
+                    hotkey TEXT NOT NULL,
+                    verdict TEXT NOT NULL CHECK (verdict = 'VERIFIED'),
+                    tee_type TEXT NOT NULL CHECK (tee_type = 'TDX'),
+                    workload TEXT NOT NULL CHECK (workload = 'CPU'),
+                    evidence_digest TEXT NOT NULL,
+                    attested_at TEXT NOT NULL,
+                    PRIMARY KEY (epoch_id, hotkey)
+                );
+
+                CREATE TABLE epoch_scores (
+                    epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
+                    hotkey TEXT NOT NULL,
+                    work_units REAL NOT NULL CHECK (work_units >= 0),
+                    score REAL NOT NULL CHECK (score >= 0 AND score <= 1),
+                    PRIMARY KEY (epoch_id, hotkey)
+                );
+                """
+            )
+            cx.execute(
+                "INSERT INTO epochs (source_epoch, status, started_at, completed_at, "
+                "generated_at, report_body, report_digest) VALUES "
+                "(1, 'complete', '2020-01-01T00:00:00+00:00', '2020-01-01T00:00:01+00:00', "
+                "'2020-01-01T00:00:00+00:00', ?, 'deadbeef')",
+                (b'{"complete":true}',),
+            )
+            cx.execute(
+                "INSERT INTO epoch_scores (epoch_id, hotkey, work_units, score) VALUES (1, 'hk', 5, 1.0)"
+            )
+            cx.commit()
+        finally:
+            cx.close()
+
+    def test_legacy_ledger_migrates_and_supports_abandon(self, tmp_path: Path) -> None:
+        path = tmp_path / "legacy.sqlite3"
+        self._create_legacy_schema(path)
+
+        ledger = Ledger(path)
+        row = ledger.get_epoch(1)
+        assert row["status"] == "complete"
+        assert row["abandon_reason"] is None
+        assert row["abandoned_at"] is None
+        assert bytes(row["report_body"]) == b'{"complete":true}'
+
+        # Existing invariants (one running epoch, source-epoch uniqueness) still hold.
+        with pytest.raises(LedgerError, match="publish it"):
+            ledger.begin_epoch(2)
+
+        ledger.abandon_completed_epoch(1, "legacy report too old for first ingest")
+        migrated = ledger.get_epoch(1)
+        assert migrated["status"] == "abandoned"
+        assert migrated["abandon_reason"] == "legacy report too old for first ingest"
+        assert ledger.begin_epoch(2)
+
+    def test_migration_is_idempotent_across_reopen(self, tmp_path: Path) -> None:
+        path = tmp_path / "legacy.sqlite3"
+        self._create_legacy_schema(path)
+        Ledger(path).close()
+        # A second open (already migrated) must not error or re-migrate.
+        ledger = Ledger(path)
+        assert ledger.get_epoch(1)["status"] == "complete"
+        ledger.abandon_completed_epoch(1, "reason")
+        assert ledger.get_epoch(1)["status"] == "abandoned"
+
+    def test_refuses_to_open_with_leftover_pre_abandon_table(self, tmp_path: Path) -> None:
+        """A stranded rename-aside table from an interrupted migration must be refused.
+
+        This reproduces exactly what an old, non-atomic migration could leave
+        behind if interrupted right after the rename: the rename-aside table
+        holding all the real history, plus a brand new (empty-of-history)
+        ``epochs`` table that already has the current schema. Without an
+        explicit check, opening this file would treat migration as already
+        done and silently proceed on the fresh, historyless table.
+        """
+        import sqlite3 as _sqlite3
+
+        path = tmp_path / "legacy.sqlite3"
+        self._create_legacy_schema(path)
+
+        cx = _sqlite3.connect(str(path))
+        try:
+            cx.execute("DROP INDEX one_running_epoch")
+            cx.execute("DROP INDEX one_finalized_source_epoch")
+            cx.execute("ALTER TABLE epochs RENAME TO epochs_pre_abandon_migration")
+            cx.execute(
+                "CREATE TABLE epochs ("
+                "epoch_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "source_epoch INTEGER NOT NULL, "
+                "status TEXT NOT NULL CHECK ("
+                "status IN ('running', 'aborted', 'complete', 'published', 'abandoned')"
+                "), "
+                "started_at TEXT NOT NULL, "
+                "completed_at TEXT, "
+                "published_at TEXT, "
+                "generated_at TEXT, "
+                "report_body BLOB, "
+                "report_digest TEXT, "
+                "abandoned_at TEXT, "
+                "abandon_reason TEXT"
+                ")"
+            )
+            cx.commit()
+        finally:
+            cx.close()
+
+        with pytest.raises(
+            LedgerError, match="leftover 'epochs_pre_abandon_migration'"
+        ):
+            Ledger(path)
+
+        # The refusal must not have mutated anything further: both tables
+        # are exactly as this test left them for manual operator recovery.
+        verify_cx = _sqlite3.connect(str(path))
+        try:
+            tables = {
+                row[0]
+                for row in verify_cx.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            assert "epochs_pre_abandon_migration" in tables
+            assert "epochs" in tables
+            stranded_row = verify_cx.execute(
+                "SELECT report_digest FROM epochs_pre_abandon_migration WHERE epoch_id = 1"
+            ).fetchone()
+            assert stranded_row == ("deadbeef",)
+        finally:
+            verify_cx.close()
+
+    def test_rolls_back_atomically_when_copy_step_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An error injected mid-rebuild must roll back the whole rename+rebuild+copy.
+
+        Proves the fix for the original bug: because the rebuild runs inside
+        one explicit transaction instead of `executescript` (which
+        auto-commits), a failure partway through -- here, the row-copy INSERT
+        -- undoes the index drops, the rename, and the new table/index
+        creation together. `epochs` is left exactly as it was, with no
+        `epochs_pre_abandon_migration` table stranded, and `PRAGMA
+        foreign_keys` is restored even though migration failed.
+        """
+        import sqlite3 as _sqlite3
+
+        path = tmp_path / "legacy.sqlite3"
+        self._create_legacy_schema(path)
+
+        class _InjectingConnection(_sqlite3.Connection):
+            """Fails the migration's row-copy INSERT, simulating e.g. a full disk."""
+
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                if isinstance(sql, str) and sql.startswith("INSERT INTO epochs (epoch_id"):
+                    raise _sqlite3.OperationalError("injected copy failure")
+                return super().execute(sql, *args, **kwargs)
+
+        real_connect = _sqlite3.connect
+        created_connections: list[_sqlite3.Connection] = []
+
+        def connect_with_injection(*args, **kwargs):
+            kwargs["factory"] = _InjectingConnection
+            connection = real_connect(*args, **kwargs)
+            created_connections.append(connection)
+            return connection
+
+        with monkeypatch.context() as patched:
+            patched.setattr(_sqlite3, "connect", connect_with_injection)
+            with pytest.raises(LedgerError, match="failed to migrate"):
+                Ledger(path)
+
+        assert len(created_connections) == 1
+        failed_connection = created_connections[0]
+        # PRAGMA foreign_keys is per-connection state, never persisted to disk,
+        # so this is the only way to observe that the OFF/ON toggle around the
+        # rebuild was restored correctly on the failure path.
+        assert failed_connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        failed_connection.close()
+
+        verify_cx = _sqlite3.connect(str(path))
+        try:
+            tables = {
+                row[0]
+                for row in verify_cx.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            assert "epochs_pre_abandon_migration" not in tables
+            columns = {row[1] for row in verify_cx.execute("PRAGMA table_info(epochs)")}
+            assert "abandon_reason" not in columns
+            row = verify_cx.execute(
+                "SELECT source_epoch, status, report_digest FROM epochs WHERE epoch_id = 1"
+            ).fetchone()
+            assert row == (1, "complete", "deadbeef")
+        finally:
+            verify_cx.close()
+
+        # A later, uninterrupted open still migrates cleanly.
+        ledger = Ledger(path)
+        assert ledger.get_epoch(1)["abandon_reason"] is None
+
+
 class FakeHeaders(dict):
     pass
 

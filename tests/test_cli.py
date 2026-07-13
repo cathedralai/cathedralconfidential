@@ -23,6 +23,7 @@ from cathedral.cli import (
 )
 from cathedral.lanes.sat import _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
+from cathedral.ledger import Ledger
 from cathedral.worker import WorkerServer
 
 
@@ -173,6 +174,130 @@ def test_runtime_run_epoch_is_dry_by_default_and_publish_is_explicit():
 def test_runtime_restart_commands_only_require_ledger_path():
     args = build_parser().parse_args(["runtime", "status", "--ledger-db", "ledger.sqlite"])
     assert args.runtime_command == "status"
+
+
+# ---------------------------------------------------------------------------
+# runtime abandon-complete: audited recovery for a stuck 'complete' epoch
+# ---------------------------------------------------------------------------
+
+
+def test_abandon_complete_parser_requires_epoch_id_and_reason():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "runtime", "abandon-complete",
+            "--ledger-db", "ledger.sqlite",
+            "--epoch-id", "3",
+            "--reason", "too old for first ingest",
+        ]
+    )
+    assert args.runtime_command == "abandon-complete"
+    assert args.epoch_id == 3
+    assert args.reason == "too old for first ingest"
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        ["runtime", "abandon-complete", "--ledger-db", "l.sqlite", "--reason", "x"],
+        ["runtime", "abandon-complete", "--ledger-db", "l.sqlite", "--epoch-id", "1"],
+    ],
+)
+def test_abandon_complete_parser_requires_all_flags(missing):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(missing)
+
+
+def test_abandon_complete_end_to_end_unblocks_begin_epoch(tmp_path: Path):
+    from cathedral.cli import cmd_runtime_abandon_complete
+
+    db_path = tmp_path / "ledger.sqlite"
+    ledger = Ledger(db_path)
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(epoch_id, set())
+    ledger.close()
+
+    args = argparse.Namespace(
+        ledger_db=str(db_path),
+        epoch_id=epoch_id,
+        reason="report too old for first ingest",
+    )
+    rc = cmd_runtime_abandon_complete(args)
+    assert rc == 0
+
+    reopened = Ledger(db_path)
+    row = reopened.get_epoch(epoch_id)
+    assert row["status"] == "abandoned"
+    assert row["abandon_reason"] == "report too old for first ingest"
+    assert row["abandoned_at"] is not None
+    assert reopened.begin_epoch(2)
+    reopened.close()
+
+
+def test_abandon_complete_prints_epoch_id_reason_and_timestamp(tmp_path: Path, capsys):
+    from cathedral.cli import cmd_runtime_abandon_complete
+
+    db_path = tmp_path / "ledger.sqlite"
+    ledger = Ledger(db_path)
+    epoch_id = ledger.begin_epoch(5)
+    ledger.complete_epoch(epoch_id, set())
+    ledger.close()
+
+    args = argparse.Namespace(
+        ledger_db=str(db_path), epoch_id=epoch_id, reason="stale for ingest"
+    )
+    assert cmd_runtime_abandon_complete(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["abandoned_epoch_id"] == epoch_id
+    assert payload["reason"] == "stale for ingest"
+    assert payload["abandoned_at"]
+
+
+def test_abandon_complete_rejects_running_epoch_via_cli(tmp_path: Path):
+    from cathedral.cli import cmd_runtime_abandon_complete
+
+    db_path = tmp_path / "ledger.sqlite"
+    ledger = Ledger(db_path)
+    epoch_id = ledger.begin_epoch(1)
+    ledger.close()
+
+    args = argparse.Namespace(ledger_db=str(db_path), epoch_id=epoch_id, reason="reason")
+    with pytest.raises(Exception, match="exact completed"):
+        cmd_runtime_abandon_complete(args)
+
+
+def test_abandon_complete_rejects_empty_reason_via_cli(tmp_path: Path):
+    from cathedral.cli import cmd_runtime_abandon_complete
+
+    db_path = tmp_path / "ledger.sqlite"
+    ledger = Ledger(db_path)
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(epoch_id, set())
+    ledger.close()
+
+    args = argparse.Namespace(ledger_db=str(db_path), epoch_id=epoch_id, reason="   ")
+    with pytest.raises(Exception, match="nonempty"):
+        cmd_runtime_abandon_complete(args)
+
+
+def test_abandon_complete_via_main_reports_error_for_empty_reason(tmp_path: Path, capsys):
+    db_path = tmp_path / "ledger.sqlite"
+    ledger = Ledger(db_path)
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(epoch_id, set())
+    ledger.close()
+
+    rc = main(
+        [
+            "runtime", "abandon-complete",
+            "--ledger-db", str(db_path),
+            "--epoch-id", str(epoch_id),
+            "--reason", "   ",
+        ]
+    )
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert "nonempty" in payload["error"]
 
 
 def test_worker_serve_defaults_to_loopback():

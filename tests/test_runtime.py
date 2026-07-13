@@ -398,6 +398,43 @@ def test_restart_status_and_explicit_abort(tmp_path: Path) -> None:
     assert reopened.get_epoch(epoch_id)["status"] == "aborted"
 
 
+def test_abandon_completed_unblocks_begin_epoch_and_is_audited(tmp_path: Path) -> None:
+    runtime, ledger, _ = make_runtime(tmp_path, [], default_specs())
+    run = runtime.run_epoch(1, CANARY)
+    assert run.status == "complete"
+
+    with pytest.raises(LedgerError, match="publish it"):
+        ledger.begin_epoch(2)
+
+    epoch_id = runtime.abandon_completed(run.epoch_id, "report too old for first ingest")
+    assert epoch_id == run.epoch_id
+    row = ledger.get_epoch(epoch_id)
+    assert row["status"] == "abandoned"
+    assert row["abandon_reason"] == "report too old for first ingest"
+    assert row["abandoned_at"] is not None
+
+    # begin_epoch is unblocked; a later source epoch can proceed.
+    next_run = runtime.run_epoch(2, CANARY)
+    assert next_run.status == "complete"
+
+
+def test_abandon_completed_requires_exact_blocking_epoch(tmp_path: Path) -> None:
+    runtime, ledger, _ = make_runtime(tmp_path, [], default_specs())
+    run = runtime.run_epoch(1, CANARY)
+    with pytest.raises(RuntimeError, match="exact completed"):
+        runtime.abandon_completed(run.epoch_id + 1, "reason")
+
+
+def test_abandon_completed_rejects_a_running_epoch(tmp_path: Path) -> None:
+    db = tmp_path / "ledger.sqlite"
+    first = Ledger(db)
+    epoch_id = first.begin_epoch(1)
+    first.close()
+    runtime, _, _ = make_runtime(tmp_path, [], default_specs(), ledger=Ledger(db))
+    with pytest.raises(RuntimeError, match="exact completed"):
+        runtime.abandon_completed(epoch_id, "reason")
+
+
 def test_runtime_has_no_forbidden_scorer_path_imports_or_calls() -> None:
     path = Path(__file__).parents[1] / "cathedral" / "runtime.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))

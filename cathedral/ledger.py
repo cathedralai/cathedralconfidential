@@ -18,22 +18,42 @@ class LedgerError(Exception):
     """Raised when a ledger invariant would be violated."""
 
 
-_SCHEMA = """
+# Single source of truth for the `epochs` table and its two partial indexes.
+# `_migrate_epochs_table_if_needed` below executes each of these individually
+# (never via `executescript`) so the rebuild can run inside one explicit,
+# rollback-able transaction.
+_EPOCHS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS epochs (
     epoch_id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_epoch INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('running', 'aborted', 'complete', 'published')),
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'aborted', 'complete', 'published', 'abandoned')
+    ),
     started_at TEXT NOT NULL,
     completed_at TEXT,
     published_at TEXT,
     generated_at TEXT,
     report_body BLOB,
-    report_digest TEXT
-);
-CREATE UNIQUE INDEX IF NOT EXISTS one_running_epoch
-    ON epochs ((1)) WHERE status = 'running';
-CREATE UNIQUE INDEX IF NOT EXISTS one_finalized_source_epoch
-    ON epochs (source_epoch) WHERE status IN ('complete', 'published');
+    report_digest TEXT,
+    abandoned_at TEXT,
+    abandon_reason TEXT
+)
+"""
+
+_ONE_RUNNING_EPOCH_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS one_running_epoch "
+    "ON epochs ((1)) WHERE status = 'running'"
+)
+
+_ONE_FINALIZED_SOURCE_EPOCH_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS one_finalized_source_epoch "
+    "ON epochs (source_epoch) WHERE status IN ('complete', 'published')"
+)
+
+_SCHEMA = f"""
+{_EPOCHS_TABLE_SQL};
+{_ONE_RUNNING_EPOCH_INDEX_SQL};
+{_ONE_FINALIZED_SOURCE_EPOCH_INDEX_SQL};
 
 CREATE TABLE IF NOT EXISTS challenges (
     challenge_id TEXT PRIMARY KEY,
@@ -132,6 +152,89 @@ class Ledger:
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._connection.execute("PRAGMA synchronous = FULL")
         self._connection.executescript(_SCHEMA)
+        self._migrate_epochs_table_if_needed()
+
+    def _migrate_epochs_table_if_needed(self) -> None:
+        """Widen a pre-existing on-disk ``epochs`` table to support 'abandoned'.
+
+        Fresh databases already get the current schema from ``_SCHEMA`` above,
+        so this is a no-op for them. Ledgers created before the 'abandoned'
+        status existed have an ``epochs`` table whose CHECK constraint and
+        column set predate it; SQLite cannot alter a CHECK constraint in
+        place, so the table is rebuilt: its two partial indexes are dropped,
+        the table is renamed aside, a fresh ``epochs`` table (widened CHECK,
+        plus ``abandoned_at``/``abandon_reason`` columns) is created and its
+        indexes restored, every existing row is copied across unchanged
+        (including ``epoch_id``, so child rows in ``challenges``,
+        ``epoch_attestations`` and ``epoch_scores`` keep pointing at the same
+        logical epoch), and the renamed table is dropped.
+
+        The whole rebuild runs inside one explicit ``BEGIN IMMEDIATE`` ...
+        ``COMMIT``/``ROLLBACK`` transaction using plain ``execute`` calls (no
+        ``executescript``, which implicitly commits and cannot be rolled back
+        as a unit). If the process is interrupted or a step fails partway
+        through, SQLite rolls the whole rename+rebuild+copy+drop back on the
+        next connection, so ``epochs`` is left exactly as it was and no
+        ``epochs_pre_abandon_migration`` table can survive. Foreign keys are
+        held off for the duration (SQLite ignores changes to that pragma
+        inside a transaction, so it must be toggled outside the BEGIN/COMMIT)
+        so child tables keep referencing the table named ``epochs``
+        throughout, rather than being silently repointed at the renamed copy;
+        the prior pragma value is restored on every exit path.
+
+        A leftover ``epochs_pre_abandon_migration`` table (from an old,
+        non-atomic version of this migration that was interrupted after the
+        rename) is refused rather than silently ignored: without this check,
+        a fresh ``epochs`` table with the current schema would already exist
+        so the ``abandon_reason`` probe below would treat migration as
+        already done, and the real history sitting in the renamed table would
+        be stranded and never surfaced.
+        """
+        cx = self._connection
+        leftover = cx.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'epochs_pre_abandon_migration'"
+        ).fetchone()
+        if leftover is not None:
+            raise LedgerError(
+                "found leftover 'epochs_pre_abandon_migration' table from an "
+                "interrupted epochs-table migration; the ledger file needs "
+                "manual inspection before it can be reopened"
+            )
+        columns = {row["name"] for row in cx.execute("PRAGMA table_info(epochs)")}
+        if "abandon_reason" in columns:
+            return
+        prior_foreign_keys = cx.execute("PRAGMA foreign_keys").fetchone()[0]
+        cx.execute("PRAGMA foreign_keys = OFF")
+        try:
+            cx.execute("BEGIN IMMEDIATE")
+            try:
+                cx.execute("DROP INDEX IF EXISTS one_running_epoch")
+                cx.execute("DROP INDEX IF EXISTS one_finalized_source_epoch")
+                cx.execute("ALTER TABLE epochs RENAME TO epochs_pre_abandon_migration")
+                cx.execute(_EPOCHS_TABLE_SQL)
+                cx.execute(_ONE_RUNNING_EPOCH_INDEX_SQL)
+                cx.execute(_ONE_FINALIZED_SOURCE_EPOCH_INDEX_SQL)
+                cx.execute(
+                    "INSERT INTO epochs (epoch_id, source_epoch, status, started_at, "
+                    "completed_at, published_at, generated_at, report_body, report_digest) "
+                    "SELECT epoch_id, source_epoch, status, started_at, completed_at, "
+                    "published_at, generated_at, report_body, report_digest "
+                    "FROM epochs_pre_abandon_migration"
+                )
+                cx.execute("DROP TABLE epochs_pre_abandon_migration")
+            except sqlite3.DatabaseError:
+                cx.execute("ROLLBACK")
+                raise
+            else:
+                cx.execute("COMMIT")
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError(
+                "failed to migrate epochs table for the 'abandoned' status; "
+                "the ledger file needs manual inspection"
+            ) from exc
+        finally:
+            cx.execute(f"PRAGMA foreign_keys = {'ON' if prior_foreign_keys else 'OFF'}")
 
     def close(self) -> None:
         with self._lock:
@@ -189,6 +292,39 @@ class Ledger:
             if row["status"] != "running":
                 raise LedgerError(f"epoch {epoch_id} is {row['status']}; cannot abort")
             cx.execute("UPDATE epochs SET status = 'aborted' WHERE epoch_id = ?", (epoch_id,))
+
+    def abandon_completed_epoch(self, epoch_id: int, reason: str) -> None:
+        """Audited operator recovery for a 'complete' epoch that can never publish.
+
+        Intended for a report that is correctly frozen but has aged past what
+        the downstream ingest service will accept for a first publish attempt
+        (e.g. a "too old for first ingest" rejection). ``retry-publish`` can
+        only ever resend the exact same immutable ``report_body``, so once
+        that window has passed the epoch would otherwise block ``begin_epoch``
+        forever. This is a one-way, audited status transition only -- it never
+        mutates ``report_body``/``report_digest``, and it never makes the
+        abandoned work payable: ``mark_published`` only accepts a 'complete'
+        epoch, and the trailing score window in ``complete_epoch`` only reads
+        'published' epochs, so an 'abandoned' epoch is permanently excluded
+        from both.
+
+        Only a 'complete' epoch may transition; every other status (running,
+        aborted, published, already abandoned) is an invalid transition and
+        raises.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise LedgerError("abandon reason must be a nonempty operator-supplied string")
+        with self._transaction() as cx:
+            row = self._epoch(cx, epoch_id)
+            if row["status"] != "complete":
+                raise LedgerError(
+                    f"epoch {epoch_id} is {row['status']}; only a complete epoch can be abandoned"
+                )
+            cx.execute(
+                "UPDATE epochs SET status = 'abandoned', abandoned_at = ?, abandon_reason = ? "
+                "WHERE epoch_id = ?",
+                (_now(), reason.strip(), epoch_id),
+            )
 
     def issue_challenge(self, challenge_id: str, hotkey: str, epoch_id: int) -> None:
         if not challenge_id or not hotkey:
@@ -392,9 +528,15 @@ class Ledger:
             return scores
 
     def report_bytes(self, epoch_id: int) -> bytes:
+        # 'abandoned' is included so the frozen report of an abandoned epoch
+        # stays inspectable for audit purposes; abandonment never mutates or
+        # deletes report_body, it only changes the epoch's status.
         with self._lock:
             row = self._epoch(self._connection, epoch_id)
-            if row["status"] not in {"complete", "published"} or row["report_body"] is None:
+            if (
+                row["status"] not in {"complete", "published", "abandoned"}
+                or row["report_body"] is None
+            ):
                 raise LedgerError(f"epoch {epoch_id} has no completed report")
             return bytes(row["report_body"])
 
