@@ -104,14 +104,15 @@ existing `census.py` / `common.py`; do not change those modules to satisfy them.
   The **admitted-miner set** is the union of miners across all lanes; admit an
   idle miner by including it with score `0.0` in some lane.
 - `routing: dict[str, float]` — lane emission shares (need not sum to 1).
-- `floor: float` — total fraction reserved for the attestation floor layer.
+- `floor: float` — generic compatibility parameter. Cathedral passes `0.0` so
+  attestation grants admission without earning weight.
 - Returns `(weights: dict[str, float], burn: float)`.
 
-Three-layer emission, **sum-conserving to exactly 1.0**:
+The generic router is **sum-conserving to exactly 1.0**:
 
-1. **Floor layer** (total `floor`): split equally among admitted miners
+1. **Optional floor layer** (total `floor`): split equally among admitted miners
    (`floor / n_admitted` each). If there are no admitted miners, the whole floor
-   burns.
+   burns. This is disabled in Cathedral's standalone policy.
 2. **Work layer** (total `1 - floor`): let `denom = sum(routing.values())`. Each
    lane `L` gets budget `(1 - floor) * routing[L] / denom`. Within a lane, miner
    `m` gets `lane_budget * score_m / total_score`. If a lane's total score is 0

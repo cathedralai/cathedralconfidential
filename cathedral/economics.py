@@ -1,8 +1,12 @@
-"""Emission routing: attestation floor + routing-weighted work + burn (docs/DESIGN.md §5).
+"""Routing-weighted work, an optional compatibility floor, and burn.
+
+Cathedral calls this router with ``floor=0.0``: attestation grants admission,
+while only verified work earns weight. The parameter remains to keep the
+low-level routing primitive explicit and testable.
 
 Three layers, sum-conserving to exactly 1.0:
 
-1. Floor — `floor` split equally among admitted miners (union of miners across
+1. Optional floor — `floor` split among admitted miners (union across
    all lanes). Burns entirely if there are no admitted miners.
 2. Work — `1 - floor` split across lanes by normalized `routing` share, then
    within a lane by score share. A lane with zero total score (or absent from

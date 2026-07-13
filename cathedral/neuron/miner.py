@@ -9,9 +9,8 @@ See docs/DESIGN.md §4, §9.
 Hardware-free testable core: ``MockMiner`` serves MOCK evidence (the real
 REPORT_DATA binding + policy check, no vendor crypto) and does real SAT work.
 The MOCK boundary is the only substitution — the SAT solve/certify path is the
-real Phase-2 code. Chain registration and weight submission remain scorer-owned
-in ``cathedralai/cathedral``; this repo's console entrypoint is only a
-compatibility wrapper into the existing operator CLI.
+real Phase-2 code. SN39 registration is proven by the miner's signed hotkey;
+this console entrypoint forwards into the worker operator CLI.
 """
 
 from __future__ import annotations

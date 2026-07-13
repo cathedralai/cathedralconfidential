@@ -3,9 +3,9 @@
 Hardware-free, stdlib-only. The only third-party dependency is `pytest` (dev).
 No network, no TEE, no hardware: attestation is **mocked** behind the real
 `verify()` interface (see `cathedral/verify/mock.py` and `docs/DESIGN.md §6`).
-This repo is the confidential-compute sidecar only; `cathedralai/cathedral`
-remains the sole Bittensor weight setter, so there is no direct SDK dependency
-here.
+This service publishes a signed score stream. The existing Cathedral validator
+owns metagraph mapping and on-chain weight submission, so this core has no
+direct Bittensor SDK dependency.
 
 ## 1. Create the venv and install
 

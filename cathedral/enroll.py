@@ -52,7 +52,7 @@ class RegistrationProvider(Protocol):
     """Gate enrollment to hotkeys registered on the subnet.
 
     Implementations query the Bittensor metagraph, a local cache, or a
-    sidecar service. Return True (registered), False (not registered), or
+    registry service. Return True (registered), False (not registered), or
     None (cannot confirm right now). None is treated as fail-closed: the
     enrollment is rejected and the miner must retry when the provider is
     available. See docs/DESIGN.md §6.

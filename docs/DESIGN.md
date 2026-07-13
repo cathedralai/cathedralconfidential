@@ -14,7 +14,7 @@ Two sentences hold the whole design:
 
 > **Confidentiality is our admission rule. Verified work is our currency.**
 
-Every miner proves, cryptographically, that it runs inside a genuine Trusted Execution Environment (TEE) — a confidential CPU (AMD SEV-SNP, Intel TDX) or a confidential-compute GPU (NVIDIA H100/H200/B200 in CC or PPCIe mode). That attestation is the ticket to participate. It is **not** the paycheck. The long-range Cathedral design earns through five lanes; the current public sidecar implementation is narrower and focused on the confidential scoring report path. Idle attested hardware earns a thin floor and nothing more; unearned emission burns.
+Every miner proves, cryptographically, that it runs inside a genuine Trusted Execution Environment (TEE) — a confidential CPU (AMD SEV-SNP, Intel TDX) or a confidential-compute GPU (NVIDIA H100/H200/B200 in CC or PPCIe mode). That attestation is the ticket to participate. It is **not** the paycheck. Miners earn through useful, verified work; idle attested hardware earns nothing.
 
 This inverts the usual confidential-compute subnet, which sells trust and then waits. Cathedral is never idle: attested machines are always visibly solving, evaluating, training, serving, and hosting.
 
@@ -108,41 +108,30 @@ Lane:
 
 ## 5. Emissions
 
-Three layers:
+Two layers:
 
-1. **Attestation floor (~10–15%).** Valid TEE evidence + liveness. Just enough that keeping hardware attested and TCB-current is worthwhile.
-2. **Work layer (majority).** Weighted by completed, verified work units, composed through the routing vector.
-3. **Burn.** Work that did not happen pays nobody. (`burn_uid` / `forced_burn_percentage` already exist in the inherited validator config.)
+1. **Verified work.** Validator-derived credit for useful jobs and unpredictable audit work. Attestation only admits the worker.
+2. **Unallocated mass.** Work that did not happen pays nobody. A failed, missing, stale, or unverifiable result receives an explicit zero.
 
-### Current promotion policy
+### Dedicated compute stream
 
-The current public promotion path keeps the existing scorer as the base vector
-and applies the global confidential v3 contract only when Cathedral has a
-payable, verified confidential snapshot to publish.
+Cathedral owns SN39's full score surface. It does not compose with another
+scorer or reserve a fixed secondary allocation.
 
-- **Exact aggregate split:** when base and payable confidential populations
-  both exist, independently normalized components contribute exactly 90% base
-  mass and 10% confidential mass across their hotkey union. A hotkey need not
-  appear in the base vector to earn confidential mass.
-- **Fail-closed boundaries:** base-only composition returns 100% base. A
-  confidential-only or fully empty composition returns an empty vector.
-- **Complete-map requirement:** if the thin validator is missing any signed
-  hotkey, all confidential mass is dropped and the mapped signed base
-  components are reconstructed as a base-only vector. Two signed hotkeys
-  mapping to one UID invalidate the vector.
-- **Gate before claim:** the launch gate verifies the signed aggregate split
-  and the production Bittensor u16 transform. With both populations present,
-  quantized aggregate confidential attribution must remain near 10% within the
-  gate's rounding tolerance.
+- **Complete epochs:** Cathedral challenges miners, verifies evidence and
+  delivery, derives work units, and freezes a complete compute epoch.
+- **Complete signed stream:** every epoch contains the latest state for every
+  observed hotkey, including explicit zeros that revoke stale credit.
+- **Existing validator path:** Cathedral publishes the signed compute vector to
+  the validator feed. SN39 validators verify it, map registered hotkeys to
+  current UIDs, reject duplicate mappings, and submit weights to Bittensor.
+- **Fail closed:** an invalid signature, incomplete identity map, stale report,
+  failed attestation, or failed job cannot preserve old weight.
+- **Open entry:** admission follows published hardware and measurement policy,
+  not an operator allowlist or privileged machine access.
 
-This promotion claim is about report production, publication, and scorer-side
-reconciliation. The operator CLI works for runtime and worker operations, and
-the validator/miner console scripts are compatibility wrappers into it; direct
-chain weight submission remains outside this sidecar.
-
-`cathedralai/cathedral` remains the sole Bittensor weight setter. This repo is
-the confidential-compute sidecar and intentionally excludes a direct Bittensor
-SDK dependency.
+This repository owns attestation, work verification, accounting, and the signed
+compute stream. It does not need a second Bittensor neuron stack.
 
 ### The routing vector = "directing compute to the primitives," made mechanical
 
@@ -231,7 +220,7 @@ When off-subnet customers need trustless settlement, add exactly one **Verificat
 Each phase ships alone; nothing blocks on the phase after it.
 
 - **Phase 0 — now (~1–2 wk).** Land the rename. `TeeEvidence` proto (SNP | TDX | GPU, nonce+hotkey binding). CC census probe (`/dev/sev-guest`, TDX support, `nvidia-smi conf-compute -q`) to measure launch supply. *Launch path: TDX CPU first on the live GCP TDX CVM; SNP verification exists, but SNP runtime scoring is the next CPU platform port.*
-- **Phase 1 — attestation core (~4–6 wk).** `cathedral-attestor` + `cathedral-verifier` (KDS / DCAP / NRAS + policy engine). Admission and emissions gate on attestation. Cathedral is now an attestation-gated subnet with the attestation floor + a first lane (SAT — cheapest verification, biggest CPU supply).
+- **Phase 1 — attestation core (~4–6 wk).** `cathedral-attestor` + `cathedral-verifier` (KDS / DCAP / NRAS + policy engine). Admission gates on attestation and earnings gate on verified work. SAT is the first audit lane because it is cheap to verify and has broad CPU supply.
 - **Phase 2 — lanes (~4–6 wk).** Lane engine + the five lanes' dispatch/verify/score. Routing vector wired to the weight-setter. Canonical work queues live. Demand-preempt + burn.
 - **Phase 3 — Sandbox rentals (~6–10 wk).** Host-agent (cloud-hypervisor/QEMU + TDX/SNP + VFIO passthrough), measured guest image + build pipeline, attested SSH (host-key binding), control-plane API + CLI + MCP. CC-CPU pods first, CC-GPU second.
 - **Phase 4 — Core (rented-split) (~2–3 wk).** `suppliers/` module (Lium/Vast/RunPod backends), challenge harness + tolerance bounds, judge deployment. Opens the commodity-GPU floodgates for SAT / eval / open-model jobs.

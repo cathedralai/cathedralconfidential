@@ -148,31 +148,28 @@ CATHEDRAL_RUN_TDX_NEGATIVE=1 \
 python -m pytest tests/test_attest_tdx_negative.py -q
 ```
 
-## Cross-Repository Scoring Gate
+## Dedicated Compute Stream Launch Gate
 
-After the hardware gates, run the local launch proof against the exact scorer
-checkout intended for deployment. The environment must contain both projects'
-dependencies, including the installed Bittensor SDK used by validators:
+After the hardware gates, test the compute publisher and the existing SN39
+validator together.
+Launch acceptance requires all of the following:
 
-```bash
-python scripts/cross_repo_launch_verify.py \
-  --scorer-repo /absolute/path/to/cathedral-scorer
-```
+1. A real TDX miner enrolls with its registered hotkey and passes fresh-nonce,
+   measurement, TCB, and platform policy.
+2. Cathedral dispatches useful work plus an unpredictable audit task,
+   independently verifies both, and derives all credit itself.
+3. The publisher freezes and signs a complete epoch stream. Missing, failed,
+   stale, and revoked miners are present with explicit zero scores.
+4. Every signed hotkey maps to exactly one current SN39 UID. Missing and
+   duplicate mappings fail closed before submission.
+5. The existing validator consumes the compute vector as its sole score input,
+   conserves it through Bittensor u16 quantization, and submits it on chain.
+6. A subsequent zero report removes the miner's prior weight, and all
+   validators consuming the same signed epoch submit the same mapped vector.
 
-The gate starts the real scorer FastAPI app on an ephemeral localhost port,
-posts the ledger's frozen bytes through `cathedral.poster.Poster`, builds one
-signed positive vector, and exercises the production thin-validator and
-Bittensor u16 transforms under the global confidential v3 contract. The proof
-requires an exact aggregate 90% base / 10% confidential split when both
-populations exist, including positive weight for a compute-only hotkey. It also
-checks that base-only input remains 100% base, no-base input fails closed to an
-empty vector, an incomplete signed-hotkey map reconstructs base-only weights,
-and duplicate UID mappings are rejected. The fully mapped quantized aggregate
-must remain within rounding tolerance of 10% confidential attribution.
-
-The gate exits nonzero on any contract mismatch and emits one compact JSON
-object with `"status":"PASS"` only after the subsequent complete-zero report
-revokes the confidential snapshot.
+`scripts/cross_repo_launch_verify.py` still proves the former mixed-vector
+contract. Replace that contract with a sole-input compute-stream gate before
+using the script as launch evidence.
 
 ## Definition Of Done
 
@@ -182,6 +179,10 @@ revokes the confidential snapshot.
 - `tests/test_attest_tdx_negative.py` fails closed on a non-TDX CPU host.
 - A validator epoch can admit a real TDX-attested miner and still produce
   conserved weights.
+- The publisher signs a complete Cathedral compute stream and the existing
+  validator consumes it as its sole score input.
+- Two validators map the same signed stream identically, including zero
+  revocation after a miner disappears or fails work.
 - SNP remains a second CPU platform port, not a launch blocker.
 
 Live evidence recorded July 8, 2026:

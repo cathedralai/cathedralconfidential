@@ -9,16 +9,14 @@ This is the hardware-free *testable core*: the epoch below composes the real
 admission contract (verify) + control plane (Inventory) + SAT lane + emission
 routing, driven against MOCKED attestation. The MOCK boundary is the only
 substitution — everything downstream of an ``Attested`` verdict is the real
-Phase-2 code path. Chain submission itself remains scorer-owned in
-``cathedralai/cathedral``; this repo's console entrypoint is only a
-compatibility wrapper into the existing operator CLI.
+Phase-2 code path. This runtime publishes the complete signed compute stream;
+the existing Cathedral validator maps it to SN39 and submits weights.
 
 Fault isolation in ``attested_epoch``:
   Each miner’s collection + verification phase is wrapped in its own try/except
   so a misbehaving miner (exception in collect_evidence, the verifier, or
   do_sat_work) cannot abort the epoch for its peers. A miner that fails
-  admission is simply skipped; one that fails work keeps its attestation floor
-  but earns no work score.
+  admission is simply skipped; one that fails work earns zero.
 """
 
 from __future__ import annotations
@@ -36,9 +34,9 @@ from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.neuron.miner import MockMiner
 from cathedral.verify import verify
 
-# The attestation floor: valid TEE evidence + liveness earns this thin base,
-# the remainder is competed for as verified work (docs/DESIGN.md §5).
-ATTESTATION_FLOOR = 0.12
+# Attestation grants admission only. The compatibility parameter remains so
+# callers can exercise the generic router, but the Cathedral default is zero.
+ATTESTATION_FLOOR = 0.0
 
 
 @dataclass(frozen=True)
@@ -110,7 +108,7 @@ def epoch(
         cert = miner.do_sat_work(item)
         accepted = lane.verify(item, cert)
         if accepted is None:
-            # admitted + live but no verified work this epoch: floor only.
+            # Admitted but no verified work this epoch: explicit zero.
             lane_scores[lane.name][miner.uid] = 0.0
             continue
         lane_scores[lane.name][miner.uid] = lane.score(miner.uid, [accepted])
@@ -169,8 +167,7 @@ def attested_epoch(
             continue  # admission failure — skip, do not propagate
 
         # --- Phase 2: work (isolated per admitted miner) --------------------
-        # Admitted miner earns at least the attestation floor; work exceptions
-        # leave the work score at 0.0 rather than aborting the epoch.
+        # Work exceptions leave the score at 0.0 rather than aborting the epoch.
         lane_scores[lane.name][miner.uid] = 0.0
         try:
             item = lane.dispatch(miner.uid, budget=0)
@@ -179,18 +176,17 @@ def attested_epoch(
             if accepted is not None:
                 lane_scores[lane.name][miner.uid] = lane.score(miner.uid, [accepted])
         except Exception:  # noqa: BLE001
-            pass  # work failure — miner keeps floor, peers unaffected
+            pass  # work failure: zero score, peers unaffected
 
     weights, burn = apply_routing(lane_scores, routing, floor=floor)
     return EpochResult(weights=weights, burn=burn, admitted=admitted)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Compatibility wrapper for ``cathedral runtime ...``.
+    """Operator wrapper for ``cathedral runtime ...``.
 
-    This repo intentionally does not own direct Bittensor weight submission.
-    Operators invoking ``cathedral-validator`` are forwarded to the existing
-    confidential-runtime CLI surface.
+    The runtime produces Cathedral's signed compute stream. The existing thin
+    validator consumes that stream and owns on-chain weight submission.
     """
 
     from cathedral import cli as operator_cli

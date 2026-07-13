@@ -50,7 +50,7 @@ def test_epoch_admits_runs_sat_and_conserves_weights():
     assert inventory.by_tier(attested.tier)  # miners were admitted
 
     # --- emissions: route work through the vector, conserve to 1.0 ---
-    weights, burn = apply_routing(lane_scores, {lane.name: 1.0}, floor=0.12)
+    weights, burn = apply_routing(lane_scores, {lane.name: 1.0}, floor=0.0)
     assert set(weights) == {"uid-1", "uid-2"}
     assert abs(sum(weights.values()) + burn - 1.0) < 1e-9
     assert all(w > 0 for w in weights.values())
