@@ -2,13 +2,20 @@
 
 **A confidential compute subnet that directs attested hardware at verifiable work.**
 
-Status: founding design for Cathedral's current confidential-compute architecture.
+Status: founding design for Cathedral's confidential-compute architecture. This
+document is design and direction. For what is currently live, see
+[`BUILD_STATUS.md`](../BUILD_STATUS.md): the proven path today is Intel TDX CPU
+workers with deterministic validator-dispatched audit work, proven on testnet
+SN292 in dry-run mode. The products, lanes, and hardware classes below beyond
+that are planned direction, not current launch evidence.
 
 ---
 
 ## 1. Thesis
 
-Cathedral is a Bittensor subnet (SN39) where the admission rule is hardware attestation and the currency is verified work.
+Cathedral's production target is Bittensor SN39. Its admission rule is hardware
+attestation and its currency is verified work. Production chain submission is
+not live; the current integration proof is the SN292 dry run described above.
 
 Two sentences hold the whole design:
 
@@ -16,11 +23,11 @@ Two sentences hold the whole design:
 
 Every miner proves, cryptographically, that it runs inside a genuine Trusted Execution Environment (TEE) — a confidential CPU (AMD SEV-SNP, Intel TDX) or a confidential-compute GPU (NVIDIA H100/H200/B200 in CC or PPCIe mode). That attestation is the ticket to participate. It is **not** the paycheck. Miners earn through useful, verified work; idle attested hardware earns nothing.
 
-This inverts the usual confidential-compute subnet, which sells trust and then waits. Cathedral is never idle: attested machines are always visibly solving, evaluating, training, serving, and hosting.
+Attestation alone pays nothing. Cathedral keeps attested machines busy: they are always visibly solving, evaluating, training, serving, and hosting.
 
-### Why this is not a boring CC subnet
+### Confidentiality as the verification engine
 
-Most compute subnets spend their entire innovation budget verifying work done on untrusted hardware (output sampling, deterministic replay, sumcheck proofs, benchmark gauntlets). Because Cathedral makes confidentiality the admission rule, **CC is not only the privacy feature — it is the verification engine.** In every lane, the integrity of the work is inherited from the enclave measurement at near-zero marginal cost. That is what lets one thin validator run five lanes without becoming five subnets' worth of code.
+Because Cathedral makes confidentiality the admission rule, **confidential compute is not only the privacy feature, it is the verification engine.** In every lane, the integrity of the work is inherited from the enclave measurement at near-zero marginal cost. That is what lets one thin validator run many lanes without becoming many separate codebases.
 
 ---
 
@@ -39,7 +46,7 @@ Two products, two *different* guarantees. Keeping them distinct is a correctness
 
 **Secure Sandbox** — the customer rents a confidential machine. SSH terminates *inside* a CVM; the host sees only encrypted memory and disk. The customer verifies a single attestation quote before the first keystroke and knows the machine's owner cannot see the workload.
 
-**Core (Rented-Split)** — customer work is orchestrated by Cathedral's attested TDX judge, which delegates heavy compute to commodity GPUs rented on the open market (Lium, Vast, RunPod). The judge holds the reference answers, fresh-seed challenges, and the customer's secrets; the rented GPU only ever sees a challenge harness and returns results the judge verifies. **The customer's trust terminates at the attested judge — not at the rented GPU.** Results are provably correct; they are **not** private from the GPU's owner.
+**Core (Rented-Split)** — customer work is orchestrated by Cathedral's attested TDX judge, which delegates heavy compute to commodity GPUs rented on the open market. The judge holds the reference answers, fresh-seed challenges, and the customer's secrets; the rented GPU only ever sees a challenge harness and returns results the judge verifies. **The customer's trust terminates at the attested judge — not at the rented GPU.** Results are provably correct; they are **not** private from the GPU's owner.
 
 ### The trust boundary (say this on the security page)
 
@@ -54,7 +61,13 @@ Two products, two *different* guarantees. Keeping them distinct is a correctness
 
 ## 3. Two supply chains
 
-**Subnet supply = confidential hardware only.** Admission requires a valid TEE attestation. Accepted evidence classes: AMD SEV-SNP (EPYC 7003 "Milan" and newer), Intel TDX (5th-gen Xeon Scalable and newer), and NVIDIA CC GPUs (H100/H200 Hopper CC, B200/B300 Blackwell) attested compositely with their host CPU TEE. No commodity GPUs, no benchmark tiers, no waivers. Emissions exist to bootstrap the one thing that is scarce and hard to find: attested confidential hardware. This single admission rule keeps the validator simple and eliminates the spoofing/sybil surface — a DCAP quote cannot be faked by a clever miner.
+**Subnet supply = confidential hardware only.** Admission requires a valid TEE
+attestation. Intel TDX CPU is the proven path today. AMD SEV-SNP and NVIDIA CC
+GPU evidence classes are planned platform extensions and do not earn in the
+current runtime. Emissions bootstrap attested confidential hardware; delegated
+commodity compute in the future Core product is not itself subnet supply. The
+validator accepts only vendor-backed evidence that satisfies current nonce,
+measurement, TCB, platform, and hotkey-binding policy.
 
 **Commodity GPUs = procured, not mined.** For Core jobs, the judge rents commodity GPUs on demand from open markets, pushes the challenge harness, verifies, and tears down. These machines never touch the subnet, never earn emissions, never need admission logic. Zero demand → zero spend. Core's unit economics are ordinary business math (rent at market, sell verified execution at a markup), decoupled from tokenomics.
 
@@ -122,9 +135,10 @@ scorer or reserve a fixed secondary allocation.
   delivery, derives work units, and freezes a complete compute epoch.
 - **Complete signed stream:** every epoch contains the latest state for every
   observed hotkey, including explicit zeros that revoke stale credit.
-- **Existing validator path:** Cathedral publishes the signed compute vector to
-  the validator feed. SN39 validators verify it, map registered hotkeys to
-  current UIDs, reject duplicate mappings, and submit weights to Bittensor.
+- **Validator path:** Cathedral publishes the signed compute vector to the
+  validator feed. In production, SN39 validators will verify it, map registered
+  hotkeys to current UIDs, reject duplicate mappings, and submit weights to
+  Bittensor. The current SN292 proof stops before chain submission.
 - **Fail closed:** an invalid signature, incomplete identity map, stale report,
   failed attestation, or failed job cannot preserve old weight.
 - **Open entry:** admission follows published hardware and measurement policy,
@@ -133,15 +147,14 @@ scorer or reserve a fixed secondary allocation.
 This repository owns attestation, work verification, accounting, and the signed
 compute stream. It does not need a second Bittensor neuron stack.
 
-### The routing vector = "directing compute to the primitives," made mechanical
+### Lane routing
 
-Emission split across lanes is an explicit, governance-visible, per-epoch table:
-
-```
-routing = { inference: 0.30, training: 0.20, rl: 0.15, agents: 0.10, sat: 0.25 }
-```
-
-Want more CPU enclaves this quarter? Raise the SAT lane. Need CC-GPUs for an eval customer? Shift weight to inference/benchmark. The subnet does not merely *admit* confidential hardware — it *steers* it, and everyone can see where it is pointed. Demand preempts canonical work in any lane at market price.
+Future multi-lane routing will be an explicit, governance-visible per-epoch
+table whose shares sum to the subnet's complete score vector. The current
+runtime has one scored path: deterministic SAT audit work on admitted TDX CPU
+workers. New lanes must ship with their own qualification, dispatch,
+verification, scoring, and zero-revocation acceptance tests before receiving
+any routing share.
 
 ### Credit validation: preventing inflation and replay
 
@@ -172,7 +185,10 @@ Miners cannot choose their own credit. Every work unit's difficulty and credit i
 - Policy engine: allowed measurements, minimum TCB, allowed firmware/driver versions
 - **Sybil defense is free:** SNP `CHIP_ID`, TDX platform ID, and certified GPU UUIDs live in the evidence — one physical machine backs exactly one UID; dedup is a dictionary, not a subsystem.
 
-**Corrections carried from prior drafts:** the guest instruction is `TDG.MR.REPORT`, not `SEAMREPORT`. The SM-latency GPU probe is a *fingerprint / scoring heuristic* for Core's commodity tier, never called "attestation" (no vendor key, no cryptographic root). Any external broker (e.g. a Cloudflare Worker) in the confidential path is a trust violation — the entire coordinator (runtime + Postgres + lease state) runs **inside** the TD.
+The guest instruction is `TDG.MR.REPORT`, not `SEAMREPORT`. An SM-latency GPU
+probe is a fingerprint or scoring heuristic, never attestation: it has no
+vendor key or cryptographic root. The confidential coordinator, including its
+runtime and lease state, must remain inside the measured trust boundary.
 
 ---
 
@@ -185,7 +201,7 @@ The rental unit is a **CVM, not a container**. The move that makes SSH-into-a-CV
 3. Renter CLI verifies the quote (measurement matches published image hash, TCB current, nonce fresh) and pins the host key from it.
 4. `ssh` connects. Matching fingerprint ⇒ the session terminates inside genuine confidential hardware running exactly Cathedral's image. Host cannot MITM, inspect, or fake it.
 
-Renter has root inside the CVM: install anything, run Docker, use the GPU. Feels like a Lium pod; invisible to its landlord.
+Renter has root inside the CVM: install anything, run Docker, use the GPU. Feels like an ordinary cloud GPU pod; invisible to its landlord.
 
 **Data gravity:** bake large model weights into pre-staged, measured base images; push only the lightweight harness, tolerance bounds, and fresh-seed challenge over the wire. Preserves the 1–2 minute cold-start target.
 
@@ -197,17 +213,20 @@ Renter has root inside the CVM: install anything, run Docker, use the GPU. Feels
 
 Bittensor weights **are** the launch-day slashing mechanism: invalid quote → weight 0 → no emission. No contract required to start.
 
-When off-subnet customers need trustless settlement, add exactly one **Verification contract** on Bittensor's EVM: ingests DCAP quotes via Automata's `automata-dcap-attestation` (SNARK-compressed path, ~300k gas), gates payment release, slashes collateral on invalid evidence. This is Nodexo's `CollateralManager` pattern with hardware receipts.
+When off-subnet customers need trustless settlement, add one **Verification
+contract** on Bittensor's EVM. It ingests cryptographically verified hardware
+receipts, gates payment release, and slashes collateral on invalid evidence.
 
 **Explicitly cut** (violate "super thin"): the multi-contract "Trias Politica" DAG governance stack (on-chain workflow is expensive state the TDX judge already handles off-chain — the chain needs *receipts*, not *workflow*); the judicial-DAO Guardian circuit breaker (an owner-key pause is honest and adequate at this stage); the ZK data bridge (a separate product, not this roadmap).
 
 ---
 
-## 9. What we build vs. what we keep
+## 9. Implementation boundary
 
-**Greenfield the core.** The hard parts (attestor, verifier, policy engine, CVM stack, lane engine) do not exist in the fork and must be written new regardless. The fork's model — validator SSHes into miners as root to run benchmark binaries — is the wrong trust topology; Cathedral inverts it (miners *serve* attestation; validators never touch miner machines).
-
-**Keep from the fork (as reference, not code):** the `TeeEvidence` / `GpuAttestation` proto shapes, the category/pricing vocabulary, the ops lessons in commit history, and — critically — **SN39 itself**: the subnet slot, registrations, and community carry over regardless of which codebase the neurons run.
+The attestor, verifier, policy engine, CVM stack, and lane engine are Cathedral
+components. Miners serve attestation and work endpoints; validators never need
+root access to miner machines. The production target remains SN39, while the
+current integration proof runs on testnet SN292.
 
 **Language:** Python (mature `bittensor` SDK; NVIDIA nvtrust, AMD/Intel tooling all have Python paths). Attestor may become a small static Rust binary later if distribution demands.
 
@@ -219,11 +238,11 @@ When off-subnet customers need trustless settlement, add exactly one **Verificat
 
 Each phase ships alone; nothing blocks on the phase after it.
 
-- **Phase 0 — now (~1–2 wk).** Land the rename. `TeeEvidence` proto (SNP | TDX | GPU, nonce+hotkey binding). CC census probe (`/dev/sev-guest`, TDX support, `nvidia-smi conf-compute -q`) to measure launch supply. *Launch path: TDX CPU first on the live GCP TDX CVM; SNP verification exists, but SNP runtime scoring is the next CPU platform port.*
+- **Phase 0 — now (~1–2 wk).** Land the rename. `TeeEvidence` proto (SNP | TDX | GPU, nonce+hotkey binding). CC census probe (`/dev/sev-guest`, TDX support, `nvidia-smi conf-compute -q`) to measure launch supply. *Launch path: TDX CPU first on a live Intel TDX CVM; SNP verification exists, but SNP runtime scoring is the next CPU platform port.*
 - **Phase 1 — attestation core (~4–6 wk).** `cathedral-attestor` + `cathedral-verifier` (KDS / DCAP / NRAS + policy engine). Admission gates on attestation and earnings gate on verified work. SAT is the first audit lane because it is cheap to verify and has broad CPU supply.
 - **Phase 2 — lanes (~4–6 wk).** Lane engine + the five lanes' dispatch/verify/score. Routing vector wired to the weight-setter. Canonical work queues live. Demand-preempt + burn.
 - **Phase 3 — Sandbox rentals (~6–10 wk).** Host-agent (cloud-hypervisor/QEMU + TDX/SNP + VFIO passthrough), measured guest image + build pipeline, attested SSH (host-key binding), control-plane API + CLI + MCP. CC-CPU pods first, CC-GPU second.
-- **Phase 4 — Core (rented-split) (~2–3 wk).** `suppliers/` module (Lium/Vast/RunPod backends), challenge harness + tolerance bounds, judge deployment. Opens the commodity-GPU floodgates for SAT / eval / open-model jobs.
+- **Phase 4 — Core (rented-split) (~2–3 wk).** `suppliers/` module (commodity GPU rental backends), challenge harness + tolerance bounds, judge deployment. Opens the commodity-GPU floodgates for SAT / eval / open-model jobs.
 - **Phase 5 — settlement.** EVM Verification contract when off-subnet customers need trustless payment. Composite attestation for CC-GPU Sandbox. Confidential-K8s if demanded.
 
 **Sizing:** attestation-gated subnet core ≈ 1–2k LOC; full rentable platform ≈ 5–7k LOC; +2–3k for Core's verification harness and the EVM contract. Real cost is not lines — it is the guest-image build pipeline and the firmware/driver matrix (BIOS access, HGX firmware versions, per-platform Ubuntu). Dev hardware is the critical path: a TDX CPU box now, then SNP and a CC-capable H100/H200 for later platform coverage.
@@ -242,6 +261,6 @@ Each phase ships alone; nothing blocks on the phase after it.
 
 ## 12. One-line positioning
 
-**Rent a GPU like on Lium, trust it like a Targon enclave — and every idle cycle in between goes to solving, evaluating, and hosting in the open.**
+**Confidential hardware, verified work, and every cycle in between pointed at solving, evaluating, and hosting in the open.**
 
-Confidentiality is the admission rule. Verified work is the currency. The five lanes are where the compute is pointed.
+Confidentiality is the admission rule. Verified work is the currency. The lanes are where the compute is pointed.

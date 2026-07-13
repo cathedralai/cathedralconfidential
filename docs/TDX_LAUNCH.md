@@ -1,22 +1,16 @@
 # Cathedral TDX Launch Path
 
 This is the current Phase 1 launch path. The original handoff was SNP-first,
-but launch supply is already a GCP Intel TDX CVM, so Cathedral proves real CPU
-attestation with TDX first and ports the same interface to SNP after launch.
+but launch supply is already an Intel TDX confidential VM, so Cathedral proves
+real CPU attestation with TDX first and ports the same interface to SNP after
+launch.
 
 ## Live Box
 
-Current launch target:
-
-```text
-name: polaris-tdx-7e93d5de
-project: polaris-tdx-attest
-zone: us-central1-b
-machine: c3-standard-4
-confidential type: TDX
-role: cathedral-sn39-publisher
-deletion protection: true
-```
+The current launch worker is a cloud Intel TDX confidential VM (a 4-vCPU
+TDX-capable instance running the Cathedral publisher). Deployment identifiers
+(VM name, project, zone, addresses) are intentionally kept out of this public
+doc.
 
 Treat it as live infrastructure. Initial probes should only request attestation
 evidence and inspect read-only capability state. Do not restart services, change
@@ -82,8 +76,8 @@ Cathedral then enforces:
 - `tcb >= policy.min_tcb`
 - `platform_id` is present and becomes the Phase 1 sybil-dedup key
 
-For the current Polaris TDX launch box, use the adapter in
-`scripts/tdx_verify_json.py` with the Polaris `attestor-verify` binary:
+Use the adapter in `scripts/tdx_verify_json.py` with an `attestor-verify`
+DCAP binary:
 
 ```bash
 export CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify
@@ -107,8 +101,7 @@ dedup key, not a package-stable identity guarantee.
 
 ## Hardware Test
 
-Run quote collection + verification on the TDX CVM with the Polaris verifier
-adapter:
+Run quote collection + verification on the TDX CVM with the verifier adapter:
 
 ```bash
 sudo env \
@@ -150,8 +143,11 @@ python -m pytest tests/test_attest_tdx_negative.py -q
 
 ## Dedicated Compute Stream Launch Gate
 
-After the hardware gates, test the compute publisher and the existing SN39
-validator together.
+After the hardware gates, test the compute publisher and the thin validator
+together. The current integration proof runs on testnet SN292 in dry-run mode;
+production target is SN39. The gate below is written against the production
+metagraph and applies identically to the SN292 dry-run except that chain
+submission stays disabled until the validator hotkey is registered.
 Launch acceptance requires all of the following:
 
 1. A real TDX miner enrolls with its registered hotkey and passes fresh-nonce,
@@ -160,16 +156,17 @@ Launch acceptance requires all of the following:
    independently verifies both, and derives all credit itself.
 3. The publisher freezes and signs a complete epoch stream. Missing, failed,
    stale, and revoked miners are present with explicit zero scores.
-4. Every signed hotkey maps to exactly one current SN39 UID. Missing and
+4. Every signed hotkey maps to exactly one current metagraph UID. Missing and
    duplicate mappings fail closed before submission.
-5. The existing validator consumes the compute vector as its sole score input,
+5. The thin validator consumes the compute vector as its sole score input,
    conserves it through Bittensor u16 quantization, and submits it on chain.
 6. A subsequent zero report removes the miner's prior weight, and all
    validators consuming the same signed epoch submit the same mapped vector.
 
-`scripts/cross_repo_launch_verify.py` still proves the former mixed-vector
-contract. Replace that contract with a sole-input compute-stream gate before
-using the script as launch evidence.
+`scripts/cross_repo_launch_verify.py` still encodes the retired mixed-vector
+contract and is not launch evidence for this mechanism. Replace it with a
+sole-input compute-stream gate against `cathedralai/cathedral` PR #378 before
+using it for production acceptance.
 
 ## Definition Of Done
 
@@ -189,7 +186,7 @@ Live evidence recorded July 8, 2026:
 
 - Hardware-free local suite passed; hardware-gated cases were skipped in that
   environment.
-- Live TDX CVM with Polaris `attestor-verify` adapter:
+- Live TDX CVM with the `attestor-verify` adapter:
   parsed `tdx-measurement-sha256:24da9c7003a1199293951b8e9acbf5ae0bf94b209b6958c1c3651892df5e02ce`,
   `tdx-pck-cert-sha256:cac3ee7282e1c79c9d3bcfcad2125dce41d7ef773cf61655693b51e968baa5a2`,
   and `tee_tcb_svn=0d010800000000000000000000000000`;
@@ -197,7 +194,7 @@ Live evidence recorded July 8, 2026:
 - Live verifier smoke returned an 8000-byte quote with
   `intel_verified=true`, `report_data_match=true`, 64-byte `report_data`, and
   four Intel collateral URLs.
-- Non-TDX field negative control on disposable `e2-micro` Spot VM:
+- Non-TDX field negative control on a disposable non-TDX Linux host:
   `/sys/module/tdx_guest`, `/dev/tdx_guest`, and
   `/sys/kernel/config/tsm/report` were absent;
   the enabled non-TDX negative-control test module passed.

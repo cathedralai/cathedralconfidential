@@ -2,23 +2,24 @@
 
 Last verified: 2026-07-13
 
+Current integration proof is **testnet SN292 in dry-run mode**. Production
+target is SN39; SN39 chain submission is not live.
+
 ## Working now
 
-- Confidential compute is the sole scoring dimension: base mass = 0,
-  confidential mass = 1. The signed scorer targets testnet SN292.
+- Confidential compute owns 100% of the score vector. There is no shared scorer,
+  reserved share, or second scoring mechanism.
 - The worker serves authenticated `/info` and `/evidence` endpoints and returns
-  real Intel TDX quotes.
-- The confidential validator enrolls workers, issues fresh challenges, verifies
-  TDX evidence and hotkey binding, runs deterministic audit work, derives the
-  score, and publishes a complete score vector.
-- A dedicated thin validator pinned to `confidential_primary_v1` has repeatedly
-  accepted fresh signed vectors, mapped worker hotkey
-  `5CtobNq2yNmUKaaR9HL5eSY2jN4j43iz1GLXNeNp2tbkwawK` to UID 41, and computed
-  dry-run UID41 = 1.0.
-- The old shared SN292 validator is disabled.
-- Hardware epochs run on a 60-second cycle; each verified epoch produces 20 work
-  units at score 1.0.
-- Post-migration FK integrity is clean.
+  real Intel TDX hardware quotes (8000-byte quotes with `intel_verified=true`
+  and `report_data_match=true`).
+- The scorer enrolls workers, issues fresh challenges, verifies TDX evidence and
+  hotkey binding, runs deterministic validator-dispatched audit work, derives
+  the score itself, and publishes a complete signed score vector.
+- A dedicated thin validator has repeatedly accepted fresh signed vectors,
+  mapped the worker hotkey to UID 41, and computed dry-run UID41 = 1.0.
+- Hardware epochs run on a 60-second cycle; each verified epoch produces 20
+  validator-derived work units at score 1.0.
+- Post-migration foreign-key integrity is clean.
 - Repository test suite: 469 passed, 3 skipped.
 
 ## Operator: pretty epoch logs
@@ -42,9 +43,9 @@ Example output (one header, one line per worker, one footer):
 
 ```
 [2026-07-13T15:23:01Z] EPOCH START  source=7  ep=1
-[2026-07-13T15:23:09Z] OK    5Ctob..wawK  ep=7/1  admit=Y  work=verified               wu=   20.00  score=1.000  pub=NO  ch=ababab..ababab
-[2026-07-13T15:23:09Z] ZERO  5Zero..ero   ep=7/1  admit=Y  work=sat_failed             wu=    0.00  score=0.000  pub=NO  ch=cdcdcd..cdcdcd  err=invalid SAT certificate
-[2026-07-13T15:23:09Z] FAIL  5Fail..ail   ep=7/1  admit=N  work=attestation_failed     wu=    0.00  score=0.000  pub=NO  err=worker returned HTTP 401
+[2026-07-13T15:23:09Z] OK    5Aaaa..aaaa  ep=7/1  admit=Y  work=verified               wu=   20.00  score=1.000  pub=NO  ch=ababab..ababab
+[2026-07-13T15:23:09Z] ZERO  5Bbbb..bbbb  ep=7/1  admit=Y  work=sat_failed             wu=    0.00  score=0.000  pub=NO  ch=cdcdcd..cdcdcd  err=invalid SAT certificate
+[2026-07-13T15:23:09Z] FAIL  5Cccc..cccc  ep=7/1  admit=N  work=attestation_failed     wu=    0.00  score=0.000  pub=NO  err=worker returned HTTP 401
 [2026-07-13T15:23:09Z] EPOCH END  ep=7/1  status=complete  published=NO  workers=3  ok=1  zeros=1  fail=1
 ```
 
@@ -99,15 +100,19 @@ automatically (in place, preserving all rows) the first time they are opened.
 
 ## Testnet boundary
 
-Chain broadcast is disabled. Wallet hotkey
-`5Dk1aiJ5cXe8KJSjKMuMrwAaJhUQEKAxTHFfG8gJjpZ64f9S` is not registered on
-SN292, so the validator cannot submit extrinsics.
+**Chain broadcast is NOT live.** The validator hotkey is not registered on
+SN292, so the validator cannot submit extrinsics. Everything above is dry-run:
+the vector is signed, verified, and mapped, but no weights land on chain.
 
 Remaining before chain-live:
 
-1. Register and stake the wallet hotkey on SN292, or supply a hotkey that
+1. Register and stake the validator hotkey on SN292, or supply a hotkey that
    already holds a permitted validator slot.
 2. Explicitly enable chain broadcast in the validator config.
-3. Confirm one successful weight extrinsic lands on chain.
-4. Confirm that a stale or failed-evidence epoch produces zero weight
-   (burn behavior).
+3. Confirm one monitored on-chain `set_weights` extrinsic lands.
+4. Confirm zero-revocation acceptance: a stale or failed-evidence epoch removes
+   prior weight (burn behavior).
+
+Production (SN39) submission is a separate step. The scorer integration for
+production is under review in `cathedralai/cathedral` PR #378, not merged to
+production main.
