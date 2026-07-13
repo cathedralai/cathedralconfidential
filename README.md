@@ -16,18 +16,19 @@ This is a **greenfield build**. The trust topology of prior marketplace designs
 ## For miners
 
 The current promotion path keeps the existing scorer authoritative and adds a
-separate confidential-compute component that is **capped at 10%**.
+demand-driven confidential-compute component under the global v3 contract:
 
-Three commitments govern that component:
-
-1. It is **demand-driven**: Cathedral only attributes confidential weight from
-   payable, verified confidential-compute reports.
-2. It is **zero when no payable verified compute exists**: an empty or
-   fully-revoked confidential snapshot contributes nothing, so SAT miners are
-   not diluted by an empty lane.
-3. It is **bounded end to end**: the launch gate checks the scorer-side blend,
-   survivor/UID merges, and Bittensor u16 quantization so realized confidential
-   attribution never exceeds 10%.
+1. When payable base and confidential populations both exist, the scorer
+   allocates exactly 90% of aggregate mass to base and 10% to confidential
+   compute across the union of their hotkeys. Compute-only hotkeys can earn.
+2. With base scores but no payable confidential compute, the result is 100%
+   base. With no base scores, composition fails closed to an empty vector.
+3. If the thin validator is missing any hotkey from the signed vector, it drops
+   all confidential mass and reconstructs a base-only vector from the mapped
+   signed base components. Duplicate UID mappings are rejected.
+4. The launch gate checks the aggregate contract through Bittensor u16
+   quantization; with both populations present, the quantized confidential
+   share must remain within tolerance of 10%.
 
 Cathedral does not mine its own confidential lane. Cathedral-operated TDX
 infrastructure exists to attest, verify, and publish the confidential snapshot;
@@ -47,9 +48,9 @@ What you can do today:
    scoring path in this repo. SNP cryptographic verification exists, but SNP
    runtime scoring is not enabled here today.
 3. **Inspect the launch gate** — `scripts/cross_repo_launch_verify.py` proves
-   the capped 10% scorer integration against the external scorer checkout and
-   revokes the confidential overlay back to zero when no payable verified
-   compute remains.
+   the global v3 scorer integration against the external scorer checkout,
+   including base-only fallback, duplicate-UID rejection, quantized aggregate
+   attribution, and revocation when no payable verified compute remains.
 
 Truthful working commands in this repo today:
 

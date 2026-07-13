@@ -162,9 +162,17 @@ python scripts/cross_repo_launch_verify.py \
 The gate starts the real scorer FastAPI app on an ephemeral localhost port,
 posts the ledger's frozen bytes through `cathedral.poster.Poster`, builds one
 signed positive vector, and exercises the production thin-validator and
-Bittensor u16 transforms. It exits nonzero on any contract mismatch and emits
-one compact JSON object with `"status":"PASS"` only after the subsequent
-complete-zero report revokes the confidential snapshot.
+Bittensor u16 transforms under the global confidential v3 contract. The proof
+requires an exact aggregate 90% base / 10% confidential split when both
+populations exist, including positive weight for a compute-only hotkey. It also
+checks that base-only input remains 100% base, no-base input fails closed to an
+empty vector, an incomplete signed-hotkey map reconstructs base-only weights,
+and duplicate UID mappings are rejected. The fully mapped quantized aggregate
+must remain within rounding tolerance of 10% confidential attribution.
+
+The gate exits nonzero on any contract mismatch and emits one compact JSON
+object with `"status":"PASS"` only after the subsequent complete-zero report
+revokes the confidential snapshot.
 
 ## Definition Of Done
 
@@ -176,18 +184,19 @@ complete-zero report revokes the confidential snapshot.
   conserved weights.
 - SNP remains a second CPU platform port, not a launch blocker.
 
-Latest live evidence, July 8, 2026:
+Live evidence recorded July 8, 2026:
 
-- Hardware-free local suite: `63 passed, 3 skipped`.
+- Hardware-free local suite passed; hardware-gated cases were skipped in that
+  environment.
 - Live TDX CVM with Polaris `attestor-verify` adapter:
   parsed `tdx-measurement-sha256:24da9c7003a1199293951b8e9acbf5ae0bf94b209b6958c1c3651892df5e02ce`,
   `tdx-pck-cert-sha256:cac3ee7282e1c79c9d3bcfcad2125dce41d7ef773cf61655693b51e968baa5a2`,
   and `tee_tcb_svn=0d010800000000000000000000000000`;
-  `tests/test_attest_tdx_hw.py tests/test_tdx_sat_e2e_hw.py` -> `2 passed`.
+  both the TDX quote round trip and SAT lane end-to-end hardware tests passed.
 - Live verifier smoke returned an 8000-byte quote with
   `intel_verified=true`, `report_data_match=true`, 64-byte `report_data`, and
   four Intel collateral URLs.
 - Non-TDX field negative control on disposable `e2-micro` Spot VM:
   `/sys/module/tdx_guest`, `/dev/tdx_guest`, and
   `/sys/kernel/config/tsm/report` were absent;
-  `CATHEDRAL_RUN_TDX_NEGATIVE=1 tests/test_attest_tdx_negative.py` -> `2 passed`.
+  the enabled non-TDX negative-control test module passed.

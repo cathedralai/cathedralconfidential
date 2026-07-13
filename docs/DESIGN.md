@@ -117,27 +117,32 @@ Three layers:
 ### Current promotion policy
 
 The current public promotion path keeps the existing scorer as the base vector
-and adds a confidential-compute overlay only when Cathedral has a payable,
-verified confidential snapshot to publish.
+and applies the global confidential v3 contract only when Cathedral has a
+payable, verified confidential snapshot to publish.
 
-- **Cap:** confidential attribution is capped at 10% end to end.
-- **Demand-driven:** confidential attribution comes only from payable, verified
-  confidential compute, not from lane occupancy targets or miner counts.
-- **Zero when empty:** when there is no payable verified confidential compute,
-  Cathedral publishes a complete-zero snapshot that revokes the overlay back to
-  zero rather than diluting SAT/base miners with stale mass.
-- **Gate before claim:** the launch gate audits the scorer blend, survivor/UID
-  merges, and Bittensor u16 quantization so realized confidential attribution
-  cannot exceed the published 10% cap.
+- **Exact aggregate split:** when base and payable confidential populations
+  both exist, independently normalized components contribute exactly 90% base
+  mass and 10% confidential mass across their hotkey union. A hotkey need not
+  appear in the base vector to earn confidential mass.
+- **Fail-closed boundaries:** base-only composition returns 100% base. A
+  confidential-only or fully empty composition returns an empty vector.
+- **Complete-map requirement:** if the thin validator is missing any signed
+  hotkey, all confidential mass is dropped and the mapped signed base
+  components are reconstructed as a base-only vector. Two signed hotkeys
+  mapping to one UID invalidate the vector.
+- **Gate before claim:** the launch gate verifies the signed aggregate split
+  and the production Bittensor u16 transform. With both populations present,
+  quantized aggregate confidential attribution must remain near 10% within the
+  gate's rounding tolerance.
 
 This promotion claim is about report production, publication, and scorer-side
-reconciliation. It does not imply live public neuron entrypoints or launch-ready
-operator CLIs.
+reconciliation. The operator CLI works for runtime and worker operations, and
+the validator/miner console scripts are compatibility wrappers into it; direct
+chain weight submission remains outside this sidecar.
 
 `cathedralai/cathedral` remains the sole Bittensor weight setter. This repo is
 the confidential-compute sidecar and intentionally excludes a direct Bittensor
-SDK dependency; its validator/miner console scripts are compatibility wrappers
-into the operator CLI for runtime and worker operations.
+SDK dependency.
 
 ### The routing vector = "directing compute to the primitives," made mechanical
 
