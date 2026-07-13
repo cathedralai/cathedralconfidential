@@ -9,8 +9,47 @@ ticket to participate, not the paycheck. Miners earn by completing verified work
 in five lanes — inference, training, RL, agent hosting, and SAT/benchmark — and
 idle attested hardware earns only a thin floor. Unearned emission burns.
 
-This is a **greenfield build** with a deliberately inverted trust topology:
-miners *serve* attestation, validators never touch miner machines.
+This is a **greenfield build**. The trust topology of prior marketplace designs
+(validator SSHes into miners as root) is deliberately inverted here — miners
+*serve* attestation, validators never touch miner machines.
+
+## For miners
+
+The current promotion path keeps the existing scorer authoritative and adds a
+separate confidential-compute component that is **capped at 10%**.
+
+Three commitments govern that component:
+
+1. It is **demand-driven**: Cathedral only attributes confidential weight from
+   payable, verified confidential-compute reports.
+2. It is **zero when no payable verified compute exists**: an empty or
+   fully-revoked confidential snapshot contributes nothing, so SAT miners are
+   not diluted by an empty lane.
+3. It is **bounded end to end**: the launch gate checks the scorer-side blend,
+   survivor/UID merges, and Bittensor u16 quantization so realized confidential
+   attribution never exceeds 10%.
+
+Cathedral does not mine its own confidential lane. Cathedral-operated TDX
+infrastructure exists to attest, verify, and publish the confidential snapshot;
+it is not registered for emissions.
+
+What you can do today:
+
+1. **Run the testable core** — clone this repo, `pip install -e '.[dev]'`,
+   `python -m pytest -q`. Understand the evidence flow in
+   `cathedral/attest`, the verifier logic in `cathedral/verify`, and the SAT
+   lane in `cathedral/lanes/sat.py`.
+2. **Prep confidential hardware** — Intel TDX or AMD SEV-SNP capable CPU
+   (CC-mode GPU support follows). Attestation is the admission ticket:
+   no genuine TEE evidence, no confidential-compute credit.
+3. **Inspect the launch gate** — `scripts/cross_repo_launch_verify.py` proves
+   the capped 10% scorer integration against the external scorer checkout and
+   revokes the confidential overlay back to zero when no payable verified
+   compute remains.
+
+This repo does not yet claim launch-ready neuron entrypoints or operator CLIs.
+The live claim in this branch is the attestation, runtime, ledger, poster, and
+cross-repo scoring path.
 
 ## Read first
 

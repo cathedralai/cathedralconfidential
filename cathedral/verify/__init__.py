@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, report_data
+from cathedral.verify.snp import verify_snp
 
 
 def verify(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
@@ -44,7 +45,7 @@ def verify(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
     _ = expected  # bound-in check happens against the parsed quote in Phase 1
 
     if evidence.kind is EvidenceKind.SEV_SNP:
-        raise NotImplementedError("SNP verify — Phase 1 (snpguest verify + KDS)")
+        return verify_snp(evidence, nonce, policy)
     if evidence.kind is EvidenceKind.TDX:
         return _verify_tdx(evidence, nonce, policy)
     if evidence.kind is EvidenceKind.GPU_CC:

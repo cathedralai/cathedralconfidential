@@ -12,9 +12,7 @@ conserves to 1.0.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
-import pytest
+from dataclasses import dataclass
 
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier
 from cathedral.lanes.sat import solve_sat

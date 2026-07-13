@@ -15,8 +15,6 @@ from __future__ import annotations
 import sys
 import time
 
-import pytest
-
 from cathedral.common import Evidence, EvidenceKind, Policy, issue_nonce, report_data
 from cathedral.verify import verify
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 
-from cathedral.common import Attested, Tier
 from cathedral.economics import apply_routing
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem

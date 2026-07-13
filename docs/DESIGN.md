@@ -114,6 +114,26 @@ Three layers:
 2. **Work layer (majority).** Weighted by completed, verified work units, composed through the routing vector.
 3. **Burn.** Work that did not happen pays nobody. (`burn_uid` / `forced_burn_percentage` already exist in the inherited validator config.)
 
+### Current promotion policy
+
+The current public promotion path keeps the existing scorer as the base vector
+and adds a confidential-compute overlay only when Cathedral has a payable,
+verified confidential snapshot to publish.
+
+- **Cap:** confidential attribution is capped at 10% end to end.
+- **Demand-driven:** confidential attribution comes only from payable, verified
+  confidential compute, not from lane occupancy targets or miner counts.
+- **Zero when empty:** when there is no payable verified confidential compute,
+  Cathedral publishes a complete-zero snapshot that revokes the overlay back to
+  zero rather than diluting SAT/base miners with stale mass.
+- **Gate before claim:** the launch gate audits the scorer blend, survivor/UID
+  merges, and Bittensor u16 quantization so realized confidential attribution
+  cannot exceed the published 10% cap.
+
+This promotion claim is about report production, publication, and scorer-side
+reconciliation. It does not imply live public neuron entrypoints or launch-ready
+operator CLIs.
+
 ### The routing vector = "directing compute to the primitives," made mechanical
 
 Emission split across lanes is an explicit, governance-visible, per-epoch table:

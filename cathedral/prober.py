@@ -185,8 +185,6 @@ def _build_pre_resolved_opener(resolved_addr: str) -> Any:
 
     class _ResolvedHTTPHandler(HTTPHandler):
         def http_open(self, req: Any) -> Any:
-            # Extract host from request
-            host = req.host
             return self.do_open(
                 lambda h, **kw: _PreResolvedHTTPConnection(h, resolved_addr=resolved_addr, **kw),
                 req,
@@ -194,7 +192,6 @@ def _build_pre_resolved_opener(resolved_addr: str) -> Any:
 
     class _ResolvedHTTPSHandler(HTTPSHandler):
         def https_open(self, req: Any) -> Any:
-            host = req.host
             return self.do_open(
                 lambda h, **kw: _PreResolvedHTTPSConnection(h, resolved_addr=resolved_addr, **kw),
                 req,
