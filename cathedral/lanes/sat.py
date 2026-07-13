@@ -26,6 +26,7 @@ from cathedral.lanes import Certificate, Lane, WorkItem
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
 _QUALIFIED_TIERS = {Tier.CC_CPU_SNP, Tier.CC_CPU_TDX}
+_MAX_NONNEGATIVE_SIGNED_I64 = (1 << 63) - 1
 
 
 def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
@@ -41,6 +42,23 @@ def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
     }
     h = hashlib.sha256(json.dumps(payload, sort_keys=True).encode())
     return h.hexdigest()
+
+
+def _derive_canonical_seed(namespace: str, counter: int) -> int:
+    """Derive a reproducible canonical SAT seed from namespace + counter.
+
+    Uses the first 64 HMAC bits and masks to the nonnegative signed-64-bit
+    range already accepted by the remote worker protocol. Retaining these high
+    bits avoids collapsing the seed space to 31 bits, which would sharply raise
+    challenge-id collision risk once ledger challenge IDs are globally unique.
+    """
+
+    seed_bytes = hmac.new(
+        namespace.encode(),
+        str(counter).encode(),
+        hashlib.sha256,
+    ).digest()
+    return int.from_bytes(seed_bytes[:8], "big") & _MAX_NONNEGATIVE_SIGNED_I64
 
 
 def solve_sat(instance: SatInstance) -> list[int] | None:
@@ -204,13 +222,7 @@ class SatLane(Lane):
         # hash() which is process-salted and not reproducible. HMAC-SHA256
         # ensures identical namespace/counter always yields identical seed
         # across different PYTHONHASHSEED values.
-        seed_bytes = hmac.new(
-            self._namespace.encode(),
-            str(self._seed_counter).encode(),
-            hashlib.sha256,
-        ).digest()
-        # Constrain to positive 31-bit int (same as original intent).
-        seed = int.from_bytes(seed_bytes[:4], "big") & 0x7FFFFFFF
+        seed = _derive_canonical_seed(self._namespace, self._seed_counter)
         self._seed_counter += 1
         instance = _canonical_instance(seed)
         challenge_id = _compute_challenge_id(instance, seed)

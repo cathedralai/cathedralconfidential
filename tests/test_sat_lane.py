@@ -7,12 +7,19 @@ testable core (DRAT proof in production).
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
 import subprocess
 import sys
 
 from cathedral.common import Attested, Tier
-from cathedral.lanes.sat import SatLane, solve_sat, _compute_challenge_id
+from cathedral.lanes.sat import (
+    SatLane,
+    _compute_challenge_id,
+    _derive_canonical_seed,
+    solve_sat,
+)
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
 
@@ -202,6 +209,36 @@ def test_seed_derivation_varies_with_different_namespaces():
     item1 = lane1.dispatch("miner-x", 0)
     item2 = lane2.dispatch("miner-x", 0)
     assert item1.seed != item2.seed, "Different namespaces should produce different seeds"
+
+
+def test_seed_derivation_retains_high_bits_beyond_31_bit_truncation():
+    """Canonical dispatch must keep the high HMAC bits, not truncate to 31 bits."""
+    namespace = "test-namespace"
+    lane = SatLane(namespace)
+
+    item = lane.dispatch("miner-x", 0)
+
+    expected = _derive_canonical_seed(namespace, 0)
+    truncated = int.from_bytes(
+        hmac.new(namespace.encode(), b"0", hashlib.sha256).digest()[:4],
+        "big",
+    ) & 0x7FFFFFFF
+    assert expected > 2**31 - 1
+    assert item.seed == expected
+    assert item.seed != truncated
+
+
+def test_seed_derivation_is_reproducible_for_namespace_and_counter_sequence():
+    """Independent lanes with the same namespace must reproduce the same seed sequence."""
+    namespace = "collision-test"
+    lane1 = SatLane(namespace)
+    lane2 = SatLane(namespace)
+
+    seeds1 = [lane1.dispatch("miner-x", 0).seed for _ in range(4)]
+    seeds2 = [lane2.dispatch("miner-y", 0).seed for _ in range(4)]
+
+    assert seeds1 == seeds2
+    assert seeds1 == [_derive_canonical_seed(namespace, counter) for counter in range(4)]
 
 
 def test_enqueue_rejects_mismatched_challenge_id():
