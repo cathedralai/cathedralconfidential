@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-  # bittensor SDK added in Phase 1 when chain integration lands
+  # No direct bittensor SDK here: cathedralai/cathedral remains the sole
+  # weight-setting scorer, and this repo stays the confidential sidecar.
   # "bittensor>=8.0",
 ]
 
@@ -17,6 +18,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 cathedral = "cathedral.cli:main"
 cathedral-census = "cathedral.census:main"
+# Compatibility wrappers into the operator CLI; they do not add chain logic.
 cathedral-validator = "cathedral.neuron.validator:main"
 cathedral-miner = "cathedral.neuron.miner:main"
 

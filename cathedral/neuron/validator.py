@@ -1,4 +1,4 @@
-"""Validator neuron (Phase 1+).
+"""Validator compatibility entrypoint plus hardware-free epoch helpers.
 
 Epoch loop: challenge every miner, verify attestation, gate admission, run the
 lanes, score verified work through the routing vector, burn the remainder, set
@@ -9,8 +9,9 @@ This is the hardware-free *testable core*: the epoch below composes the real
 admission contract (verify) + control plane (Inventory) + SAT lane + emission
 routing, driven against MOCKED attestation. The MOCK boundary is the only
 substitution — everything downstream of an ``Attested`` verdict is the real
-Phase-2 code path. ``main`` (real chain + hardware collectors) stays a Phase-1
-stub with clear markers.
+Phase-2 code path. Chain submission itself remains scorer-owned in
+``cathedralai/cathedral``; this repo's console entrypoint is only a
+compatibility wrapper into the existing operator CLI.
 
 Fault isolation in ``attested_epoch``:
   Each miner’s collection + verification phase is wrapped in its own try/except
@@ -22,6 +23,7 @@ Fault isolation in ``attested_epoch``:
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
@@ -183,12 +185,19 @@ def attested_epoch(
     return EpochResult(weights=weights, burn=burn, admitted=admitted)
 
 
-def main() -> None:
-    # TODO(phase1): bittensor registration; for each axon on SN39 -> issue_nonce,
-    #   request real Evidence, cathedral.verify.verify() (vendor crypto);
-    #   dedupe by Attested.chip_id; run lanes; subtensor.set_weights(netuid=39, ...).
-    raise NotImplementedError("validator neuron main — Phase 1 (real chain + attestation)")
+def main(argv: list[str] | None = None) -> int:
+    """Compatibility wrapper for ``cathedral runtime ...``.
+
+    This repo intentionally does not own direct Bittensor weight submission.
+    Operators invoking ``cathedral-validator`` are forwarded to the existing
+    confidential-runtime CLI surface.
+    """
+
+    from cathedral import cli as operator_cli
+
+    forwarded = ["runtime", *(sys.argv[1:] if argv is None else argv)]
+    return operator_cli.main(forwarded)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

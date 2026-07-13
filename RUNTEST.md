@@ -3,6 +3,9 @@
 Hardware-free, stdlib-only. The only third-party dependency is `pytest` (dev).
 No network, no TEE, no hardware: attestation is **mocked** behind the real
 `verify()` interface (see `cathedral/verify/mock.py` and `docs/DESIGN.md §6`).
+This repo is the confidential-compute sidecar only; `cathedralai/cathedral`
+remains the sole Bittensor weight setter, so there is no direct SDK dependency
+here.
 
 ## 1. Create the venv and install
 
@@ -27,7 +30,7 @@ points import cleanly) and pulls in `pytest`. No runtime deps beyond the stdlib.
 Expected:
 
 ```
-63 passed, 3 skipped
+340 passed, 3 skipped
 ```
 
 The skipped tests are the hardware-gated TDX quote round trip, SAT lane e2e,
@@ -73,6 +76,5 @@ print('admitted', r.admitted); print('weights', r.weights); print('burn', r.burn
 
 - `cathedral` — operator CLI (`census`, `verify-quote`, `work submit/status`)
 - `cathedral-census` — the CC capability probe
-- `cathedral-validator` / `cathedral-miner` — neuron entry points; `main()` is a
-  Phase-1 stub (real chain + hardware attestation), the importable `epoch()` /
-  `MockMiner` run the hardware-free core.
+- `cathedral-validator` — compatibility wrapper for `cathedral runtime ...`
+- `cathedral-miner` — compatibility wrapper for `cathedral worker ...`

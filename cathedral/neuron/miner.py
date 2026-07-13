@@ -1,4 +1,4 @@
-"""Miner neuron (Phase 1+).
+"""Miner compatibility entrypoint plus local worker adapters.
 
 Inverted trust topology: the miner *serves* attestation on request and runs
 lane work; the validator never SSHes in.
@@ -9,12 +9,14 @@ See docs/DESIGN.md §4, §9.
 Hardware-free testable core: ``MockMiner`` serves MOCK evidence (the real
 REPORT_DATA binding + policy check, no vendor crypto) and does real SAT work.
 The MOCK boundary is the only substitution — the SAT solve/certify path is the
-real Phase-2 code. ``main`` (real registration + hardware collectors) stays a
-Phase-1 stub with clear markers.
+real Phase-2 code. Chain registration and weight submission remain scorer-owned
+in ``cathedralai/cathedral``; this repo's console entrypoint is only a
+compatibility wrapper into the existing operator CLI.
 """
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 from cathedral.attest import collect_tdx
@@ -110,12 +112,14 @@ class TdxMiner:
         return _solve_sat_work(item, self.uid)
 
 
-def main() -> None:
-    # TODO(phase1): bittensor registration; serve an authenticated attestation
-    # endpoint (attest.collect_* bound to the validator's nonce + this hotkey);
-    # advertise tier + lane subscriptions; run lane work loops.
-    raise NotImplementedError("miner neuron main — Phase 1 (real registration + attestation)")
+def main(argv: list[str] | None = None) -> int:
+    """Compatibility wrapper for ``cathedral worker ...``."""
+
+    from cathedral import cli as operator_cli
+
+    forwarded = ["worker", *(sys.argv[1:] if argv is None else argv)]
+    return operator_cli.main(forwarded)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

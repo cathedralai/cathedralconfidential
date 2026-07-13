@@ -9,6 +9,8 @@ file is the how.
 > Cathedral is going TDX CPU first because a live GCP TDX CVM is already running
 > the Cathedral publisher. Use `docs/TDX_LAUNCH.md` for the current real
 > attestation path; keep the SNP sections below as the next CPU platform port.
+> SNP quote parsing and cryptographic verification exist in-repo, but runtime
+> scoring remains TDX CPU first.
 
 > **The one-line status.** The subnet mechanics + the SAT lane are real and
 > tested. The attestation verdict is currently **mocked** in the validator epoch
@@ -48,9 +50,11 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 
-python -m pytest -q             # expect: 47 passed, 2 skipped
+python -m pytest -q             # expect the current full suite count from RUNTEST.md
 python scripts/demo_sat.py      # expect: ... PASS
 python -m cathedral.census      # prints CC capability of THIS box (exit 1 if none)
+cathedral-validator --help      # compatibility wrapper -> cathedral runtime ...
+cathedral-miner --help          # compatibility wrapper -> cathedral worker ...
 ```
 
 **What the hardware-free pass is telling you:** the nonce/REPORT_DATA binding,
@@ -190,10 +194,10 @@ rd = report_data(nonce, miner_hotkey)          # -> pass as request-data.bin to 
 
 If `REPORT_DATA` in the returned report ≠ `report_data(nonce, hotkey)`, **reject**.
 
-### 4.2 Implement the collector — `cathedral/attest/__init__.py`
+### 4.2 Next SNP runtime step — `cathedral/attest/__init__.py`
 
-`collect_snp(nonce, hotkey, ssh_host_key=None)` currently raises
-`NotImplementedError`. Implement it to:
+The remaining SNP runtime task is wiring a real collector into the scoring path.
+That collector should:
 
 1. compute `rd = report_data(nonce, hotkey, ssh_host_key)`, write to a temp file
 2. shell out to `snpguest report <out> <rd-file>` (or call the sev-guest ioctl
@@ -202,10 +206,10 @@ If `REPORT_DATA` in the returned report ≠ `report_data(nonce, hotkey)`, **reje
 4. return an `Evidence(kind=SEV_SNP, quote=<report bytes>, cert_chain=[...],
    nonce=nonce, miner_hotkey=hotkey, ssh_host_key=ssh_host_key)`
 
-### 4.3 Implement the verifier — `cathedral/verify/__init__.py`
+### 4.3 Next SNP runtime step — `cathedral/verify/__init__.py`
 
-`verify(evidence, nonce, policy)` currently raises for each kind. Implement the
-SNP branch to:
+SNP verification code exists now; the remaining runtime task is making the SNP
+collector/verifier pair part of an enabled scoring path. The SNP verifier must:
 
 1. verify the AMD signature chain (`snpguest verify`, or the `sev` Rust crate /
    a Python binding) — **this is the crypto you must not hand-roll**
@@ -246,7 +250,7 @@ produces weights. That is the first real proof the subnet gates on hardware.
 
 Track A (any box):
 - [ ] `pip install -e '.[dev]'` succeeds
-- [ ] `python -m pytest -q` → **47 passed, 2 skipped**
+- [ ] `python -m pytest -q` matches the current count in `RUNTEST.md`
 - [ ] `python scripts/demo_sat.py` → **PASS**
 
 Track B (SNP box):

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import argparse
+import importlib
 
 import pytest
 
@@ -254,3 +255,54 @@ def test_publisher_secrets_have_env_name_flags_only():
     help_text = build_parser().format_help()
     assert "--publisher-bearer-token" not in help_text
     assert "--publisher-hmac-secret" not in help_text
+
+
+def test_validator_wrapper_forwards_to_runtime(monkeypatch):
+    calls = []
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        return 0
+
+    monkeypatch.setattr("cathedral.cli.main", fake_main)
+    validator_mod = importlib.import_module("cathedral.neuron.validator")
+
+    assert validator_mod.main(["status", "--ledger-db", "ledger.sqlite"]) == 0
+    assert calls == [["runtime", "status", "--ledger-db", "ledger.sqlite"]]
+
+
+def test_miner_wrapper_forwards_to_worker(monkeypatch):
+    calls = []
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        return 0
+
+    monkeypatch.setattr("cathedral.cli.main", fake_main)
+    miner_mod = importlib.import_module("cathedral.neuron.miner")
+
+    assert miner_mod.main(["serve", "--hotkey", "miner"]) == 0
+    assert calls == [["worker", "serve", "--hotkey", "miner"]]
+
+
+def test_validator_wrapper_help_uses_runtime_parser(capsys):
+    validator_mod = importlib.import_module("cathedral.neuron.validator")
+
+    with pytest.raises(SystemExit, match="0"):
+        validator_mod.main(["--help"])
+
+    help_text = capsys.readouterr().out
+    assert "usage: cathedral runtime" in help_text
+    assert "retry-publish" in help_text
+    assert "run-epoch" in help_text
+
+
+def test_miner_wrapper_help_uses_worker_parser(capsys):
+    miner_mod = importlib.import_module("cathedral.neuron.miner")
+
+    with pytest.raises(SystemExit, match="0"):
+        miner_mod.main(["--help"])
+
+    help_text = capsys.readouterr().out
+    assert "usage: cathedral worker" in help_text
+    assert "serve" in help_text

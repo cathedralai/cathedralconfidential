@@ -14,7 +14,7 @@ Two sentences hold the whole design:
 
 > **Confidentiality is our admission rule. Verified work is our currency.**
 
-Every miner proves, cryptographically, that it runs inside a genuine Trusted Execution Environment (TEE) — a confidential CPU (AMD SEV-SNP, Intel TDX) or a confidential-compute GPU (NVIDIA H100/H200/B200 in CC or PPCIe mode). That attestation is the ticket to participate. It is **not** the paycheck. Miners earn by completing verified work in one of five lanes. Idle attested hardware earns a thin floor and nothing more; unearned emission burns.
+Every miner proves, cryptographically, that it runs inside a genuine Trusted Execution Environment (TEE) — a confidential CPU (AMD SEV-SNP, Intel TDX) or a confidential-compute GPU (NVIDIA H100/H200/B200 in CC or PPCIe mode). That attestation is the ticket to participate. It is **not** the paycheck. The long-range Cathedral design earns through five lanes; the current public sidecar implementation is narrower and focused on the confidential scoring report path. Idle attested hardware earns a thin floor and nothing more; unearned emission burns.
 
 This inverts the usual confidential-compute subnet, which sells trust and then waits. Cathedral is never idle: attested machines are always visibly solving, evaluating, training, serving, and hosting.
 
@@ -134,6 +134,11 @@ This promotion claim is about report production, publication, and scorer-side
 reconciliation. It does not imply live public neuron entrypoints or launch-ready
 operator CLIs.
 
+`cathedralai/cathedral` remains the sole Bittensor weight setter. This repo is
+the confidential-compute sidecar and intentionally excludes a direct Bittensor
+SDK dependency; its validator/miner console scripts are compatibility wrappers
+into the operator CLI for runtime and worker operations.
+
 ### The routing vector = "directing compute to the primitives," made mechanical
 
 Emission split across lanes is an explicit, governance-visible, per-epoch table:
@@ -220,7 +225,7 @@ When off-subnet customers need trustless settlement, add exactly one **Verificat
 
 Each phase ships alone; nothing blocks on the phase after it.
 
-- **Phase 0 — now (~1–2 wk).** Land the rename. `TeeEvidence` proto (SNP | TDX | GPU, nonce+hotkey binding). CC census probe (`/dev/sev-guest`, TDX support, `nvidia-smi conf-compute -q`) to measure launch supply. *Launch path: TDX CPU first on the live GCP TDX CVM; SNP is the next CPU platform port.*
+- **Phase 0 — now (~1–2 wk).** Land the rename. `TeeEvidence` proto (SNP | TDX | GPU, nonce+hotkey binding). CC census probe (`/dev/sev-guest`, TDX support, `nvidia-smi conf-compute -q`) to measure launch supply. *Launch path: TDX CPU first on the live GCP TDX CVM; SNP verification exists, but SNP runtime scoring is the next CPU platform port.*
 - **Phase 1 — attestation core (~4–6 wk).** `cathedral-attestor` + `cathedral-verifier` (KDS / DCAP / NRAS + policy engine). Admission and emissions gate on attestation. Cathedral is now an attestation-gated subnet with the attestation floor + a first lane (SAT — cheapest verification, biggest CPU supply).
 - **Phase 2 — lanes (~4–6 wk).** Lane engine + the five lanes' dispatch/verify/score. Routing vector wired to the weight-setter. Canonical work queues live. Demand-preempt + burn.
 - **Phase 3 — Sandbox rentals (~6–10 wk).** Host-agent (cloud-hypervisor/QEMU + TDX/SNP + VFIO passthrough), measured guest image + build pipeline, attested SSH (host-key binding), control-plane API + CLI + MCP. CC-CPU pods first, CC-GPU second.
