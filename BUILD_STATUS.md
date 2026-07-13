@@ -9,9 +9,9 @@ target is SN39; SN39 chain submission is not live.
 
 - Confidential compute owns 100% of the score vector. There is no shared scorer,
   reserved share, or second scoring mechanism.
-- The worker serves authenticated `/info` and `/evidence` endpoints and returns
-  real Intel TDX hardware quotes (8000-byte quotes with `intel_verified=true`
-  and `report_data_match=true`).
+- The worker serves authenticated `POST /v1/evidence` and `POST /v1/sat-work`
+  endpoints and returns real Intel TDX hardware quotes (8000-byte quotes with
+  `intel_verified=true` and `report_data_match=true`).
 - The scorer enrolls workers, issues fresh challenges, verifies TDX evidence and
   hotkey binding, runs deterministic validator-dispatched audit work, derives
   the score itself, and publishes a complete signed score vector.
