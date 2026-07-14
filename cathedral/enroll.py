@@ -442,33 +442,12 @@ class RegistryStore:
             status = attested.verification_status
             chip_id = attested.chip_id
             tier = attested.tier.value
-        now = datetime.now(UTC)
         with self._connect() as conn:
             if status == "VERIFIED" and chip_id is not None:
-                existing = conn.execute(
-                    """
-                    SELECT hotkey, last_verified_iso FROM attestations
-                    WHERE chip_id = ?
-                      AND hotkey != ?
-                      AND verification_status = 'VERIFIED'
-                    ORDER BY last_verified_iso DESC
-                    LIMIT 1
-                    """,
-                    (chip_id, hotkey),
-                ).fetchone()
-                if existing is not None:
-                    # Only block rotation when the competing binding is still
-                    # effective (within TTL).  An expired/STALE binding allows
-                    # a new hotkey to legitimately claim the same physical chip
-                    # after the previous operator's verification has lapsed.
-                    effective = self._effective_status(
-                        "VERIFIED",
-                        existing["last_verified_iso"],
-                        now,
-                    )
-                    if effective == "VERIFIED":
-                        status = "FAILED"
-                        error = f"chip_id already bound to hotkey {existing['hotkey']}"
+                conflict = self._chip_rotation_owner(conn, chip_id, hotkey)
+                if conflict is not None:
+                    status = "FAILED"
+                    error = f"chip_id already bound to hotkey {conflict}"
             conn.execute(
                 """
                 INSERT INTO attestations(
@@ -484,6 +463,41 @@ class RegistryStore:
                 """,
                 (hotkey, chip_id, tier, status, ts, error),
             )
+
+    def chip_rotation_owner(self, chip_id: str, hotkey: str) -> str | None:
+        """Return the other hotkey currently holding an effective VERIFIED
+
+        binding for ``chip_id``, if any. Callers use this to reject a fresh
+        attestation as a same-chip rotation Sybil attempt before admitting
+        or scoring it, independent of whether ``record_verdict`` has run for
+        this epoch yet.
+        """
+        with self._connect() as conn:
+            return self._chip_rotation_owner(conn, chip_id, hotkey)
+
+    def _chip_rotation_owner(
+        self, conn: sqlite3.Connection, chip_id: str, hotkey: str
+    ) -> str | None:
+        existing = conn.execute(
+            """
+            SELECT hotkey, last_verified_iso FROM attestations
+            WHERE chip_id = ?
+              AND hotkey != ?
+              AND verification_status = 'VERIFIED'
+            ORDER BY last_verified_iso DESC
+            LIMIT 1
+            """,
+            (chip_id, hotkey),
+        ).fetchone()
+        if existing is None:
+            return None
+        # Only block rotation when the competing binding is still effective
+        # (within TTL). An expired/STALE binding allows a new hotkey to
+        # legitimately claim the same physical chip after the previous
+        # operator's verification has lapsed.
+        now = datetime.now(UTC)
+        effective = self._effective_status("VERIFIED", existing["last_verified_iso"], now)
+        return existing["hotkey"] if effective == "VERIFIED" else None
 
     def _effective_status(self, status: str, last_verified_iso: str | None, now: datetime) -> str:
         if status != "VERIFIED":

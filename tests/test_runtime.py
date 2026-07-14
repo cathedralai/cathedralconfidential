@@ -264,6 +264,54 @@ def test_duplicate_chip_excludes_all_independent_of_order(
     assert ledger.attested_hotkeys(run.epoch_id) == frozenset()
 
 
+def test_chip_rotation_to_new_hotkey_is_blocked_within_ttl(tmp_path: Path) -> None:
+    """A physical chip verified for hotkey "a" in one epoch must not be
+    admitted under a different hotkey "b" in a later epoch while the first
+    binding is still effective — even though the two hotkeys never attest
+    within the same epoch, so the same-epoch duplicate-chip check alone
+    cannot see the collision.
+    """
+
+    registry = RegistryStore(str(tmp_path / "registry.sqlite"))
+    registry.enroll("a", "http://127.0.0.1:9001")
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    specs = default_specs(**{"9001": MinerSpec("shared-chip")})
+    factory = FakeFactory(specs)
+    runtime = ConfidentialRuntime(
+        registry,
+        ledger,
+        Policy(allowed_measurements={"measurement"}),
+        poster=RecordingPoster(),
+        verifier=verifier,
+        remote_factory=factory,
+        config=RuntimeConfig(
+            max_workers=4,
+            production_mode=False,
+            allow_insecure_http_for_tests=True,
+        ),
+    )
+
+    first = runtime.run_epoch(1, CANARY, publish=True)
+    assert dict(first.scores) == {"a": 1.0}
+    assert {outcome.status for outcome in first.outcomes} == {"verified"}
+    assert first.published is True
+
+    # "a"'s worker goes offline; the same physical chip now serves "b" at a
+    # freshly enrolled endpoint.
+    registry.enroll("b", "http://127.0.0.1:9002")
+    specs["http://127.0.0.1:9002"] = MinerSpec("shared-chip")
+    del specs["http://127.0.0.1:9001"]
+
+    second = runtime.run_epoch(2, CANARY)
+    assert dict(second.scores) == {"a": 0.0, "b": 0.0}
+    statuses = {outcome.hotkey: outcome.status for outcome in second.outcomes}
+    assert statuses["a"] == "attestation_failed"
+    assert statuses["b"] == "chip_rotation_conflict"
+    assert "already bound to hotkey a" in (
+        next(o.error for o in second.outcomes if o.hotkey == "b") or ""
+    )
+
+
 def test_invalid_miner_is_zero_while_peer_succeeds(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("good")})
     runtime, _, _ = make_runtime(
