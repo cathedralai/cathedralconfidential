@@ -23,6 +23,15 @@ _DEFAULT_SEV_GUEST_DEV = Path("/dev/sev-guest")
 _SNP_REPORT_SIZE = 1184  # fixed AMD SEV-SNP ATTESTATION_REPORT layout (matches verify.snp)
 
 
+def _snpguest_timeout() -> float:
+    """Wall-clock cap (seconds) for each ``snpguest`` subprocess so a hung binary
+    cannot wedge the collector. Override with ``CATHEDRAL_SNPGUEST_TIMEOUT``."""
+    try:
+        return max(1.0, float(os.environ.get("CATHEDRAL_SNPGUEST_TIMEOUT", "30")))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 def collect_snp(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) -> Evidence:
     """AMD SEV-SNP attestation report via /dev/sev-guest with bound REPORT_DATA.
 
@@ -92,10 +101,15 @@ def _collect_snpguest_report(report_data_bytes: bytes, *, dev: Path) -> tuple[by
         report_path = work / "attestation-report.bin"
 
         # `snpguest report <out> <request>`: request bytes become REPORT_DATA.
-        subprocess.run(
-            [snpguest, "report", str(report_path), str(request)],
-            check=True, capture_output=True, text=True,
-        )
+        try:
+            subprocess.run(
+                [snpguest, "report", str(report_path), str(request)],
+                check=True, capture_output=True, text=True, timeout=_snpguest_timeout(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"snpguest report timed out after {_snpguest_timeout():.0f}s"
+            ) from exc
         quote = report_path.read_bytes()
         if len(quote) != _SNP_REPORT_SIZE:
             raise RuntimeError(
@@ -108,23 +122,26 @@ def _fetch_snp_cert_chain(snpguest: str, report_path: Path, work: Path) -> list[
     """Best-effort VCEK + CA (ARK/ASK) fetch from AMD KDS. Returns [] on failure."""
     certs = work / "certs"
     certs.mkdir(parents=True, exist_ok=True)
+    timeout = _snpguest_timeout()
     try:
         subprocess.run(
             [snpguest, "fetch", "vcek", "DER", str(certs), str(report_path)],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, text=True, timeout=timeout,
         )
-        # `fetch ca` argument order varies across snpguest versions; try known forms.
+        # `fetch ca` argument order varies across snpguest versions; try the known
+        # forms. Both derive the CA generation (Milan / Genoa / Turin) from the
+        # report itself — no hardcoded product guess, which would fetch the wrong
+        # CA on non-Milan parts.
         for cmd in (
             [snpguest, "fetch", "ca", "--report", str(report_path), "DER", str(certs)],
             [snpguest, "fetch", "ca", "DER", str(certs), str(report_path)],
-            [snpguest, "fetch", "ca", "DER", str(certs), "milan"],
         ):
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
                 break
             except subprocess.CalledProcessError:
                 continue
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return []
     return [
         f.read_bytes()
