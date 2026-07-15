@@ -29,6 +29,7 @@ from cathedral.common import (
     Policy,
     Tier,
     issue_nonce,
+    is_globally_routable,
 )
 from cathedral.enroll import RegistryStore
 from cathedral.lifecycle import (
@@ -130,7 +131,7 @@ def _resolve_endpoint(
     # IP literals: validate globality; in production mode, reject all non-global.
     try:
         ip = ipaddress.ip_address(host)
-        if production_mode and not ip.is_global:
+        if production_mode and not is_globally_routable(ip):
             raise ValueError(
                 f"endpoint IP literal {host!r} rejected in production mode: "
                 "must be a public/global address"
@@ -163,7 +164,7 @@ def _resolve_endpoint(
     resolved_addr = None
     for addr in addrs:
         ip = ipaddress.ip_address(addr)
-        if not ip.is_global:
+        if not is_globally_routable(ip):
             raise ValueError(
                 f"endpoint resolves to non-global address {addr!r} for hostname {host!r}"
             )

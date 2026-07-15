@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import ipaddress
 import os
 import re
 import struct
@@ -86,6 +87,43 @@ MAX_GPU_EVIDENCE_CONCURRENCY = (
 )
 if MAX_GPU_EVIDENCE_CONCURRENCY < 1:
     raise RuntimeError("GPU evidence contract exceeds its working-set budget")
+
+
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address embedded in an IPv6 transition address, else None.
+
+    Covers IPv4-mapped (``::ffff:0:0/96``), 6to4 (``2002::/16``), and the NAT64
+    well-known prefix (``64:ff9b::/96``). ``ipaddress.is_global`` looks only at
+    the outer IPv6 prefix, so on its own it reports a transition address that
+    wraps a private/loopback IPv4 as globally routable.
+    """
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip in _NAT64_WELL_KNOWN_PREFIX:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
+def is_globally_routable(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Stricter ``ip.is_global`` that also rejects IPv6 transition addresses
+    wrapping a non-global IPv4.
+
+    ``ipaddress.is_global`` does not inspect the IPv4 embedded in NAT64/6to4/
+    IPv4-mapped IPv6 addresses, so e.g. ``64:ff9b::7f00:1`` (127.0.0.1) reports
+    ``is_global=True``. On a network with NAT64/DNS64 or 6to4 routing those
+    resolve to the embedded IPv4 target, defeating an SSRF guard built on
+    ``is_global`` alone. Require any embedded IPv4 to be global too.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None and not embedded.is_global:
+            return False
+    return ip.is_global
 
 
 class Tier(str, enum.Enum):
