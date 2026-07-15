@@ -33,10 +33,15 @@ def _sev_snp() -> bool:
 
 
 def _tdx() -> bool:
-    """Intel TDX guest (configfs-tsm report path) or host module present."""
+    """Intel TDX guest — requires a TDX-specific marker.
 
-    if os.path.exists("/sys/kernel/config/tsm/report"):
-        return True
+    The generic configfs-tsm report path (``/sys/kernel/config/tsm/report``) is
+    NOT sufficient on its own: AMD SEV-SNP guests (and other TSM providers)
+    expose the same interface, so keying off it mis-reported an SEV-SNP box as
+    ``Intel TDX: yes``. The Linux TDX guest driver exposes ``/sys/module/tdx_guest``
+    and ``/dev/tdx_guest`` whenever the guest is a real TD, so gate on those.
+    """
+
     return os.path.exists("/sys/module/tdx_guest") or os.path.exists("/dev/tdx_guest")
 
 
