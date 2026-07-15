@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -235,6 +236,30 @@ def test_two_unique_tdx_miners_complete_normalized(tmp_path: Path) -> None:
     assert dict(run.scores) == {"miner-a": 1.0, "miner-b": 1.0}
     assert {outcome.status for outcome in run.outcomes} == {"verified"}
     assert all(outcome.work_units == 20 for outcome in run.outcomes)
+
+
+def test_registry_write_failure_does_not_abort_epoch(tmp_path: Path) -> None:
+    """record_verdict is a best-effort defense-in-depth refresh; the ledger is
+    the authoritative admission record. A transient registry write failure (e.g.
+    the separate prober process holding the SQLite write lock) must not abort the
+    epoch and void every admitted miner's score."""
+    specs = default_specs(**{"9001": MinerSpec("a"), "9002": MinerSpec("b")})
+    runtime, _, _ = make_runtime(
+        tmp_path,
+        [("miner-a", "http://127.0.0.1:9001"), ("miner-b", "http://127.0.0.1:9002")],
+        specs,
+    )
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    runtime.registry.record_verdict = boom  # type: ignore[method-assign]
+
+    run = runtime.run_epoch(7, CANARY)
+
+    assert run.status == "complete"
+    assert dict(run.scores) == {"miner-a": 1.0, "miner-b": 1.0}
+    assert {outcome.status for outcome in run.outcomes} == {"verified"}
 
 
 def test_duplicate_endpoint_excludes_all_claimants(tmp_path: Path) -> None:

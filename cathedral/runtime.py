@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 import math
 import urllib.parse
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -24,6 +25,8 @@ from cathedral.ledger import Ledger
 from cathedral.poster import Poster
 from cathedral.remote import RemoteMiner
 from cathedral.verify import verify
+
+LOGGER = logging.getLogger(__name__)
 
 MAX_BEARER_TOKEN_LENGTH = 4096
 
@@ -406,7 +409,21 @@ class ConfidentialRuntime:
                 workload="CPU",
                 evidence_digest=result.evidence_digest,
             )
-            self.registry.record_verdict(result.target.hotkey, result.attested)
+            # Best-effort defense-in-depth refresh of the persisted chip binding.
+            # ledger.add_attestation above is the authoritative admission record,
+            # so a transient registry write failure -- e.g. the separate prober
+            # process holding the SQLite write lock -- must not propagate out of
+            # run_epoch's try block, abort the epoch, and void every miner's
+            # score. The binding is re-refreshed on the next admission or by the
+            # prober.
+            try:
+                self.registry.record_verdict(result.target.hotkey, result.attested)
+            except Exception:
+                LOGGER.warning(
+                    "record_verdict failed for %s; admission stands via ledger",
+                    result.target.hotkey,
+                    exc_info=True,
+                )
             outcomes[result.target.hotkey] = MinerOutcome(
                 result.target.hotkey, result.endpoint, "attested", admitted=True
             )
