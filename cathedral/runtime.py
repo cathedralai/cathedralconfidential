@@ -389,6 +389,15 @@ class ConfidentialRuntime:
                 continue
             result = group[0]
             assert result.attested is not None and result.evidence_digest is not None
+            rotation_owner = self.registry.chip_rotation_owner(chip_id, result.target.hotkey)
+            if rotation_owner is not None:
+                outcomes[result.target.hotkey] = MinerOutcome(
+                    result.target.hotkey,
+                    result.endpoint,
+                    "chip_rotation_conflict",
+                    error=f"chip_id already bound to hotkey {rotation_owner}",
+                )
+                continue
             self.ledger.add_attestation(
                 epoch_id,
                 result.target.hotkey,
@@ -397,6 +406,7 @@ class ConfidentialRuntime:
                 workload="CPU",
                 evidence_digest=result.evidence_digest,
             )
+            self.registry.record_verdict(result.target.hotkey, result.attested)
             outcomes[result.target.hotkey] = MinerOutcome(
                 result.target.hotkey, result.endpoint, "attested", admitted=True
             )
