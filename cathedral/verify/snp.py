@@ -118,6 +118,16 @@ def _resolve_snpguest(snpguest_path: str | os.PathLike[str] | None) -> str | Non
     return shutil.which("snpguest")
 
 
+def _snpguest_timeout() -> float:
+    """Wall-clock cap (seconds) for each ``snpguest`` subprocess so a hung binary
+    cannot wedge the verifier on the validator's scoring path. Override with
+    ``CATHEDRAL_SNPGUEST_TIMEOUT``."""
+    try:
+        return max(1.0, float(os.environ.get("CATHEDRAL_SNPGUEST_TIMEOUT", "30")))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 def _verify_chain_with_snpguest(
     report: bytes,
     *,
@@ -126,6 +136,7 @@ def _verify_chain_with_snpguest(
 ) -> bool:
     """Ask snpguest to fetch AMD certs and verify the report signature chain."""
 
+    timeout = _snpguest_timeout()
     with tempfile.TemporaryDirectory() as td:
         work = Path(td)
         report_path = work / "attestation-report.bin"
@@ -138,19 +149,21 @@ def _verify_chain_with_snpguest(
             check=True,
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
 
+        # `fetch ca` argument order varies across snpguest versions; both forms
+        # derive the CA generation (Milan/Genoa/Turin) from the report itself. A
+        # hardcoded generation fallback would fetch the wrong CA on non-Milan
+        # parts, so it is deliberately omitted (see collector fix in #16).
         ca_fetch_orders = [
             [snpguest_path, "fetch", "ca", "--report", str(report_path), "DER", str(certs_path)],
-            [snpguest_path, "fetch", "ca", "DER", str(certs_path), "turin"],
-            [snpguest_path, "fetch", "ca", "DER", str(certs_path), "genoa"],
-            [snpguest_path, "fetch", "ca", "DER", str(certs_path), "milan"],
             [snpguest_path, "fetch", "ca", "DER", str(certs_path), str(report_path)],
         ]
         last_error: subprocess.CalledProcessError | None = None
         for cmd in ca_fetch_orders:
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
                 break
             except subprocess.CalledProcessError as exc:
                 last_error = exc
@@ -163,6 +176,7 @@ def _verify_chain_with_snpguest(
             check=True,
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
 
         verify_orders = [
@@ -172,7 +186,7 @@ def _verify_chain_with_snpguest(
         last_error = None
         for cmd in verify_orders:
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
                 return True
             except subprocess.CalledProcessError as exc:
                 last_error = exc
@@ -221,7 +235,7 @@ def verify_snp_report_data(
                     certs_dir=certs_dir,
                 )
                 break
-            except (OSError, subprocess.CalledProcessError):
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 if attempt == 2:
                     return None
                 time.sleep(1)
