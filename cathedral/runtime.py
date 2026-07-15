@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 
-from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce
+from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce, is_globally_routable
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
@@ -566,7 +566,7 @@ def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:
         if config.production_mode:
             raise ValueError("production endpoint must use a public IP literal") from None
     else:
-        if config.production_mode and not ip.is_global:
+        if config.production_mode and not is_globally_routable(ip):
             raise ValueError("production endpoint must use a public address")
         host = f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
     try:
