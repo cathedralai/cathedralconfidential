@@ -26,9 +26,10 @@ verification time, and a safe reason category when it did not pass.
 `not_evaluated` has `null` for all four audit fields. There is deliberately no
 single overall-verification flag.
 
-## Version 1 schema
+## Version 2 schema
 
-The schema identifier is `cathedral_assurance_receipt_v1`.
+The schema identifier issued by the current runtime is
+`cathedral_assurance_receipt_v2`.
 
 | Field | Meaning |
 |---|---|
@@ -43,12 +44,17 @@ The schema identifier is `cathedral_assurance_receipt_v1`.
 | `channel` | Channel claim status and its evidence digest. |
 | `work` | Claim status, challenge ID, canonical workload-manifest digest, result digest, and decimal work units. Non-passing work always records `"0"`; passed work can still receive zero credit when a separate eligibility claim is unsatisfied. |
 | `assurance` | The four independent typed claims and their component digests. |
-| `lifecycle` | Receipt state. Version 1 accepts only `issued` with a `null` revocation reference. |
+| `lifecycle` | Receipt state plus the exact attested worker generation, revision, event ID, safe transition reason, and evidence-expiry boundary used for eligibility. Version 2 accepts only an eligible `attested` worker snapshot and an `issued` receipt with a `null` revocation reference. |
 | `issued_at` | UTC issuance time with exactly six fractional digits. |
 | `signing_key_id`, `signature` | Registry-anchored Ed25519 key and signature over all other receipt fields. |
 
 Unknown or missing fields fail closed. A new critical field or lifecycle state
-requires a new schema version; version 1 verifiers do not silently ignore it.
+requires a new schema version; verifiers do not silently ignore it.
+
+Historical `cathedral_assurance_receipt_v1` bytes remain verifiable. Version 1
+predates exact worker-state binding and contains only the receipt issuance
+state. The runtime no longer issues new version 1 receipts; converting or
+re-signing historical bytes is forbidden.
 
 ## Canonical bytes and durable storage
 
@@ -65,9 +71,10 @@ leaves both present or leaves the challenge unresolved with no receipt. Stored
 receipts are returned as their original bytes and are never reconstructed from
 later mutable state.
 
-The repository's deterministic golden receipt is
-[`tests/fixtures/assurance-receipt-v1.json`](../tests/fixtures/assurance-receipt-v1.json).
-Its keys and measurements are test-only.
+The repository keeps deterministic golden receipts for both the historical
+[`version 1`](../tests/fixtures/assurance-receipt-v1.json) contract and current
+[`version 2`](../tests/fixtures/assurance-receipt-v2.json) contract. Their keys
+and measurements are test-only.
 
 ## Offline verification
 

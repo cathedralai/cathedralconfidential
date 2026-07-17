@@ -31,6 +31,14 @@ from cathedral.assurance import (
     sha256_digest,
 )
 from cathedral.common import Attested, Policy
+from cathedral.lifecycle import (
+    LifecycleError,
+    LifecycleReason,
+    LifecycleSnapshot,
+    WorkerLifecycleState,
+    canonical_utc,
+    require_snapshot_reason,
+)
 from cathedral.policy_registry import (
     PolicyRegistryError,
     PolicyRegistrySnapshot,
@@ -38,7 +46,8 @@ from cathedral.policy_registry import (
 )
 
 
-RECEIPT_SCHEMA = "cathedral_assurance_receipt_v1"
+RECEIPT_SCHEMA = "cathedral_assurance_receipt_v2"
+LEGACY_RECEIPT_SCHEMA = "cathedral_assurance_receipt_v1"
 MAX_RECEIPT_BYTES = 256 * 1024
 MAX_SQLITE_INTEGER = 2**63 - 1
 MAX_TCB_ADVISORIES = 256
@@ -87,7 +96,19 @@ _CHANNEL_KEYS = frozenset({"status", "binding_digest"})
 _WORK_KEYS = frozenset(
     {"status", "challenge_id", "manifest_digest", "result_digest", "work_units"}
 )
-_LIFECYCLE_KEYS = frozenset({"state", "revocation_reference"})
+_LIFECYCLE_KEYS_V1 = frozenset({"state", "revocation_reference"})
+_LIFECYCLE_KEYS_V2 = frozenset(
+    {
+        "state",
+        "revocation_reference",
+        "worker_state",
+        "worker_generation",
+        "worker_revision",
+        "worker_event_id",
+        "worker_reason",
+        "worker_evidence_expires_at",
+    }
+)
 _SIGNATURE_KEYS = frozenset({"algorithm", "value_base64"})
 _ASSURANCE_KEYS = frozenset({"schema", "claims"})
 _CLAIM_KEYS = frozenset(
@@ -364,6 +385,7 @@ class ReceiptIssuer:
         attested: Attested,
         policy: Policy,
         assurance: AssuranceClaims,
+        worker_lifecycle: LifecycleSnapshot,
         challenge_id: str | None,
         manifest_digest: str | None,
         work_units: float,
@@ -415,6 +437,25 @@ class ReceiptIssuer:
                 "schema", "receipt assurance differs from attested assurance"
             )
         _validate_claim_times_and_policy(assurance, when, policy_digest(policy))
+        if (
+            not isinstance(worker_lifecycle, LifecycleSnapshot)
+            or worker_lifecycle.hotkey != subject_hotkey
+            or worker_lifecycle.state is not WorkerLifecycleState.ATTESTED
+            or not worker_lifecycle.eligible_at(when)
+            or worker_lifecycle.evidence_digest
+            != assurance.hardware.evidence_digest
+            or worker_lifecycle.policy_digest != assurance.software.policy_digest
+            or worker_lifecycle.policy_registry_release != policy.registry_release
+            or worker_lifecycle.policy_registry_digest != policy.registry_digest
+        ):
+            raise ReceiptError(
+                "lifecycle", "receipt worker lifecycle snapshot is not eligible"
+            )
+        evidence_expires_at = worker_lifecycle.evidence_expires_at
+        if evidence_expires_at is None:  # eligible_at() above already rejects this.
+            raise ReceiptError(
+                "lifecycle", "receipt worker lifecycle snapshot is not eligible"
+            )
         if (
             isinstance(attested.tcb, bool)
             or not isinstance(attested.tcb, int)
@@ -494,7 +535,18 @@ class ReceiptIssuer:
                 "work_units": units,
             },
             "assurance": assurance.to_dict(),
-            "lifecycle": {"state": "issued", "revocation_reference": None},
+            "lifecycle": {
+                "state": "issued",
+                "revocation_reference": None,
+                "worker_state": worker_lifecycle.state.value,
+                "worker_generation": worker_lifecycle.generation,
+                "worker_revision": worker_lifecycle.revision,
+                "worker_event_id": worker_lifecycle.event_id,
+                "worker_reason": worker_lifecycle.reason.value,
+                "worker_evidence_expires_at": canonical_utc(
+                    evidence_expires_at
+                ),
+            },
             "issued_at": when_text,
             "signing_key_id": self.signing_key_id,
         }
@@ -533,7 +585,11 @@ def verify_receipt(
         raise ReceiptError("schema", "receipt contains a non-canonical value") from exc
     if encoded != canonical_input:
         raise ReceiptError("schema", "receipt JSON is not canonical")
-    if frozenset(document) != _TOP_KEYS or document.get("schema") != RECEIPT_SCHEMA:
+    schema = document.get("schema")
+    if frozenset(document) != _TOP_KEYS or not isinstance(schema, str) or schema not in {
+        LEGACY_RECEIPT_SCHEMA,
+        RECEIPT_SCHEMA,
+    }:
         raise ReceiptError("schema", "receipt has missing, unknown, or unsupported fields")
     issued_at = _timestamp(document["issued_at"])
     for name in ("epoch_id", "source_epoch", "policy_registry_release"):
@@ -644,10 +700,44 @@ def verify_receipt(
         raise ReceiptError("schema", "receipt channel result is invalid")
     if not isinstance(work, dict) or frozenset(work) != _WORK_KEYS:
         raise ReceiptError("schema", "receipt work result is invalid")
-    if not isinstance(lifecycle, dict) or frozenset(lifecycle) != _LIFECYCLE_KEYS:
+    expected_lifecycle_keys = (
+        _LIFECYCLE_KEYS_V2 if schema == RECEIPT_SCHEMA else _LIFECYCLE_KEYS_V1
+    )
+    if (
+        not isinstance(lifecycle, dict)
+        or frozenset(lifecycle) != expected_lifecycle_keys
+    ):
         raise ReceiptError("schema", "receipt lifecycle is invalid")
-    if lifecycle != {"state": "issued", "revocation_reference": None}:
+    if (
+        lifecycle["state"] != "issued"
+        or lifecycle["revocation_reference"] is not None
+    ):
         raise ReceiptError("lifecycle", "receipt lifecycle state is unsupported")
+    if schema == RECEIPT_SCHEMA:
+        for name in ("worker_generation", "worker_revision", "worker_event_id"):
+            if (
+                isinstance(lifecycle[name], bool)
+                or not isinstance(lifecycle[name], int)
+                or not 0 < lifecycle[name] <= MAX_SQLITE_INTEGER
+            ):
+                raise ReceiptError("lifecycle", "receipt worker lifecycle id is invalid")
+        try:
+            worker_state = WorkerLifecycleState(lifecycle["worker_state"])
+            worker_reason = LifecycleReason(lifecycle["worker_reason"])
+            require_snapshot_reason(worker_state, worker_reason)
+        except (TypeError, ValueError, LifecycleError) as exc:
+            raise ReceiptError(
+                "lifecycle", "receipt worker lifecycle state is invalid"
+            ) from exc
+        worker_expires_at = _timestamp(
+            lifecycle["worker_evidence_expires_at"],
+            "receipt worker lifecycle evidence expiry",
+        )
+        if (
+            worker_state is not WorkerLifecycleState.ATTESTED
+            or worker_expires_at <= issued_at
+        ):
+            raise ReceiptError("lifecycle", "receipt worker lifecycle is not eligible")
     if (
         channel["status"] != claims.channel.status.value
         or channel["binding_digest"] != claims.channel.evidence_digest

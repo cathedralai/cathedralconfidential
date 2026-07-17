@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,6 +26,11 @@ from cathedral.assurance import (
 from cathedral.cli import _load_receipt_private_seed, cmd_receipt_verify
 from cathedral.common import Attested, Policy, Tier
 from cathedral.ledger import Ledger, LedgerError
+from cathedral.lifecycle import (
+    LifecycleReason,
+    LifecycleSnapshot,
+    WorkerLifecycleState,
+)
 from cathedral.policy_registry import (
     PolicyRegistryError,
     PolicyRegistryState,
@@ -183,6 +189,25 @@ def _attested(claims) -> Attested:
     )
 
 
+def _worker_lifecycle(policy: Policy, claims, hotkey: str) -> LifecycleSnapshot:
+    return LifecycleSnapshot(
+        hotkey=hotkey,
+        state=WorkerLifecycleState.ATTESTED,
+        generation=1,
+        revision=2,
+        event_id=2,
+        reason=LifecycleReason.ATTESTATION_VERIFIED,
+        state_changed_at=ISSUED,
+        evidence_verified_at=ISSUED,
+        evidence_expires_at=ISSUED + timedelta(hours=1),
+        measurement="tdx-measurement-sha256:sample-v1",
+        evidence_digest=claims.hardware.evidence_digest,
+        policy_digest=claims.software.policy_digest,
+        policy_registry_release=policy.registry_release,
+        policy_registry_digest=policy.registry_digest,
+    )
+
+
 def _issued_receipt(
     *,
     work_status: ClaimStatus = ClaimStatus.PASSED,
@@ -203,6 +228,7 @@ def _issued_receipt(
         attested=attested,
         policy=policy,
         assurance=claims,
+        worker_lifecycle=_worker_lifecycle(policy, claims, subject_hotkey),
         challenge_id=challenge_id,
         manifest_digest=MANIFEST_DIGEST,
         work_units=(
@@ -251,13 +277,13 @@ def test_golden_receipt_signature_canonicalization_and_offline_verification():
     assert verified.receipt_bytes == receipt.receipt_bytes
     assert verified.receipt_digest == receipt.receipt_digest
     assert receipt.receipt_id == (
-        "receipt-sha256:0277d2aa2f85999e5883f5d23ea9616ae04b881fda71daf58df3bd8c66863fec"
+        "receipt-sha256:b0a9956a73816a273cf3d23677357df3eec78aaf101753cfd651f51111e4b344"
     )
     assert receipt.receipt_digest == (
-        "sha256:324e74c499114a083786c3d678a2fad29a149d9994992a623a4a9bc3cf7b04d0"
+        "sha256:82748edd31b321883703473ab0fb05b06f74a8fbdca3b0acd569314f45997ffc"
     )
     assert (
-        Path("tests/fixtures/assurance-receipt-v1.json").read_bytes().rstrip(b"\n")
+        Path("tests/fixtures/assurance-receipt-v2.json").read_bytes().rstrip(b"\n")
         == receipt.receipt_bytes
     )
     assert receipt.document["work"]["work_units"] == "3.5"
@@ -266,10 +292,30 @@ def test_golden_receipt_signature_canonicalization_and_offline_verification():
     )
 
 
+def test_historical_v1_receipt_remains_offline_verifiable():
+    receipt_bytes = Path("tests/fixtures/assurance-receipt-v1.json").read_bytes().rstrip(
+        b"\n"
+    )
+    verified = verify_receipt(receipt_bytes, _snapshot())
+    assert verified.document["schema"] == "cathedral_assurance_receipt_v1"
+    assert verified.receipt_id == (
+        "receipt-sha256:0277d2aa2f85999e5883f5d23ea9616ae04b881fda71daf58df3bd8c66863fec"
+    )
+
+
+def test_v2_receipt_rejects_a_known_reason_for_the_wrong_worker_state():
+    snapshot, _policy, _claims_value, receipt = _issued_receipt()
+    document = json.loads(receipt.receipt_bytes)
+    document["lifecycle"]["worker_reason"] = "enrolled"
+
+    with pytest.raises(ReceiptError, match="lifecycle state is invalid"):
+        verify_receipt(_resign(document), snapshot)
+
+
 @pytest.mark.parametrize(
     ("field", "mutation"),
     [
-        ("schema", lambda value: value.update(schema="cathedral_assurance_receipt_v2")),
+        ("schema", lambda value: value.update(schema="cathedral_assurance_receipt_v3")),
         ("receipt_id", lambda value: value.update(receipt_id="receipt-sha256:" + "0" * 64)),
         ("epoch_id", lambda value: value.update(epoch_id=8)),
         ("source_epoch", lambda value: value.update(source_epoch=12)),
@@ -298,6 +344,10 @@ def test_golden_receipt_signature_canonicalization_and_offline_verification():
             ),
         ),
         ("lifecycle", lambda value: value["lifecycle"].update(state="revoked")),
+        (
+            "lifecycle_reason",
+            lambda value: value["lifecycle"].update(worker_reason="enrolled"),
+        ),
         ("issued_at", lambda value: value.update(issued_at="2026-07-17T12:00:01.000000Z")),
         ("signing_key_id", lambda value: value.update(signing_key_id="unknown-key")),
         (
@@ -332,7 +382,12 @@ def test_duplicate_unknown_version_float_and_oversized_receipts_fail_closed():
         verify_receipt(canonical_json(document), snapshot)
 
     document = json.loads(receipt.receipt_bytes)
-    document["schema"] = "cathedral_assurance_receipt_v2"
+    document["schema"] = "cathedral_assurance_receipt_v3"
+    with pytest.raises(ReceiptError, match="unsupported"):
+        verify_receipt(canonical_json(document), snapshot)
+
+    document = json.loads(receipt.receipt_bytes)
+    document["schema"] = []
     with pytest.raises(ReceiptError, match="unsupported"):
         verify_receipt(canonical_json(document), snapshot)
 
@@ -493,6 +548,7 @@ def test_unknown_and_expired_receipt_signing_keys_fail_closed():
             attested=_attested(claims),
             policy=policy,
             assurance=claims,
+            worker_lifecycle=_worker_lifecycle(policy, claims, "public-hotkey"),
             challenge_id=CHALLENGE_ID,
             manifest_digest=MANIFEST_DIGEST,
             work_units=3.5,
@@ -506,6 +562,7 @@ def test_unknown_and_expired_receipt_signing_keys_fail_closed():
         attested=_attested(claims),
         policy=policy,
         assurance=claims,
+        worker_lifecycle=_worker_lifecycle(policy, claims, "public-hotkey"),
         challenge_id=CHALLENGE_ID,
         manifest_digest=MANIFEST_DIGEST,
         work_units=3.5,
@@ -513,6 +570,9 @@ def test_unknown_and_expired_receipt_signing_keys_fail_closed():
     )
     expired = json.loads(valid.receipt_bytes)
     expired["issued_at"] = "2026-07-18T00:00:00.000000Z"
+    expired["lifecycle"]["worker_evidence_expires_at"] = (
+        "2026-07-18T01:00:00.000000Z"
+    )
     with pytest.raises(ReceiptError, match="out of window"):
         verify_receipt(_resign(expired), expiring_snapshot)
 
@@ -569,7 +629,7 @@ def test_receipt_bytes_persist_atomically_with_work_resolution(tmp_path: Path):
         policy_registry_release=snapshot.release,
         policy_registry_digest=snapshot.digest,
     )
-    _snapshot_value, _policy, _claims_value, receipt = _issued_receipt(
+    _snapshot_value, receipt_policy, receipt_claims, receipt = _issued_receipt(
         epoch_id=epoch_id
     )
     ledger.issue_challenge(CHALLENGE_ID, "public-hotkey", epoch_id)
@@ -587,6 +647,11 @@ def test_receipt_bytes_persist_atomically_with_work_resolution(tmp_path: Path):
     assert stored is not None
     assert stored["receipt_body"] == receipt.receipt_bytes
     assert stored["receipt_digest"] == receipt.receipt_digest
+    ledger.add_lifecycle_snapshot(
+        epoch_id,
+        _worker_lifecycle(receipt_policy, receipt_claims, "public-hotkey"),
+        snapshot_at=ISSUED_TEXT,
+    )
 
     eligibility_zero = "f" * 64
     ledger.issue_challenge(eligibility_zero, "eligibility-zero", epoch_id)
@@ -636,6 +701,31 @@ def test_receipt_bytes_persist_atomically_with_work_resolution(tmp_path: Path):
     ).fetchone()
     assert challenge["status"] == "issued"
     assert ledger.receipt_for_challenge(second) is None
+
+
+def test_epoch_snapshot_must_match_the_exact_lifecycle_signed_in_receipt(tmp_path: Path):
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    epoch_id = ledger.begin_epoch(11)
+    _snapshot_value, policy, claims, receipt = _issued_receipt(epoch_id=epoch_id)
+    ledger.issue_challenge(CHALLENGE_ID, "public-hotkey", epoch_id)
+    ledger.resolve_challenge_with_receipt(
+        CHALLENGE_ID,
+        "verified",
+        3.5,
+        validator_derived=True,
+        receipt_id=receipt.receipt_id,
+        receipt_body=receipt.receipt_bytes,
+        receipt_digest=receipt.receipt_digest,
+        issued_at=ISSUED_TEXT,
+    )
+    mismatched = replace(
+        _worker_lifecycle(policy, claims, "public-hotkey"),
+        revision=3,
+        event_id=3,
+    )
+
+    with pytest.raises(LedgerError, match="does not match"):
+        ledger.add_lifecycle_snapshot(epoch_id, mismatched, snapshot_at=ISSUED_TEXT)
 
 
 def test_offline_cli_returns_machine_readable_verification_categories(

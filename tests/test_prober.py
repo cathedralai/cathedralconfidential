@@ -14,6 +14,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import cathedral.prober as prober_module
 from cathedral.assurance import attestation_claims
 from cathedral.common import (
     Attested,
@@ -25,6 +26,7 @@ from cathedral.common import (
     Tier,
 )
 from cathedral.enroll import RegistryStore
+from cathedral.lifecycle import WorkerLifecycleState
 from cathedral.prober import policy_from_args, probe_once
 
 
@@ -152,6 +154,50 @@ def test_prober_verified_tdx_evidence(monkeypatch, tmp_path):
     assert board["miners"][0]["verification_status"] == "VERIFIED"
     assert board["miners"][0]["tier"] == Tier.CC_CPU_TDX.value
     assert board["miners"][0]["chip_id_prefix"] == TDX_CHIP_ID[:16]
+
+
+def test_prober_transient_failure_recovers_without_manual_reenrollment(
+    monkeypatch, tmp_path
+):
+    server = _serve(TdxMiner)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = TdxMiner.hotkey
+    store.enroll(hotkey, f"http://127.0.0.1:{server.server_port}")
+    original_request = prober_module._request_evidence
+    calls = 0
+
+    def flaky_request(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("temporary timeout")
+        return original_request(*args, **kwargs)
+
+    monkeypatch.setattr(prober_module, "_request_evidence", flaky_request)
+    monkeypatch.setattr("cathedral.prober.verifier.verify", _fake_tdx_verify)
+
+    probe_once(store, Policy())
+    pending = store.lifecycle_snapshot(hotkey)
+    assert pending.state is WorkerLifecycleState.PENDING
+    assert pending.retry_count == 1
+    assert store.board()["miners"][0]["verification_status"] == "FAILED"
+
+    # Polling before the durable retry is due does not make another request.
+    probe_once(store, Policy())
+    assert calls == 1
+
+    # Once the persisted retry becomes due, a successful probe can recover the
+    # pending worker without manual reenrollment.
+    pending_retry = pending.next_retry_at
+    assert pending_retry is not None
+    store._clock = lambda: pending_retry
+    probe_once(store, Policy())
+    server.shutdown()
+
+    recovered = store.lifecycle_snapshot(hotkey)
+    assert recovered.state is WorkerLifecycleState.ATTESTED
+    assert recovered.retry_count == 0
+    assert store.board()["miners"][0]["verification_status"] == "VERIFIED"
 
 
 def test_prober_rejects_verified_flag_without_typed_assurance(monkeypatch, tmp_path):

@@ -18,11 +18,12 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urlparse
 from wsgiref.simple_server import make_server
 
@@ -33,6 +34,19 @@ from cathedral.assurance import (
     empty_assurance_claims,
 )
 from cathedral.common import Attested
+from cathedral.lifecycle import (
+    NETWORK_ELIGIBLE_STATES,
+    TERMINAL_STATES,
+    LifecycleError,
+    LifecycleReason,
+    LifecycleSnapshot,
+    WorkerLifecycleState,
+    canonical_utc,
+    parse_utc,
+    require_transition,
+    require_transition_reason,
+    retry_delay_seconds,
+)
 
 try:
     from substrateinterface import Keypair
@@ -288,21 +302,46 @@ class Enrollment:
 
 
 class RegistryStore:
-    def __init__(self, path: str, *, verification_ttl_seconds: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        verification_ttl_seconds: int | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.path = path
         if verification_ttl_seconds is None:
             verification_ttl_seconds = _positive_int_from_env(
                 VERIFICATION_TTL_ENV,
                 DEFAULT_VERIFICATION_TTL_SECONDS,
             )
-        if verification_ttl_seconds <= 0:
+        if (
+            isinstance(verification_ttl_seconds, bool)
+            or not isinstance(verification_ttl_seconds, int)
+            or verification_ttl_seconds <= 0
+        ):
             raise ValueError("verification_ttl_seconds must be positive")
         self.verification_ttl_seconds = verification_ttl_seconds
+        if clock is not None and not callable(clock):
+            raise ValueError("clock must be callable")
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._lifecycle_lock = threading.RLock()
         self._init()
+
+    def _lifecycle_now(self) -> datetime:
+        when = self._clock()
+        if (
+            not isinstance(when, datetime)
+            or when.tzinfo is None
+            or when.utcoffset() != timedelta(0)
+        ):
+            raise LifecycleError("worker lifecycle clock must return UTC")
+        return when
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init(self) -> None:
@@ -366,10 +405,865 @@ class RegistryStore:
                 ON hotkey_enroll_attempts(hotkey, attempted_at_iso)
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worker_lifecycle_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    hotkey TEXT NOT NULL REFERENCES enrollments(hotkey),
+                    generation INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    from_state TEXT,
+                    to_state TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    evidence_verified_at TEXT,
+                    evidence_expires_at TEXT,
+                    measurement TEXT,
+                    evidence_digest TEXT,
+                    policy_digest TEXT,
+                    policy_registry_release INTEGER,
+                    policy_registry_digest TEXT,
+                    retry_count INTEGER NOT NULL,
+                    next_retry_at TEXT,
+                    operator_detail TEXT,
+                    UNIQUE(hotkey, generation, revision)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worker_lifecycle_current (
+                    hotkey TEXT PRIMARY KEY REFERENCES enrollments(hotkey),
+                    state TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    event_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    state_changed_at TEXT NOT NULL,
+                    evidence_verified_at TEXT,
+                    evidence_expires_at TEXT,
+                    measurement TEXT,
+                    evidence_digest TEXT,
+                    policy_digest TEXT,
+                    policy_registry_release INTEGER,
+                    policy_registry_digest TEXT,
+                    retry_count INTEGER NOT NULL,
+                    next_retry_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS worker_lifecycle_events_no_update
+                BEFORE UPDATE ON worker_lifecycle_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'worker lifecycle events are append-only');
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS worker_lifecycle_events_no_delete
+                BEFORE DELETE ON worker_lifecycle_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'worker lifecycle events are append-only');
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS worker_lifecycle_due_idx
+                ON worker_lifecycle_current(state, next_retry_at, evidence_expires_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worker_lifecycle_clock (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            self._backfill_lifecycle(conn)
+
+    def _advance_lifecycle_clock(
+        self, conn: sqlite3.Connection, when: datetime
+    ) -> None:
+        encoded = canonical_utc(when)
+        row = conn.execute(
+            "SELECT last_seen_at FROM worker_lifecycle_clock WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            latest = conn.execute(
+                "SELECT MAX(state_changed_at) FROM worker_lifecycle_current"
+            ).fetchone()[0]
+            if isinstance(latest, str) and parse_utc(latest) > when:
+                encoded = latest
+            conn.execute(
+                "INSERT INTO worker_lifecycle_clock(singleton, last_seen_at) VALUES (1, ?)",
+                (encoded,),
+            )
+            if encoded != canonical_utc(when):
+                raise LifecycleError("worker lifecycle clock moved backwards")
+            return
+        last_seen = parse_utc(row["last_seen_at"])
+        if when < last_seen:
+            raise LifecycleError("worker lifecycle clock moved backwards")
+        if when > last_seen:
+            conn.execute(
+                "UPDATE worker_lifecycle_clock SET last_seen_at = ? WHERE singleton = 1",
+                (encoded,),
+            )
+
+    def _backfill_lifecycle(self, conn: sqlite3.Connection) -> None:
+        when = self._lifecycle_now()
+        self._advance_lifecycle_clock(conn, when)
+        rows = conn.execute(
+            """
+            SELECT e.hotkey, a.verification_status, a.last_verified_iso,
+                   a.assurance_json
+            FROM enrollments e
+            LEFT JOIN attestations a ON a.hotkey = e.hotkey
+            LEFT JOIN worker_lifecycle_current c ON c.hotkey = e.hotkey
+            WHERE c.hotkey IS NULL
+            ORDER BY e.hotkey
+            """
+        ).fetchall()
+        for row in rows:
+            state = WorkerLifecycleState.PENDING
+            reason = LifecycleReason.BACKFILL_PENDING
+            evidence_at = None
+            expires_at = None
+            evidence_digest = None
+            policy_digest = None
+            if row["verification_status"] == "VERIFIED":
+                try:
+                    evidence_at = _parse_iso_utc(row["last_verified_iso"])
+                except (TypeError, ValueError):
+                    state = WorkerLifecycleState.STALE
+                    reason = LifecycleReason.BACKFILL_STALE
+                else:
+                    expires_at = evidence_at + timedelta(
+                        seconds=self.verification_ttl_seconds
+                    )
+                    # Historical rows did not persist the exact measurement,
+                    # so migration cannot prove current policy eligibility even
+                    # when their old timestamp is still inside the TTL.
+                    state = WorkerLifecycleState.STALE
+                    reason = LifecycleReason.BACKFILL_STALE
+                    assurance = self._stored_assurance(row["assurance_json"])
+                    evidence_digest = assurance.hardware.evidence_digest
+                    policy_digest = assurance.software.policy_digest
+                    if not ATTESTATION_ADMISSION_POLICY.allows(assurance):
+                        state = WorkerLifecycleState.FAILED
+                        reason = LifecycleReason.VERIFICATION_FAILED
+            elif row["verification_status"] is not None:
+                state = WorkerLifecycleState.FAILED
+                reason = LifecycleReason.VERIFICATION_FAILED
+            self._insert_initial_lifecycle(
+                conn,
+                row["hotkey"],
+                state,
+                reason,
+                when,
+                evidence_verified_at=evidence_at,
+                evidence_expires_at=expires_at,
+                evidence_digest=evidence_digest,
+                policy_digest=policy_digest,
+            )
+
+    def _insert_initial_lifecycle(
+        self,
+        conn: sqlite3.Connection,
+        hotkey: str,
+        state: WorkerLifecycleState,
+        reason: LifecycleReason,
+        when: datetime,
+        *,
+        evidence_verified_at: datetime | None = None,
+        evidence_expires_at: datetime | None = None,
+        evidence_digest: str | None = None,
+        policy_digest: str | None = None,
+    ) -> None:
+        occurred = canonical_utc(when)
+        evidence_text = (
+            canonical_utc(evidence_verified_at)
+            if evidence_verified_at is not None
+            else None
+        )
+        expires_text = (
+            canonical_utc(evidence_expires_at)
+            if evidence_expires_at is not None
+            else None
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO worker_lifecycle_events(
+                hotkey, generation, revision, from_state, to_state, reason,
+                occurred_at, evidence_verified_at, evidence_expires_at,
+                measurement, evidence_digest, policy_digest,
+                policy_registry_release, policy_registry_digest, retry_count,
+                next_retry_at, operator_detail
+            ) VALUES (?, 1, 1, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, NULL, NULL)
+            """,
+            (
+                hotkey,
+                state.value,
+                reason.value,
+                occurred,
+                evidence_text,
+                expires_text,
+                evidence_digest,
+                policy_digest,
+            ),
+        )
+        event_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO worker_lifecycle_current(
+                hotkey, state, generation, revision, event_id, reason,
+                state_changed_at, evidence_verified_at, evidence_expires_at,
+                measurement, evidence_digest, policy_digest,
+                policy_registry_release, policy_registry_digest, retry_count,
+                next_retry_at
+            ) VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, 0, NULL)
+            """,
+            (
+                hotkey,
+                state.value,
+                event_id,
+                reason.value,
+                occurred,
+                evidence_text,
+                expires_text,
+                evidence_digest,
+                policy_digest,
+            ),
+        )
+
+    @staticmethod
+    def _lifecycle_snapshot_from_row(row: sqlite3.Row) -> LifecycleSnapshot:
+        try:
+            return LifecycleSnapshot(
+                hotkey=row["hotkey"],
+                state=WorkerLifecycleState(row["state"]),
+                generation=int(row["generation"]),
+                revision=int(row["revision"]),
+                event_id=int(row["event_id"]),
+                reason=LifecycleReason(row["reason"]),
+                state_changed_at=parse_utc(row["state_changed_at"]),
+                evidence_verified_at=(
+                    parse_utc(row["evidence_verified_at"])
+                    if row["evidence_verified_at"] is not None
+                    else None
+                ),
+                evidence_expires_at=(
+                    parse_utc(row["evidence_expires_at"])
+                    if row["evidence_expires_at"] is not None
+                    else None
+                ),
+                measurement=row["measurement"],
+                evidence_digest=row["evidence_digest"],
+                policy_digest=row["policy_digest"],
+                policy_registry_release=row["policy_registry_release"],
+                policy_registry_digest=row["policy_registry_digest"],
+                retry_count=int(row["retry_count"]),
+                next_retry_at=(
+                    parse_utc(row["next_retry_at"])
+                    if row["next_retry_at"] is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError, LifecycleError) as exc:
+            raise LifecycleError("persisted worker lifecycle state is invalid") from exc
+
+    def _lifecycle_row(
+        self, conn: sqlite3.Connection, hotkey: str
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT * FROM worker_lifecycle_current WHERE hotkey = ?", (hotkey,)
+        ).fetchone()
+        if row is None:
+            raise LifecycleError(f"worker {hotkey!r} has no lifecycle state")
+        return row
+
+    def _transition_lifecycle_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        hotkey: str,
+        target: WorkerLifecycleState,
+        reason: LifecycleReason,
+        when: datetime,
+        *,
+        evidence_verified_at: datetime | None = None,
+        evidence_expires_at: datetime | None = None,
+        measurement: str | None = None,
+        evidence_digest: str | None = None,
+        policy_digest: str | None = None,
+        policy_registry_release: int | None = None,
+        policy_registry_digest: str | None = None,
+        retry_count: int | None = None,
+        next_retry_at: datetime | None = None,
+        operator_detail: str | None = None,
+        expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        inherit_policy_registry: bool = True,
+    ) -> LifecycleSnapshot:
+        if not isinstance(target, WorkerLifecycleState) or not isinstance(
+            reason, LifecycleReason
+        ):
+            raise LifecycleError("worker lifecycle transition metadata is invalid")
+        for value in (expected_generation, expected_revision):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise LifecycleError("worker lifecycle expectation is invalid")
+        if (policy_registry_release is None) != (policy_registry_digest is None):
+            raise LifecycleError(
+                "worker lifecycle policy registry reference is invalid"
+            )
+        self._advance_lifecycle_clock(conn, when)
+        current = self._lifecycle_snapshot_from_row(
+            self._lifecycle_row(conn, hotkey)
+        )
+        if expected_generation is not None and current.generation != expected_generation:
+            raise LifecycleError("worker lifecycle generation changed")
+        if expected_revision is not None and current.revision != expected_revision:
+            raise LifecycleError("worker lifecycle revision changed")
+        if when < current.state_changed_at:
+            raise LifecycleError("worker lifecycle transition time moved backwards")
+        require_transition(current.state, target)
+        require_transition_reason(target, reason)
+        verified_at = (
+            evidence_verified_at
+            if evidence_verified_at is not None
+            else current.evidence_verified_at
+        )
+        expires_at = (
+            evidence_expires_at
+            if evidence_expires_at is not None
+            else current.evidence_expires_at
+        )
+        chosen_measurement = measurement if measurement is not None else current.measurement
+        chosen_evidence = (
+            evidence_digest if evidence_digest is not None else current.evidence_digest
+        )
+        chosen_policy = policy_digest if policy_digest is not None else current.policy_digest
+        if inherit_policy_registry and policy_registry_release is None:
+            chosen_release = current.policy_registry_release
+            chosen_registry_digest = current.policy_registry_digest
+        else:
+            chosen_release = policy_registry_release
+            chosen_registry_digest = policy_registry_digest
+        retries = current.retry_count if retry_count is None else retry_count
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise LifecycleError("worker lifecycle retry count is invalid")
+        if target is WorkerLifecycleState.ATTESTED:
+            if (
+                verified_at is None
+                or expires_at is None
+                or verified_at > when
+                or expires_at <= when
+                or not isinstance(chosen_measurement, str)
+                or not chosen_measurement
+                or not isinstance(chosen_evidence, str)
+                or not isinstance(chosen_policy, str)
+            ):
+                raise LifecycleError("attested lifecycle state requires fresh evidence")
+            if reason is LifecycleReason.ATTESTATION_VERIFIED:
+                retries = 0
+                next_retry_at = None
+        if target in TERMINAL_STATES or target is WorkerLifecycleState.FAILED:
+            next_retry_at = None
+        if next_retry_at is not None and next_retry_at < when:
+            raise LifecycleError("worker lifecycle retry cannot be scheduled in the past")
+        detail = operator_detail.strip()[:300] if isinstance(operator_detail, str) else None
+        revision = current.revision + 1
+        occurred = canonical_utc(when)
+        values = {
+            "hotkey": hotkey,
+            "generation": current.generation,
+            "revision": revision,
+            "from_state": current.state.value,
+            "to_state": target.value,
+            "reason": reason.value,
+            "occurred_at": occurred,
+            "evidence_verified_at": canonical_utc(verified_at) if verified_at else None,
+            "evidence_expires_at": canonical_utc(expires_at) if expires_at else None,
+            "measurement": chosen_measurement,
+            "evidence_digest": chosen_evidence,
+            "policy_digest": chosen_policy,
+            "policy_registry_release": chosen_release,
+            "policy_registry_digest": chosen_registry_digest,
+            "retry_count": retries,
+            "next_retry_at": canonical_utc(next_retry_at) if next_retry_at else None,
+            "operator_detail": detail,
+        }
+        cursor = conn.execute(
+            """
+            INSERT INTO worker_lifecycle_events(
+                hotkey, generation, revision, from_state, to_state, reason,
+                occurred_at, evidence_verified_at, evidence_expires_at,
+                measurement, evidence_digest, policy_digest,
+                policy_registry_release, policy_registry_digest, retry_count,
+                next_retry_at, operator_detail
+            ) VALUES (
+                :hotkey, :generation, :revision, :from_state, :to_state, :reason,
+                :occurred_at, :evidence_verified_at, :evidence_expires_at,
+                :measurement, :evidence_digest, :policy_digest,
+                :policy_registry_release, :policy_registry_digest, :retry_count,
+                :next_retry_at, :operator_detail
+            )
+            """,
+            values,
+        )
+        event_id = int(cursor.lastrowid)
+        updated = conn.execute(
+            """
+            UPDATE worker_lifecycle_current SET
+                state=:to_state, revision=:revision, event_id=:event_id,
+                reason=:reason, state_changed_at=:occurred_at,
+                evidence_verified_at=:evidence_verified_at,
+                evidence_expires_at=:evidence_expires_at,
+                measurement=:measurement, evidence_digest=:evidence_digest,
+                policy_digest=:policy_digest,
+                policy_registry_release=:policy_registry_release,
+                policy_registry_digest=:policy_registry_digest,
+                retry_count=:retry_count, next_retry_at=:next_retry_at
+            WHERE hotkey=:hotkey AND generation=:generation
+              AND revision=:prior_revision
+            """,
+            {**values, "event_id": event_id, "prior_revision": current.revision},
+        )
+        if updated.rowcount != 1:
+            raise LifecycleError("concurrent worker lifecycle transition rejected")
+        return self._lifecycle_snapshot_from_row(
+            self._lifecycle_row(conn, hotkey)
+        )
+
+    def transition_lifecycle(
+        self,
+        hotkey: str,
+        target: WorkerLifecycleState,
+        reason: LifecycleReason,
+        *,
+        at: datetime | None = None,
+        expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        operator_detail: str | None = None,
+    ) -> LifecycleSnapshot:
+        with self._lifecycle_lock, self._connect() as conn:
+            when = at or self._lifecycle_now()
+            conn.execute("BEGIN IMMEDIATE")
+            return self._transition_lifecycle_in_connection(
+                conn,
+                hotkey,
+                target,
+                reason,
+                when,
+                expected_generation=expected_generation,
+                expected_revision=expected_revision,
+                operator_detail=operator_detail,
+            )
+
+    def _materialize_expiry_in_connection(
+        self, conn: sqlite3.Connection, hotkey: str, when: datetime
+    ) -> LifecycleSnapshot:
+        current = self._lifecycle_snapshot_from_row(
+            self._lifecycle_row(conn, hotkey)
+        )
+        if (
+            current.state is WorkerLifecycleState.ATTESTED
+            and current.evidence_expires_at is not None
+            and when >= current.evidence_expires_at
+        ):
+            return self._transition_lifecycle_in_connection(
+                conn,
+                hotkey,
+                WorkerLifecycleState.STALE,
+                LifecycleReason.EVIDENCE_EXPIRED,
+                when,
+                expected_generation=current.generation,
+                expected_revision=current.revision,
+            )
+        return current
+
+    def lifecycle_snapshot(
+        self,
+        hotkey: str,
+        *,
+        at: datetime | None = None,
+        materialize_freshness: bool = True,
+    ) -> LifecycleSnapshot:
+        with self._lifecycle_lock, self._connect() as conn:
+            when = at or self._lifecycle_now()
+            conn.execute("BEGIN IMMEDIATE")
+            self._advance_lifecycle_clock(conn, when)
+            if materialize_freshness:
+                return self._materialize_expiry_in_connection(conn, hotkey, when)
+            return self._lifecycle_snapshot_from_row(
+                self._lifecycle_row(conn, hotkey)
+            )
+
+    def record_attested_lifecycle(
+        self,
+        hotkey: str,
+        attested: Attested,
+        *,
+        at: datetime | None = None,
+        policy_registry_release: int | None = None,
+        policy_registry_digest: str | None = None,
+        expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> LifecycleSnapshot:
+        if not ATTESTATION_ADMISSION_POLICY.allows(attested.assurance):
+            raise LifecycleError("attested lifecycle update requires typed admission claims")
+        assert attested.assurance is not None
+        verified_raw = attested.assurance.hardware.verified_at
+        if not isinstance(verified_raw, str):
+            raise LifecycleError("attested lifecycle update requires verification time")
+        verified_at = _parse_iso_utc(verified_raw)
+        expires_at = verified_at + timedelta(seconds=self.verification_ttl_seconds)
+
+        def apply(conn: sqlite3.Connection, when: datetime) -> LifecycleSnapshot:
+            if expires_at <= when:
+                raise LifecycleError("attested lifecycle update evidence is already stale")
+            return self._transition_lifecycle_in_connection(
+                conn,
+                hotkey,
+                WorkerLifecycleState.ATTESTED,
+                LifecycleReason.ATTESTATION_VERIFIED,
+                when,
+                evidence_verified_at=verified_at,
+                evidence_expires_at=expires_at,
+                measurement=attested.measurement,
+                evidence_digest=attested.assurance.hardware.evidence_digest,
+                policy_digest=attested.assurance.software.policy_digest,
+                policy_registry_release=policy_registry_release,
+                policy_registry_digest=policy_registry_digest,
+                retry_count=0,
+                expected_generation=expected_generation,
+                expected_revision=expected_revision,
+                inherit_policy_registry=False,
+            )
+
+        if connection is not None:
+            return apply(connection, at or self._lifecycle_now())
+        with self._lifecycle_lock, self._connect() as conn:
+            when = at or self._lifecycle_now()
+            conn.execute("BEGIN IMMEDIATE")
+            return apply(conn, when)
+
+    def record_refresh_failure(
+        self,
+        hotkey: str,
+        *,
+        attempt: int,
+        maximum_attempts: int,
+        at: datetime | None = None,
+        retry_base_seconds: int = 5,
+        retry_maximum_seconds: int = 300,
+        retry_jitter_seconds: int = 5,
+        operator_detail: str | None = None,
+        expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> LifecycleSnapshot:
+        if (
+            isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or isinstance(maximum_attempts, bool)
+            or not isinstance(maximum_attempts, int)
+            or not 1 <= attempt <= maximum_attempts <= 32
+        ):
+            raise LifecycleError("worker lifecycle retry attempt is invalid")
+
+        def apply(conn: sqlite3.Connection, when: datetime) -> LifecycleSnapshot:
+            self._advance_lifecycle_clock(conn, when)
+            current = self._lifecycle_snapshot_from_row(
+                self._lifecycle_row(conn, hotkey)
+            )
+            if expected_generation is not None and current.generation != expected_generation:
+                raise LifecycleError("worker lifecycle generation changed")
+            if expected_revision is not None and current.revision != expected_revision:
+                raise LifecycleError("worker lifecycle revision changed")
+            if current.state in TERMINAL_STATES or current.state in {
+                WorkerLifecycleState.RETIRING,
+                WorkerLifecycleState.FAILED,
+            }:
+                return current
+            exhausted = attempt == maximum_attempts
+            if exhausted:
+                target = WorkerLifecycleState.FAILED
+                reason = LifecycleReason.RETRY_EXHAUSTED
+                next_retry = None
+            else:
+                if (
+                    current.state is WorkerLifecycleState.ATTESTED
+                    and current.evidence_expires_at is not None
+                    and when < current.evidence_expires_at
+                ):
+                    target = WorkerLifecycleState.ATTESTED
+                elif current.state is WorkerLifecycleState.PENDING:
+                    target = WorkerLifecycleState.PENDING
+                else:
+                    target = WorkerLifecycleState.STALE
+                reason = LifecycleReason.REFRESH_RETRY
+                next_retry = when + timedelta(
+                    seconds=retry_delay_seconds(
+                        hotkey,
+                        current.generation,
+                        attempt,
+                        base_seconds=retry_base_seconds,
+                        maximum_seconds=retry_maximum_seconds,
+                        jitter_seconds=retry_jitter_seconds,
+                    )
+                )
+            return self._transition_lifecycle_in_connection(
+                conn,
+                hotkey,
+                target,
+                reason,
+                when,
+                retry_count=attempt,
+                next_retry_at=next_retry,
+                operator_detail=operator_detail,
+                expected_generation=expected_generation,
+                expected_revision=expected_revision,
+            )
+
+        if connection is not None:
+            return apply(connection, at or self._lifecycle_now())
+        with self._lifecycle_lock, self._connect() as conn:
+            when = at or self._lifecycle_now()
+            conn.execute("BEGIN IMMEDIATE")
+            return apply(conn, when)
+
+    def due_refreshes(
+        self,
+        *,
+        at: datetime | None = None,
+        refresh_ahead_seconds: int = 60,
+    ) -> tuple[LifecycleSnapshot, ...]:
+        if (
+            isinstance(refresh_ahead_seconds, bool)
+            or not isinstance(refresh_ahead_seconds, int)
+            or refresh_ahead_seconds < 0
+        ):
+            raise LifecycleError("refresh-ahead window is invalid")
+        with self._lifecycle_lock, self._connect() as conn:
+            when = at or self._lifecycle_now()
+            horizon = when + timedelta(seconds=refresh_ahead_seconds)
+            conn.execute("BEGIN IMMEDIATE")
+            self._advance_lifecycle_clock(conn, when)
+            rows = conn.execute(
+                "SELECT hotkey FROM worker_lifecycle_current ORDER BY hotkey"
+            ).fetchall()
+            snapshots = [
+                self._materialize_expiry_in_connection(conn, row["hotkey"], when)
+                for row in rows
+            ]
+            return tuple(
+                snapshot
+                for snapshot in snapshots
+                if snapshot.state in NETWORK_ELIGIBLE_STATES
+                and (
+                    snapshot.next_retry_at is None
+                    or snapshot.next_retry_at <= when
+                )
+                and (
+                    snapshot.evidence_expires_at is None
+                    or snapshot.evidence_expires_at <= horizon
+                )
+            )
+
+    def apply_lifecycle_policy(
+        self,
+        allowed_measurements: set[str] | frozenset[str],
+        *,
+        at: datetime | None = None,
+        policy_registry_release: int | None = None,
+        policy_registry_digest: str | None = None,
+    ) -> tuple[LifecycleSnapshot, ...]:
+        if (
+            not isinstance(allowed_measurements, (set, frozenset))
+            or any(
+                not isinstance(measurement, str) or not measurement
+                for measurement in allowed_measurements
+            )
+        ):
+            raise LifecycleError("lifecycle measurement policy is invalid")
+        revoked: list[LifecycleSnapshot] = []
+        with self._lifecycle_lock, self._connect() as conn:
+            when = at or self._lifecycle_now()
+            conn.execute("BEGIN IMMEDIATE")
+            self._advance_lifecycle_clock(conn, when)
+            rows = conn.execute(
+                "SELECT * FROM worker_lifecycle_current ORDER BY hotkey"
+            ).fetchall()
+            for row in rows:
+                current = self._lifecycle_snapshot_from_row(row)
+                if (
+                    current.state in NETWORK_ELIGIBLE_STATES
+                    and current.measurement is not None
+                    and current.measurement not in allowed_measurements
+                ):
+                    revoked.append(
+                        self._transition_lifecycle_in_connection(
+                            conn,
+                            current.hotkey,
+                            WorkerLifecycleState.REVOKED,
+                            LifecycleReason.POLICY_REVOKED,
+                            when,
+                            policy_registry_release=policy_registry_release,
+                            policy_registry_digest=policy_registry_digest,
+                            expected_generation=current.generation,
+                            expected_revision=current.revision,
+                        )
+                    )
+        return tuple(revoked)
+
+    def reenroll_lifecycle(
+        self,
+        hotkey: str,
+        *,
+        reason: LifecycleReason = LifecycleReason.REENROLLED,
+        at: datetime | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> LifecycleSnapshot:
+        if reason not in {LifecycleReason.REENROLLED, LifecycleReason.ENDPOINT_CHANGED}:
+            raise LifecycleError("reenrollment lifecycle reason is invalid")
+        def apply(conn: sqlite3.Connection, when: datetime) -> LifecycleSnapshot:
+            self._advance_lifecycle_clock(conn, when)
+            current = self._lifecycle_snapshot_from_row(
+                self._lifecycle_row(conn, hotkey)
+            )
+            generation = current.generation + 1
+            occurred = canonical_utc(when)
+            cursor = conn.execute(
+                """
+                INSERT INTO worker_lifecycle_events(
+                    hotkey, generation, revision, from_state, to_state, reason,
+                    occurred_at, evidence_verified_at, evidence_expires_at,
+                    measurement, evidence_digest, policy_digest,
+                    policy_registry_release, policy_registry_digest, retry_count,
+                    next_retry_at, operator_detail
+                ) VALUES (?, ?, 1, ?, 'pending', ?, ?, NULL, NULL, NULL, NULL,
+                          NULL, NULL, NULL, 0, NULL, NULL)
+                """,
+                (hotkey, generation, current.state.value, reason.value, occurred),
+            )
+            event_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                UPDATE worker_lifecycle_current SET
+                    state='pending', generation=?, revision=1, event_id=?,
+                    reason=?, state_changed_at=?, evidence_verified_at=NULL,
+                    evidence_expires_at=NULL, measurement=NULL,
+                    evidence_digest=NULL, policy_digest=NULL,
+                    policy_registry_release=NULL, policy_registry_digest=NULL,
+                    retry_count=0, next_retry_at=NULL
+                WHERE hotkey=?
+                """,
+                (generation, event_id, reason.value, occurred, hotkey),
+            )
+            return self._lifecycle_snapshot_from_row(
+                self._lifecycle_row(conn, hotkey)
+            )
+
+        if connection is not None:
+            return apply(connection, at or self._lifecycle_now())
+        with self._lifecycle_lock, self._connect() as conn:
+            when = at or self._lifecycle_now()
+            conn.execute("BEGIN IMMEDIATE")
+            return apply(conn, when)
+
+    def retire_lifecycle(
+        self,
+        hotkey: str,
+        *,
+        removed: bool = False,
+        at: datetime | None = None,
+    ) -> LifecycleSnapshot:
+        if not isinstance(removed, bool):
+            raise LifecycleError("removed must be a boolean")
+        with self._lifecycle_lock, self._connect() as conn:
+            when = at or self._lifecycle_now()
+            conn.execute("BEGIN IMMEDIATE")
+            self._advance_lifecycle_clock(conn, when)
+            current = self._lifecycle_snapshot_from_row(
+                self._lifecycle_row(conn, hotkey)
+            )
+            if current.state in TERMINAL_STATES:
+                return current
+            if current.state is not WorkerLifecycleState.RETIRING:
+                current = self._transition_lifecycle_in_connection(
+                    conn,
+                    hotkey,
+                    WorkerLifecycleState.RETIRING,
+                    LifecycleReason.OPERATOR_RETIRING,
+                    when,
+                    expected_generation=current.generation,
+                    expected_revision=current.revision,
+                )
+            if removed:
+                current = self._transition_lifecycle_in_connection(
+                    conn,
+                    hotkey,
+                    WorkerLifecycleState.RETIRED,
+                    LifecycleReason.WORKER_REMOVED,
+                    when,
+                    expected_generation=current.generation,
+                    expected_revision=current.revision,
+                )
+            return current
+
+    def lifecycle_history(
+        self, hotkey: str, *, operator: bool = False
+    ) -> tuple[dict[str, object], ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM worker_lifecycle_events WHERE hotkey = ? "
+                "ORDER BY event_id",
+                (hotkey,),
+            ).fetchall()
+        history: list[dict[str, object]] = []
+        for row in rows:
+            event: dict[str, object] = {
+                "generation": row["generation"],
+                "from_state": row["from_state"],
+                "to_state": row["to_state"],
+                "reason": row["reason"],
+                "occurred_at": row["occurred_at"],
+            }
+            if operator:
+                event.update(
+                    {
+                        "event_id": row["event_id"],
+                        "revision": row["revision"],
+                        "evidence_verified_at": row["evidence_verified_at"],
+                        "evidence_expires_at": row["evidence_expires_at"],
+                        "measurement": row["measurement"],
+                        "evidence_digest": row["evidence_digest"],
+                        "policy_digest": row["policy_digest"],
+                        "policy_registry_release": row["policy_registry_release"],
+                        "policy_registry_digest": row["policy_registry_digest"],
+                        "retry_count": row["retry_count"],
+                        "next_retry_at": row["next_retry_at"],
+                        "operator_detail": row["operator_detail"],
+                    }
+                )
+            history.append(event)
+        return tuple(history)
 
     def enroll(self, hotkey: str, endpoint_url: str, *, nonce: str | None = None) -> None:
         ts = now_iso()
-        with self._connect() as conn:
+        with self._lifecycle_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lifecycle_when = self._lifecycle_now()
             if nonce is not None:
                 try:
                     conn.execute(
@@ -405,6 +1299,21 @@ class RegistryStore:
             # the existing verdict intact (idempotent refresh).
             if endpoint_changed:
                 conn.execute("DELETE FROM attestations WHERE hotkey = ?", (hotkey,))
+                self.reenroll_lifecycle(
+                    hotkey,
+                    reason=LifecycleReason.ENDPOINT_CHANGED,
+                    at=lifecycle_when,
+                    connection=conn,
+                )
+            elif prior is None:
+                self._advance_lifecycle_clock(conn, lifecycle_when)
+                self._insert_initial_lifecycle(
+                    conn,
+                    hotkey,
+                    WorkerLifecycleState.PENDING,
+                    LifecycleReason.ENROLLED,
+                    lifecycle_when,
+                )
 
     def check_and_record_hotkey_attempt(
         self, hotkey: str, *, limit: int, window_seconds: int
@@ -444,7 +1353,76 @@ class RegistryStore:
             ).fetchall()
         return [Enrollment(row["hotkey"], row["endpoint_url"]) for row in rows]
 
-    def record_verdict(self, hotkey: str, attested: Attested | None, *, error: str | None = None) -> None:
+    def record_probe_failure(
+        self,
+        hotkey: str,
+        *,
+        error: str | None = None,
+        maximum_attempts: int = 3,
+        retry_base_seconds: int = 5,
+        retry_maximum_seconds: int = 300,
+        retry_jitter_seconds: int = 5,
+    ) -> LifecycleSnapshot:
+        """Record a transient probe failure without bypassing bounded retries."""
+        if (
+            isinstance(maximum_attempts, bool)
+            or not isinstance(maximum_attempts, int)
+            or not 1 <= maximum_attempts <= 32
+            or isinstance(retry_base_seconds, bool)
+            or not isinstance(retry_base_seconds, int)
+            or isinstance(retry_maximum_seconds, bool)
+            or not isinstance(retry_maximum_seconds, int)
+            or not 1 <= retry_base_seconds <= retry_maximum_seconds <= 86400
+            or isinstance(retry_jitter_seconds, bool)
+            or not isinstance(retry_jitter_seconds, int)
+            or not 0 <= retry_jitter_seconds <= retry_maximum_seconds
+        ):
+            raise LifecycleError("worker lifecycle retry policy is invalid")
+        with self._lifecycle_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lifecycle_when = self._lifecycle_now()
+            current = self._lifecycle_snapshot_from_row(
+                self._lifecycle_row(conn, hotkey)
+            )
+            attempt = min(current.retry_count + 1, maximum_attempts)
+            conn.execute(
+                """
+                INSERT INTO attestations(
+                    hotkey, chip_id, tier, verification_status, last_verified_iso,
+                    error, assurance_json
+                ) VALUES (?, NULL, NULL, 'FAILED', ?, ?, NULL)
+                ON CONFLICT(hotkey) DO UPDATE SET
+                    chip_id=NULL, tier=NULL, verification_status='FAILED',
+                    last_verified_iso=excluded.last_verified_iso,
+                    error=excluded.error, assurance_json=NULL
+                """,
+                (hotkey, now_iso(), error),
+            )
+            return self.record_refresh_failure(
+                hotkey,
+                attempt=attempt,
+                maximum_attempts=maximum_attempts,
+                at=lifecycle_when,
+                retry_base_seconds=retry_base_seconds,
+                retry_maximum_seconds=retry_maximum_seconds,
+                retry_jitter_seconds=retry_jitter_seconds,
+                operator_detail=error,
+                expected_generation=current.generation,
+                expected_revision=current.revision,
+                connection=conn,
+            )
+
+    def record_verdict(
+        self,
+        hotkey: str,
+        attested: Attested | None,
+        *,
+        error: str | None = None,
+        expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        policy_registry_release: int | None = None,
+        policy_registry_digest: str | None = None,
+    ) -> None:
         ts = now_iso()
         if attested is None:
             status = "FAILED"
@@ -471,7 +1449,10 @@ class RegistryStore:
             chip_id = None
             tier = None
             error = "typed hardware and software assurance claims are required"
-        with self._connect() as conn:
+        with self._lifecycle_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lifecycle_when = self._lifecycle_now()
+            identity_conflict = False
             if status == "VERIFIED" and chip_id is not None:
                 conflict = self._chip_rotation_owner(conn, chip_id, hotkey)
                 if conflict is not None:
@@ -479,6 +1460,7 @@ class RegistryStore:
                     chip_id = None
                     tier = None
                     error = f"chip_id already bound to hotkey {conflict}"
+                    identity_conflict = True
             conn.execute(
                 """
                 INSERT INTO attestations(
@@ -496,6 +1478,55 @@ class RegistryStore:
                 """,
                 (hotkey, chip_id, tier, status, ts, error, assurance_json),
             )
+            current = self._lifecycle_snapshot_from_row(
+                self._lifecycle_row(conn, hotkey)
+            )
+            if status == "VERIFIED" and attested is not None:
+                self.record_attested_lifecycle(
+                    hotkey,
+                    attested,
+                    at=lifecycle_when,
+                    expected_generation=(
+                        current.generation
+                        if expected_generation is None
+                        else expected_generation
+                    ),
+                    expected_revision=(
+                        current.revision
+                        if expected_revision is None
+                        else expected_revision
+                    ),
+                    policy_registry_release=policy_registry_release,
+                    policy_registry_digest=policy_registry_digest,
+                    connection=conn,
+                )
+            elif current.state not in TERMINAL_STATES and current.state is not WorkerLifecycleState.RETIRING:
+                self._transition_lifecycle_in_connection(
+                    conn,
+                    hotkey,
+                    (
+                        WorkerLifecycleState.REVOKED
+                        if identity_conflict
+                        else WorkerLifecycleState.FAILED
+                    ),
+                    (
+                        LifecycleReason.IDENTITY_CONFLICT
+                        if identity_conflict
+                        else LifecycleReason.VERIFICATION_FAILED
+                    ),
+                    lifecycle_when,
+                    operator_detail=error,
+                    expected_generation=(
+                        current.generation
+                        if expected_generation is None
+                        else expected_generation
+                    ),
+                    expected_revision=(
+                        current.revision
+                        if expected_revision is None
+                        else expected_revision
+                    ),
+                )
 
     def chip_rotation_owner(self, chip_id: str, hotkey: str) -> str | None:
         """Return the other hotkey currently holding an effective VERIFIED
@@ -542,7 +1573,7 @@ class RegistryStore:
         except ValueError:
             return "STALE"
         cutoff = now - timedelta(seconds=self.verification_ttl_seconds)
-        if verified_at < cutoff:
+        if verified_at <= cutoff:
             return "STALE"
         return "VERIFIED"
 
@@ -563,10 +1594,10 @@ class RegistryStore:
                 """
             ).fetchall()
 
-        now = datetime.now(UTC)
         miners = []
         verified_chips: set[str] = set()
         for row in rows:
+            now = self._lifecycle_now()
             chip_id = row["chip_id"]
             tier = row["tier"]
             assurance = self._stored_assurance(row["assurance_json"])
@@ -575,6 +1606,7 @@ class RegistryStore:
                 row["last_verified_iso"],
                 now,
             )
+            lifecycle = self.lifecycle_snapshot(row["hotkey"])
             if status == "VERIFIED" and not ATTESTATION_ADMISSION_POLICY.allows(
                 assurance
             ):
@@ -591,6 +1623,7 @@ class RegistryStore:
                     "verification_status": status,
                     "last_verified_iso": row["last_verified_iso"],
                     "assurance": assurance.to_dict(include_digests=False),
+                    "lifecycle": lifecycle.public_dict(),
                 }
             )
         return {"count": len(verified_chips), "miners": miners}

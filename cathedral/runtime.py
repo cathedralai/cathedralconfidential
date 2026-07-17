@@ -11,6 +11,7 @@ import hashlib
 import ipaddress
 import json
 import math
+import threading
 import urllib.parse
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -42,6 +43,14 @@ from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.ledger import Ledger
+from cathedral.lifecycle import (
+    NETWORK_ELIGIBLE_STATES,
+    LifecycleError,
+    LifecycleReason,
+    LifecycleSnapshot,
+    SingleFlightReattestor,
+    WorkerLifecycleState,
+)
 from cathedral.poster import Poster
 from cathedral.remote import RemoteMiner
 from cathedral.receipt import ReceiptIssuer
@@ -77,6 +86,10 @@ class RuntimeConfig:
     max_workers: int = 8
     production_mode: bool = True
     allow_insecure_http_for_tests: bool = False
+    reattestation_failures_before_failed: int = 3
+    reattestation_retry_base_seconds: int = 5
+    reattestation_retry_maximum_seconds: int = 300
+    reattestation_retry_jitter_seconds: int = 5
 
     def __post_init__(self) -> None:
         timeout = self.miner_timeout_seconds
@@ -105,6 +118,28 @@ class RuntimeConfig:
             raise ValueError("allow_insecure_http_for_tests must be a boolean")
         if self.production_mode and self.allow_insecure_http_for_tests:
             raise ValueError("insecure HTTP is unavailable in production mode")
+        if (
+            isinstance(self.reattestation_failures_before_failed, bool)
+            or not isinstance(self.reattestation_failures_before_failed, int)
+            or not 1 <= self.reattestation_failures_before_failed <= 32
+        ):
+            raise ValueError("reattestation failure bound must be between 1 and 32")
+        if (
+            isinstance(self.reattestation_retry_base_seconds, bool)
+            or not isinstance(self.reattestation_retry_base_seconds, int)
+            or isinstance(self.reattestation_retry_maximum_seconds, bool)
+            or not isinstance(self.reattestation_retry_maximum_seconds, int)
+            or not 1
+            <= self.reattestation_retry_base_seconds
+            <= self.reattestation_retry_maximum_seconds
+            <= 86400
+            or isinstance(self.reattestation_retry_jitter_seconds, bool)
+            or not isinstance(self.reattestation_retry_jitter_seconds, int)
+            or not 0
+            <= self.reattestation_retry_jitter_seconds
+            <= self.reattestation_retry_maximum_seconds
+        ):
+            raise ValueError("reattestation retry policy is invalid")
 
 
 @dataclass(frozen=True)
@@ -141,6 +176,8 @@ class _AttestationResult:
     evidence_digest: str | None = None
     client: MinerClient | None = None
     error: str | None = None
+    lifecycle_generation: int | None = None
+    lifecycle_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +208,7 @@ class ConfidentialRuntime:
         remote_factory: RemoteFactory = RemoteMiner,
         config: RuntimeConfig | None = None,
         receipt_issuer: ReceiptIssuer | None = None,
+        reattestor: SingleFlightReattestor[_AttestationResult] | None = None,
     ) -> None:
         self.registry = registry
         self.ledger = ledger
@@ -182,6 +220,11 @@ class ConfidentialRuntime:
         self.remote_factory = remote_factory
         self.config = config or RuntimeConfig()
         self.receipt_issuer = receipt_issuer
+        self.reattestor = reattestor or SingleFlightReattestor(
+            max_workers=self.config.max_workers
+        )
+        self._owns_reattestor = reattestor is None
+        self._run_lock = threading.Lock()
 
     def check_canary(self, canary: MinerTarget) -> MinerOutcome:
         return self._check_canary_result(canary).outcome
@@ -228,21 +271,69 @@ class ConfidentialRuntime:
         *,
         publish: bool = False,
     ) -> EpochRun:
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("an epoch run is already in progress")
+        try:
+            return self._run_epoch_once(source_epoch, canary, publish=publish)
+        finally:
+            self._run_lock.release()
+
+    def _run_epoch_once(
+        self,
+        source_epoch: int,
+        canary: MinerTarget,
+        *,
+        publish: bool = False,
+    ) -> EpochRun:
         if not isinstance(publish, bool):
             raise ValueError("publish must be a boolean")
         canary_target, canary_endpoint = self._validate_target(canary)
 
+        revoked = self.registry.apply_lifecycle_policy(
+            self.policy.allowed_measurements,
+            policy_registry_release=self.policy.registry_release,
+            policy_registry_digest=self.policy.registry_digest,
+        )
+        for snapshot in revoked:
+            self.reattestor.cancel(snapshot.hotkey)
         enrollments = self.registry.enrollments()
-        targets = [
-            MinerTarget(
-                enrollment.hotkey,
-                enrollment.endpoint_url,
-                self.token_provider(enrollment.hotkey),
+        refresh_due = {
+            snapshot.hotkey
+            for snapshot in self.registry.due_refreshes(
+                refresh_ahead_seconds=self.registry.verification_ttl_seconds
             )
-            for enrollment in enrollments
-        ]
+        }
+        targets: list[MinerTarget] = []
+        lifecycle_outcomes: dict[str, MinerOutcome] = {}
+        for enrollment in enrollments:
+            snapshot = self.registry.lifecycle_snapshot(enrollment.hotkey)
+            if snapshot.state not in NETWORK_ELIGIBLE_STATES:
+                lifecycle_outcomes[enrollment.hotkey] = MinerOutcome(
+                    enrollment.hotkey,
+                    enrollment.endpoint_url,
+                    snapshot.state.value,
+                    error=f"worker lifecycle is {snapshot.state.value}",
+                )
+                self.reattestor.cancel(enrollment.hotkey)
+                continue
+            if enrollment.hotkey not in refresh_due:
+                lifecycle_outcomes[enrollment.hotkey] = MinerOutcome(
+                    enrollment.hotkey,
+                    enrollment.endpoint_url,
+                    "refresh_scheduled",
+                    error="worker re-attestation retry is not due",
+                )
+                continue
+            targets.append(
+                MinerTarget(
+                    enrollment.hotkey,
+                    enrollment.endpoint_url,
+                    self.token_provider(enrollment.hotkey),
+                )
+            )
         self._validate_required_auth((canary_target, *targets))
         prepared, outcomes, enrolled_endpoints = self._prepare_targets(targets)
+        outcomes = {**lifecycle_outcomes, **outcomes}
         if canary_endpoint in enrolled_endpoints:
             raise RuntimeError("canary endpoint must be dedicated and not enrolled")
 
@@ -266,7 +357,13 @@ class ConfidentialRuntime:
             admitted = self._admit_unique_chips(epoch_id, attested, outcomes)
             self._run_sat(epoch_id, source_epoch, admitted, outcomes)
 
-            all_hotkeys = {target.hotkey for target in targets}
+            for enrollment in enrollments:
+                self.ledger.add_lifecycle_snapshot(
+                    epoch_id,
+                    self.registry.lifecycle_snapshot(enrollment.hotkey),
+                )
+
+            all_hotkeys = {enrollment.hotkey for enrollment in enrollments}
             scores = self.ledger.complete_epoch(epoch_id, all_hotkeys)
             outcomes = {
                 hotkey: MinerOutcome(
@@ -318,6 +415,26 @@ class ConfidentialRuntime:
         return MappingProxyType(
             {"blocking_epoch": dict(blocking) if blocking is not None else None}
         )
+
+    def retire_worker(self, hotkey: str, *, removed: bool = False) -> LifecycleSnapshot:
+        current = self.registry.retire_lifecycle(hotkey, removed=removed)
+        self.reattestor.cancel(hotkey)
+        return current
+
+    def reenroll_worker(self, hotkey: str) -> LifecycleSnapshot:
+        self.reattestor.cancel(hotkey)
+        return self.registry.reenroll_lifecycle(hotkey)
+
+    def close(self) -> None:
+        if self._owns_reattestor:
+            self.reattestor.close()
+            self._owns_reattestor = False
+
+    def __del__(self) -> None:  # pragma: no cover - interpreter cleanup fallback
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def abort_running(self) -> int:
         blocking = self.ledger.blocking_epoch()
@@ -388,7 +505,9 @@ class ConfidentialRuntime:
         results: list[_AttestationResult] = []
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
             futures: dict[str, Future[_AttestationResult]] = {
-                target.hotkey: executor.submit(self._collect_attestation, target, endpoint)
+                target.hotkey: executor.submit(
+                    self._collect_attestation_singleflight, target, endpoint
+                )
                 for target, endpoint in prepared
             }
             by_hotkey = {target.hotkey: (target, endpoint) for target, endpoint in prepared}
@@ -396,12 +515,77 @@ class ConfidentialRuntime:
                 result = futures[hotkey].result()
                 if result.attested is None:
                     target, endpoint = by_hotkey[hotkey]
+                    if (
+                        result.lifecycle_generation is not None
+                        and result.lifecycle_revision is not None
+                    ):
+                        current = self.registry.lifecycle_snapshot(hotkey)
+                        attempt = min(
+                            current.retry_count + 1,
+                            self.config.reattestation_failures_before_failed,
+                        )
+                        try:
+                            self.registry.record_refresh_failure(
+                                hotkey,
+                                attempt=attempt,
+                                maximum_attempts=self.config.reattestation_failures_before_failed,
+                                retry_base_seconds=self.config.reattestation_retry_base_seconds,
+                                retry_maximum_seconds=self.config.reattestation_retry_maximum_seconds,
+                                retry_jitter_seconds=self.config.reattestation_retry_jitter_seconds,
+                                operator_detail=result.error,
+                                expected_generation=result.lifecycle_generation,
+                                expected_revision=result.lifecycle_revision,
+                            )
+                        except LifecycleError:
+                            # Another refresh, reenrollment, or terminal transition
+                            # won the compare-and-swap. Ignore this stale result.
+                            pass
                     outcomes[hotkey] = MinerOutcome(
                         hotkey, endpoint, "attestation_failed", error=result.error
                     )
                 else:
                     results.append(result)
         return results
+
+    def _collect_attestation_singleflight(
+        self, target: MinerTarget, endpoint: str
+    ) -> _AttestationResult:
+        snapshot = self.registry.lifecycle_snapshot(target.hotkey)
+        if snapshot.state not in NETWORK_ELIGIBLE_STATES:
+            return _AttestationResult(
+                target,
+                endpoint,
+                error=f"worker lifecycle is {snapshot.state.value}",
+                lifecycle_generation=snapshot.generation,
+                lifecycle_revision=snapshot.revision,
+            )
+        try:
+            result = self.reattestor.run(
+                target.hotkey,
+                snapshot.generation,
+                lambda cancelled: self._collect_attestation(
+                    target, endpoint, cancel_event=cancelled
+                ),
+                timeout_seconds=(
+                    self.config.miner_timeout_seconds
+                    * self.config.miner_attempts
+                    * 2
+                    + 1
+                ),
+            )
+        except LifecycleError as exc:
+            return _AttestationResult(
+                target,
+                endpoint,
+                error=_safe_error(exc),
+                lifecycle_generation=snapshot.generation,
+                lifecycle_revision=snapshot.revision,
+            )
+        return replace(
+            result,
+            lifecycle_generation=snapshot.generation,
+            lifecycle_revision=snapshot.revision,
+        )
 
     def _admit_unique_chips(
         self,
@@ -419,6 +603,7 @@ class ConfidentialRuntime:
             group = chip_groups[chip_id]
             if len(group) > 1:
                 for result in group:
+                    self._revoke_lifecycle(result, LifecycleReason.IDENTITY_CONFLICT)
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
                         result.endpoint,
@@ -428,13 +613,48 @@ class ConfidentialRuntime:
                 continue
             result = group[0]
             assert result.attested is not None and result.evidence_digest is not None
+            current = self.registry.lifecycle_snapshot(
+                result.target.hotkey, materialize_freshness=False
+            )
+            if (
+                result.lifecycle_generation is None
+                or result.lifecycle_revision is None
+                or current.generation != result.lifecycle_generation
+                or current.revision != result.lifecycle_revision
+                or current.state not in NETWORK_ELIGIBLE_STATES
+            ):
+                outcomes[result.target.hotkey] = MinerOutcome(
+                    result.target.hotkey,
+                    result.endpoint,
+                    "refresh_cancelled",
+                    error="worker lifecycle changed during re-attestation",
+                )
+                continue
             rotation_owner = self.registry.chip_rotation_owner(chip_id, result.target.hotkey)
             if rotation_owner is not None:
+                self._revoke_lifecycle(result, LifecycleReason.IDENTITY_CONFLICT)
                 outcomes[result.target.hotkey] = MinerOutcome(
                     result.target.hotkey,
                     result.endpoint,
                     "chip_rotation_conflict",
                     error=f"chip_id already bound to hotkey {rotation_owner}",
+                )
+                continue
+            try:
+                self.registry.record_verdict(
+                    result.target.hotkey,
+                    result.attested,
+                    expected_generation=result.lifecycle_generation,
+                    expected_revision=result.lifecycle_revision,
+                    policy_registry_release=self.policy.registry_release,
+                    policy_registry_digest=self.policy.registry_digest,
+                )
+            except LifecycleError:
+                outcomes[result.target.hotkey] = MinerOutcome(
+                    result.target.hotkey,
+                    result.endpoint,
+                    "refresh_cancelled",
+                    error="worker lifecycle changed during re-attestation",
                 )
                 continue
             self.ledger.add_attestation(
@@ -446,7 +666,6 @@ class ConfidentialRuntime:
                 evidence_digest=result.evidence_digest,
                 policy_mode=result.attested.policy_mode or "compatibility",
             )
-            self.registry.record_verdict(result.target.hotkey, result.attested)
             outcomes[result.target.hotkey] = MinerOutcome(
                 result.target.hotkey,
                 result.endpoint,
@@ -456,6 +675,33 @@ class ConfidentialRuntime:
             )
             admitted.append(result)
         return sorted(admitted, key=lambda result: result.target.hotkey)
+
+    def _revoke_lifecycle(
+        self,
+        result: _AttestationResult,
+        reason: LifecycleReason,
+    ) -> None:
+        current = self.registry.lifecycle_snapshot(
+            result.target.hotkey, materialize_freshness=False
+        )
+        if current.state is WorkerLifecycleState.REVOKED:
+            return
+        self.registry.transition_lifecycle(
+            result.target.hotkey,
+            WorkerLifecycleState.REVOKED,
+            reason,
+            expected_generation=(
+                result.lifecycle_generation
+                if result.lifecycle_generation is not None
+                else current.generation
+            ),
+            expected_revision=(
+                result.lifecycle_revision
+                if result.lifecycle_revision is not None
+                else current.revision
+            ),
+        )
+        self.reattestor.cancel(result.target.hotkey)
 
     def _run_sat(
         self,
@@ -579,6 +825,7 @@ class ConfidentialRuntime:
             return
         attested = result.attested
         assert attested is not None
+        worker_lifecycle = self.registry.lifecycle_snapshot(result.target.hotkey)
         receipt = self.receipt_issuer.issue(
             epoch_id=epoch_id,
             source_epoch=source_epoch,
@@ -586,6 +833,7 @@ class ConfidentialRuntime:
             attested=attested,
             policy=self.policy,
             assurance=assurance,
+            worker_lifecycle=worker_lifecycle,
             challenge_id=item.challenge_id,
             manifest_digest=_sat_manifest_digest(item),
             work_units=work_units,
@@ -603,7 +851,15 @@ class ConfidentialRuntime:
             issued_at=issued_at,
         )
 
-    def _collect_attestation(self, target: MinerTarget, endpoint: str) -> _AttestationResult:
+    def _collect_attestation(
+        self,
+        target: MinerTarget,
+        endpoint: str,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> _AttestationResult:
+        if cancel_event is not None and cancel_event.is_set():
+            return _AttestationResult(target, endpoint, error="reattestation cancelled")
         try:
             client = self.remote_factory(
                 endpoint,
@@ -617,11 +873,19 @@ class ConfidentialRuntime:
 
         last_error = "attestation rejected"
         for _ in range(self.config.miner_attempts):
+            if cancel_event is not None and cancel_event.is_set():
+                return _AttestationResult(
+                    target, endpoint, error="reattestation cancelled"
+                )
             try:
                 nonce = self.nonce_factory()
                 if not isinstance(nonce, bytes) or len(nonce) != 32:
                     raise RuntimeError("nonce_factory must return exactly 32 bytes")
                 evidence = client.collect_evidence(nonce)
+                if cancel_event is not None and cancel_event.is_set():
+                    return _AttestationResult(
+                        target, endpoint, error="reattestation cancelled"
+                    )
                 if evidence.nonce != nonce:
                     raise RuntimeError("evidence nonce mismatch")
                 if evidence.miner_hotkey != target.hotkey:
@@ -641,6 +905,10 @@ class ConfidentialRuntime:
                     )
                 if evidence.report_data_version == 2:
                     binding = client.confirm_channel_binding(evidence)
+                    if cancel_event is not None and cancel_event.is_set():
+                        return _AttestationResult(
+                            target, endpoint, error="reattestation cancelled"
+                        )
                     if binding != evidence.channel_binding:
                         raise RuntimeError("live endpoint key does not match attested binding")
                     assert verdict.assurance is not None

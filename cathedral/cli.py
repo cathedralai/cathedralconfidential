@@ -714,6 +714,18 @@ def _build_runtime(
         max_workers=getattr(args, "max_workers", 8),
         production_mode=not development,
         allow_insecure_http_for_tests=development,
+        reattestation_failures_before_failed=getattr(
+            args, "reattestation_failures_before_failed", 3
+        ),
+        reattestation_retry_base_seconds=getattr(
+            args, "reattestation_retry_base_seconds", 5
+        ),
+        reattestation_retry_maximum_seconds=getattr(
+            args, "reattestation_retry_maximum_seconds", 300
+        ),
+        reattestation_retry_jitter_seconds=getattr(
+            args, "reattestation_retry_jitter_seconds", 5
+        ),
     )
     tokens = _load_tokens(
         getattr(args, "tokens_file", None),
@@ -948,6 +960,49 @@ def cmd_runtime_abandon_complete(args: argparse.Namespace) -> int:
         ledger.close()
 
 
+def cmd_lifecycle_status(args: argparse.Namespace) -> int:
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    store = RegistryStore(args.registry_db)
+    snapshot = store.lifecycle_snapshot(args.hotkey)
+    payload = snapshot.operator_dict() if args.operator else snapshot.public_dict()
+    print(json.dumps({"hotkey": args.hotkey, **payload}, sort_keys=True))
+    return 0
+
+
+def cmd_lifecycle_history(args: argparse.Namespace) -> int:
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    store = RegistryStore(args.registry_db)
+    history = store.lifecycle_history(args.hotkey, operator=args.operator)
+    print(
+        json.dumps(
+            {"hotkey": args.hotkey, "events": list(history)},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_lifecycle_reenroll(args: argparse.Namespace) -> int:
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    snapshot = RegistryStore(args.registry_db).reenroll_lifecycle(args.hotkey)
+    print(json.dumps({"hotkey": args.hotkey, **snapshot.public_dict()}, sort_keys=True))
+    return 0
+
+
+def cmd_lifecycle_retire(args: argparse.Namespace) -> int:
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    snapshot = RegistryStore(args.registry_db).retire_lifecycle(
+        args.hotkey,
+        removed=args.removed,
+    )
+    print(json.dumps({"hotkey": args.hotkey, **snapshot.public_dict()}, sort_keys=True))
+    return 0
+
+
 # --------------------------------------------------------------------------
 # argparse wiring
 # --------------------------------------------------------------------------
@@ -1045,6 +1100,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_receipt_verify.set_defaults(func=cmd_receipt_verify)
 
+    p_lifecycle = sub.add_parser(
+        "lifecycle", help="inspect worker attestation lifecycle state"
+    )
+    lifecycle_sub = p_lifecycle.add_subparsers(
+        dest="lifecycle_command", required=True
+    )
+    p_lifecycle_status = lifecycle_sub.add_parser(
+        "status", help="show the current customer-safe worker state"
+    )
+    p_lifecycle_status.add_argument("--registry-db", required=True)
+    p_lifecycle_status.add_argument("--hotkey", required=True)
+    p_lifecycle_status.add_argument(
+        "--operator",
+        action="store_true",
+        help="include internal evidence, policy, retry, and event identifiers",
+    )
+    p_lifecycle_status.set_defaults(func=cmd_lifecycle_status)
+
+    p_lifecycle_history = lifecycle_sub.add_parser(
+        "history", help="show append-only worker transition history"
+    )
+    p_lifecycle_history.add_argument("--registry-db", required=True)
+    p_lifecycle_history.add_argument("--hotkey", required=True)
+    p_lifecycle_history.add_argument(
+        "--operator",
+        action="store_true",
+        help="include internal evidence, policy, retry, and error details",
+    )
+    p_lifecycle_history.set_defaults(func=cmd_lifecycle_history)
+
+    p_lifecycle_reenroll = lifecycle_sub.add_parser(
+        "reenroll",
+        help="start a new pending generation after failed, retired, or revoked state",
+    )
+    p_lifecycle_reenroll.add_argument("--registry-db", required=True)
+    p_lifecycle_reenroll.add_argument("--hotkey", required=True)
+    p_lifecycle_reenroll.set_defaults(func=cmd_lifecycle_reenroll)
+
+    p_lifecycle_retire = lifecycle_sub.add_parser(
+        "retire", help="stop refresh and score eligibility for a worker"
+    )
+    p_lifecycle_retire.add_argument("--registry-db", required=True)
+    p_lifecycle_retire.add_argument("--hotkey", required=True)
+    p_lifecycle_retire.add_argument(
+        "--removed",
+        action="store_true",
+        help="finish directly in retired instead of leaving the worker retiring",
+    )
+    p_lifecycle_retire.set_defaults(func=cmd_lifecycle_retire)
+
     p_runtime = sub.add_parser("runtime", help="operate confidential TDX report epochs")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
 
@@ -1067,6 +1172,18 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--miner-timeout-seconds", type=float, default=10.0)
         command.add_argument("--miner-attempts", type=int, default=2)
         command.add_argument("--max-workers", type=int, default=8)
+        command.add_argument(
+            "--reattestation-failures-before-failed", type=int, default=3
+        )
+        command.add_argument(
+            "--reattestation-retry-base-seconds", type=int, default=5
+        )
+        command.add_argument(
+            "--reattestation-retry-maximum-seconds", type=int, default=300
+        )
+        command.add_argument(
+            "--reattestation-retry-jitter-seconds", type=int, default=5
+        )
         command.add_argument("--development", action="store_true")
         command.add_argument("--publisher-endpoint", default=None)
         command.add_argument(

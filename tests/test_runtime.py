@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import hmac
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -680,6 +681,63 @@ class RecordingPoster:
         if self.fail:
             raise OSError("ambiguous publication failure")
         return {"status": "accepted"}
+
+
+class SignedRecordingPoster(RecordingPoster):
+    def __init__(self, secret: bytes) -> None:
+        super().__init__()
+        self.secret = secret
+        self.signatures: list[str] = []
+
+    def post(self, body: bytes) -> dict[str, str]:
+        self.signatures.append(hmac.new(self.secret, body, hashlib.sha256).hexdigest())
+        return super().post(body)
+
+
+def test_policy_revocation_publishes_signed_positive_to_explicit_zero_without_network(
+    tmp_path: Path,
+) -> None:
+    poster = SignedRecordingPoster(b"score-secret")
+    specs = default_specs(**{"9001": MinerSpec("a")})
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        specs,
+        poster=poster,
+    )
+
+    positive = runtime.run_epoch(1, CANARY, publish=True)
+    worker_calls = len(factory.log["nonce:miner"])
+    assert positive.scores["miner"] == 1.0
+
+    runtime.policy = Policy(allowed_measurements={"replacement-measurement"})
+    zero = runtime.run_epoch(2, CANARY, publish=True)
+    zero_report = json.loads(ledger.report_bytes(zero.epoch_id))
+    lifecycle = zero_report["metadata"]["worker_lifecycle"]
+
+    assert zero.scores["miner"] == 0.0
+    assert {outcome.status for outcome in zero.outcomes} == {"revoked"}
+    assert len(factory.log["nonce:miner"]) == worker_calls
+    assert lifecycle == [
+        {
+            "event_id": lifecycle[0]["event_id"],
+            "evidence_expires_at": lifecycle[0]["evidence_expires_at"],
+            "generation": 1,
+            "hotkey": "miner",
+            "reason": "policy_revoked",
+            "revision": 3,
+            "snapshot_at": lifecycle[0]["snapshot_at"],
+            "state": "revoked",
+        }
+    ]
+    assert poster.bodies == [
+        ledger.report_bytes(positive.epoch_id),
+        ledger.report_bytes(zero.epoch_id),
+    ]
+    assert poster.signatures == [
+        hmac.new(poster.secret, body, hashlib.sha256).hexdigest()
+        for body in poster.bodies
+    ]
 
 
 def test_dry_run_publish_failure_and_byte_identical_retry(tmp_path: Path) -> None:

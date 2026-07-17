@@ -624,7 +624,9 @@ def test_expired_chip_binding_allows_rotation(tmp_path: Path) -> None:
     statuses = {m["hotkey"]: m["verification_status"] for m in board["miners"]}
     assert statuses[hotkey_a] == "STALE"
 
-    # hotkey_b can now claim the chip
+    # Identity conflict is terminal until explicit reenrollment. Once the old
+    # owner is stale, the claimant must start a new lifecycle generation.
+    store.reenroll_lifecycle(hotkey_b)
     store.record_verdict(hotkey_b, _attested(chip_id, "meas"))
     board = store.board()
     statuses = {m["hotkey"]: m["verification_status"] for m in board["miners"]}

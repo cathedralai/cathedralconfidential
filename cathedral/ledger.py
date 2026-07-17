@@ -14,6 +14,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol
 
+from cathedral.lifecycle import LifecycleReason, LifecycleSnapshot, WorkerLifecycleState, canonical_utc
 from cathedral.receipt import ReceiptError, parse_receipt_json
 
 
@@ -112,6 +113,21 @@ CREATE TABLE IF NOT EXISTS assurance_receipts (
     issued_at TEXT NOT NULL,
     UNIQUE (epoch_id, hotkey)
 );
+
+CREATE TABLE IF NOT EXISTS epoch_worker_lifecycle (
+    epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
+    hotkey TEXT NOT NULL,
+    state TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    event_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_expires_at TEXT,
+    evidence_digest TEXT,
+    policy_digest TEXT,
+    snapshot_at TEXT NOT NULL,
+    PRIMARY KEY (epoch_id, hotkey)
+);
 """
 
 
@@ -142,6 +158,47 @@ def _canonical_json(value: Any) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _receipt_lifecycle_values(receipt: Mapping[str, object]) -> tuple[object, ...]:
+    lifecycle = receipt.get("lifecycle")
+    assurance = receipt.get("assurance")
+    if not isinstance(lifecycle, dict) or not isinstance(assurance, dict):
+        raise LedgerError("receipt lifecycle snapshot is invalid")
+    claims = assurance.get("claims")
+    if not isinstance(claims, dict):
+        raise LedgerError("receipt lifecycle snapshot is invalid")
+    hardware = claims.get("hardware")
+    software = claims.get("software")
+    if not isinstance(hardware, dict) or not isinstance(software, dict):
+        raise LedgerError("receipt lifecycle snapshot is invalid")
+    return (
+        lifecycle.get("worker_state"),
+        lifecycle.get("worker_generation"),
+        lifecycle.get("worker_revision"),
+        lifecycle.get("worker_event_id"),
+        lifecycle.get("worker_reason"),
+        lifecycle.get("worker_evidence_expires_at"),
+        hardware.get("evidence_digest"),
+        software.get("policy_digest"),
+    )
+
+
+def _snapshot_lifecycle_values(snapshot: LifecycleSnapshot) -> tuple[object, ...]:
+    return (
+        snapshot.state.value,
+        snapshot.generation,
+        snapshot.revision,
+        snapshot.event_id,
+        snapshot.reason.value,
+        (
+            canonical_utc(snapshot.evidence_expires_at)
+            if snapshot.evidence_expires_at is not None
+            else None
+        ),
+        snapshot.evidence_digest,
+        snapshot.policy_digest,
+    )
 
 
 class ReportPoster(Protocol):
@@ -184,6 +241,7 @@ class Ledger:
         self._migrate_epochs_table_if_needed()
         self._migrate_registry_policy_fields_if_needed()
         self._migrate_attestation_policy_mode_if_needed()
+        self._migrate_worker_lifecycle_fields_if_needed()
 
     def _migrate_registry_policy_fields_if_needed(self) -> None:
         columns = {
@@ -217,6 +275,25 @@ class Ledger:
             )
         except sqlite3.DatabaseError as exc:
             raise LedgerError("failed to add attestation policy-mode audit field") from exc
+
+    def _migrate_worker_lifecycle_fields_if_needed(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute(
+                "PRAGMA table_info(epoch_worker_lifecycle)"
+            )
+        }
+        if "evidence_expires_at" in columns:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE epoch_worker_lifecycle "
+                "ADD COLUMN evidence_expires_at TEXT"
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError(
+                "failed to add worker lifecycle evidence-expiry field"
+            ) from exc
 
     def _migrate_epochs_table_if_needed(self) -> None:
         """Widen a pre-existing on-disk ``epochs`` table to support 'abandoned'.
@@ -384,6 +461,7 @@ class Ledger:
             "epoch_attestations",
             "epoch_scores",
             "assurance_receipts",
+            "epoch_worker_lifecycle",
         ):
             row = cx.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -648,6 +726,26 @@ class Ledger:
                 or receipt.get("subject_hotkey") != row["hotkey"]
             ):
                 raise LedgerError("receipt subject does not match its issued challenge")
+            lifecycle = cx.execute(
+                "SELECT * FROM epoch_worker_lifecycle "
+                "WHERE epoch_id = ? AND hotkey = ?",
+                (row["epoch_id"], row["hotkey"]),
+            ).fetchone()
+            if lifecycle is not None:
+                expected_lifecycle = (
+                    lifecycle["state"],
+                    lifecycle["generation"],
+                    lifecycle["revision"],
+                    lifecycle["event_id"],
+                    lifecycle["reason"],
+                    lifecycle["evidence_expires_at"],
+                    lifecycle["evidence_digest"],
+                    lifecycle["policy_digest"],
+                )
+                if _receipt_lifecycle_values(receipt) != expected_lifecycle:
+                    raise LedgerError(
+                        "receipt does not match the epoch worker lifecycle snapshot"
+                    )
             try:
                 cx.execute(
                     "INSERT INTO assurance_receipts("
@@ -706,6 +804,88 @@ class Ledger:
                 "policy_mode, attested_at) "
                 "VALUES (?, ?, 'VERIFIED', 'TDX', 'CPU', ?, ?, ?)",
                 (epoch_id, hotkey, evidence_digest, policy_mode, _now()),
+            )
+
+    def add_lifecycle_snapshot(
+        self,
+        epoch_id: int,
+        snapshot: LifecycleSnapshot,
+        *,
+        snapshot_at: str | None = None,
+    ) -> None:
+        if (
+            not isinstance(snapshot, LifecycleSnapshot)
+            or not isinstance(snapshot.hotkey, str)
+            or not snapshot.hotkey
+            or not isinstance(snapshot.state, WorkerLifecycleState)
+            or not isinstance(snapshot.reason, LifecycleReason)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 < value <= _MAX_SQLITE_INTEGER
+                for value in (
+                    snapshot.generation,
+                    snapshot.revision,
+                    snapshot.event_id,
+                )
+            )
+        ):
+            raise LedgerError("worker lifecycle snapshot is invalid")
+        captured_at = _validated_generated_at(snapshot_at)
+        snapshot_values = _snapshot_lifecycle_values(snapshot)
+        with self._transaction() as cx:
+            self._require_running(cx, epoch_id, "add worker lifecycle snapshots")
+            existing = cx.execute(
+                "SELECT * FROM epoch_worker_lifecycle WHERE epoch_id = ? AND hotkey = ?",
+                (epoch_id, snapshot.hotkey),
+            ).fetchone()
+            values = snapshot_values
+            if existing is not None:
+                if tuple(
+                    existing[name]
+                    for name in (
+                        "state",
+                        "generation",
+                        "revision",
+                        "event_id",
+                        "reason",
+                        "evidence_expires_at",
+                        "evidence_digest",
+                        "policy_digest",
+                    )
+                ) != values:
+                    raise LedgerError(
+                        "worker lifecycle snapshot is immutable within an epoch"
+                    )
+                return
+            receipt = cx.execute(
+                "SELECT receipt_body FROM assurance_receipts "
+                "WHERE epoch_id = ? AND hotkey = ?",
+                (epoch_id, snapshot.hotkey),
+            ).fetchone()
+            if receipt is not None:
+                try:
+                    receipt_document = parse_receipt_json(receipt["receipt_body"])
+                except ReceiptError as exc:
+                    raise LedgerError("stored receipt body is invalid") from exc
+                if _receipt_lifecycle_values(receipt_document) != snapshot_values:
+                    raise LedgerError(
+                        "receipt does not match the epoch worker lifecycle snapshot"
+                    )
+            cx.execute(
+                """
+                INSERT INTO epoch_worker_lifecycle(
+                    epoch_id, hotkey, state, generation, revision, event_id,
+                    reason, evidence_expires_at, evidence_digest, policy_digest,
+                    snapshot_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    epoch_id,
+                    snapshot.hotkey,
+                    *values,
+                    captured_at,
+                ),
             )
 
     def complete_epoch(
@@ -789,7 +969,28 @@ class Ledger:
                     )
                 }
             )
-            gated = {hotkey: units if hotkey in attested else 0.0 for hotkey, units in totals.items()}
+            lifecycle_rows = cx.execute(
+                "SELECT hotkey, state, generation, revision, event_id, reason, "
+                "evidence_expires_at, snapshot_at "
+                "FROM epoch_worker_lifecycle WHERE epoch_id = ? ORDER BY hotkey",
+                (epoch_id,),
+            ).fetchall()
+            lifecycle_eligible = {
+                row["hotkey"]
+                for row in lifecycle_rows
+                if row["state"] == WorkerLifecycleState.ATTESTED.value
+            }
+            if lifecycle_rows:
+                universe.update(row["hotkey"] for row in lifecycle_rows)
+                current_work.update(
+                    {hotkey: current_work.get(hotkey, 0.0) for hotkey in universe}
+                )
+                totals.update({hotkey: totals.get(hotkey, 0.0) for hotkey in universe})
+                attested &= lifecycle_eligible
+            gated = {
+                hotkey: units if hotkey in attested else 0.0
+                for hotkey, units in totals.items()
+            }
             current_gated = {
                 hotkey: units if hotkey in attested else 0.0
                 for hotkey, units in current_work.items()
@@ -811,6 +1012,19 @@ class Ledger:
                     "policy_registry_digest": epoch["policy_registry_digest"],
                     "published_window_epochs": sorted(row["source_epoch"] for row in previous),
                     "published_window_size": self.window_size,
+                    "worker_lifecycle": [
+                        {
+                            "event_id": row["event_id"],
+                            "evidence_expires_at": row["evidence_expires_at"],
+                            "generation": row["generation"],
+                            "hotkey": row["hotkey"],
+                            "reason": row["reason"],
+                            "revision": row["revision"],
+                            "snapshot_at": row["snapshot_at"],
+                            "state": row["state"],
+                        }
+                        for row in lifecycle_rows
+                    ],
                 },
                 "scores": [
                     {"miner_hotkey": hotkey, "score": scores[hotkey]}

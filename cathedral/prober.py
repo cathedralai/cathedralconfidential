@@ -403,10 +403,10 @@ def probe_once(
 ) -> None:
     """Probe all enrolled miners concurrently, bounded to *max_workers* threads.
 
-    Each enrollment is isolated: a timeout or error in one probe records a
-    FAILED verdict and does not prevent remaining enrollments from being probed
-    in the same pass.  Concurrency prevents one slow miner from serialising
-    the entire pass.
+    Each enrollment is isolated: a timeout or transport error in one probe
+    records a failed public verdict plus a bounded lifecycle retry and does not
+    prevent remaining enrollments from being probed in the same pass.
+    Concurrency prevents one slow miner from serialising the entire pass.
 
     :param production_mode: when True, any enrollment whose endpoint_url host
         is not a public IP literal is rejected before any network access
@@ -417,7 +417,17 @@ def probe_once(
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be at least 1, got {max_workers}")
-    enrollments = store.enrollments()
+    due_hotkeys = {
+        snapshot.hotkey
+        for snapshot in store.due_refreshes(
+            refresh_ahead_seconds=store.verification_ttl_seconds
+        )
+    }
+    enrollments = [
+        enrollment
+        for enrollment in store.enrollments()
+        if enrollment.hotkey in due_hotkeys
+    ]
 
     def _probe_one(enrollment: Any) -> None:
         nonce = issue_nonce()
@@ -464,7 +474,10 @@ def probe_once(
                 store.record_verdict(enrollment.hotkey, attested)
         except Exception as exc:
             try:
-                store.record_verdict(enrollment.hotkey, None, error=type(exc).__name__)
+                store.record_probe_failure(
+                    enrollment.hotkey,
+                    error=type(exc).__name__,
+                )
             except Exception:
                 LOGGER.exception(
                     "failed to record probe failure for hotkey %s", enrollment.hotkey
