@@ -65,6 +65,9 @@ def policy_digest(policy: object) -> str:
         "allowed_firmware": sorted(getattr(policy, "allowed_firmware", set())),
         "allowed_measurements": sorted(getattr(policy, "allowed_measurements", set())),
         "min_tcb": getattr(policy, "min_tcb", 0),
+        "registry_digest": getattr(policy, "registry_digest", None),
+        "registry_profile_ids": list(getattr(policy, "registry_profile_ids", ())),
+        "registry_release": getattr(policy, "registry_release", None),
         "tdx_allowed_advisories": sorted(
             getattr(policy, "tdx_allowed_advisories", set())
         ),

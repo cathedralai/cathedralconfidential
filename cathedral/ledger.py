@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import threading
 import uuid
@@ -25,6 +26,7 @@ class LedgerError(Exception):
 # migration builds the widened schema under a throwaway temp name (never
 # under `epochs` itself -- see that method's docstring for why).
 _EPOCHS_MIGRATION_TEMP_PREFIX = "epochs_migration_new_"
+_MAX_SQLITE_INTEGER = 2**63 - 1
 
 
 def _epochs_table_sql(table_name: str) -> str:
@@ -41,6 +43,8 @@ CREATE TABLE IF NOT EXISTS {table_name} (
     generated_at TEXT,
     report_body BLOB,
     report_digest TEXT,
+    policy_registry_release INTEGER,
+    policy_registry_digest TEXT,
     abandoned_at TEXT,
     abandon_reason TEXT
 )
@@ -164,7 +168,24 @@ class Ledger:
             self._connection.execute("PRAGMA synchronous = FULL")
         self._connection.executescript(_SCHEMA)
         self._migrate_epochs_table_if_needed()
+        self._migrate_registry_policy_fields_if_needed()
         self._migrate_attestation_policy_mode_if_needed()
+
+    def _migrate_registry_policy_fields_if_needed(self) -> None:
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(epochs)")
+        }
+        try:
+            if "policy_registry_release" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE epochs ADD COLUMN policy_registry_release INTEGER"
+                )
+            if "policy_registry_digest" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE epochs ADD COLUMN policy_registry_digest TEXT"
+                )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add registry policy audit fields") from exc
 
     def _migrate_attestation_policy_mode_if_needed(self) -> None:
         """Mark historical attestation rows as compatibility-mode evidence."""
@@ -367,10 +388,26 @@ class Ledger:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def begin_epoch(self, source_epoch: int) -> int:
+    def begin_epoch(
+        self,
+        source_epoch: int,
+        *,
+        policy_registry_release: int | None = None,
+        policy_registry_digest: str | None = None,
+    ) -> int:
         """Begin the next attempt, reusing an aborted attempt's source epoch."""
         if isinstance(source_epoch, bool) or not isinstance(source_epoch, int) or source_epoch < 0:
             raise LedgerError("source_epoch must be a nonnegative integer")
+        if (policy_registry_release is None) != (policy_registry_digest is None):
+            raise LedgerError("policy registry release and digest must be supplied together")
+        if policy_registry_release is not None and (
+            isinstance(policy_registry_release, bool)
+            or not isinstance(policy_registry_release, int)
+            or not 0 < policy_registry_release <= _MAX_SQLITE_INTEGER
+            or not isinstance(policy_registry_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", policy_registry_digest) is None
+        ):
+            raise LedgerError("policy registry metadata is invalid")
         with self._transaction() as cx:
             blocking = cx.execute(
                 "SELECT epoch_id, status FROM epochs WHERE status IN ('running', 'complete') LIMIT 1"
@@ -398,8 +435,15 @@ class Ledger:
                 raise LedgerError(f"source_epoch must be greater than finalized epoch {last_final}")
 
             cursor = cx.execute(
-                "INSERT INTO epochs(source_epoch, status, started_at) VALUES (?, 'running', ?)",
-                (source_epoch, _now()),
+                "INSERT INTO epochs(source_epoch, status, started_at, "
+                "policy_registry_release, policy_registry_digest) "
+                "VALUES (?, 'running', ?, ?, ?)",
+                (
+                    source_epoch,
+                    _now(),
+                    policy_registry_release,
+                    policy_registry_digest,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -637,6 +681,8 @@ class Ledger:
                 "metadata": {
                     "normalization": "max",
                     "attestation_policy_modes": policy_modes,
+                    "policy_registry_release": epoch["policy_registry_release"],
+                    "policy_registry_digest": epoch["policy_registry_digest"],
                     "published_window_epochs": sorted(row["source_epoch"] for row in previous),
                     "published_window_size": self.window_size,
                 },

@@ -120,6 +120,7 @@ the real `verify()` interface; the real Intel TDX path runs on hardware (see
 - [`MINING.md`](MINING.md) - step-by-step miner onboarding
 - [`docs/DESIGN.md`](docs/DESIGN.md) - protocol and scoring design
 - [`docs/ASSURANCE.md`](docs/ASSURANCE.md) - four independent assurance claims
+- [`docs/POLICY_REGISTRY.md`](docs/POLICY_REGISTRY.md) - signed measurement policy and lifecycle
 - [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path
 - [`HANDOFF.md`](HANDOFF.md) - commissioning and test handoff
 - [`RUNTEST.md`](RUNTEST.md) - test commands

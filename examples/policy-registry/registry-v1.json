@@ -1,0 +1,42 @@
+{
+  "schema": "cathedral_policy_registry_v1",
+  "release": 1,
+  "generated_at": "2026-07-17T00:00:00Z",
+  "valid_from": "2026-07-17T01:00:00Z",
+  "valid_until": "2026-07-20T00:00:00Z",
+  "signing_key_id": "cathedral-policy-test-1",
+  "profiles": [
+    {
+      "id": "cpu-tdx-sample-v1",
+      "kind": "cpu_tdx",
+      "status": "active",
+      "status_changed_at": "2026-07-17T01:00:00Z",
+      "valid_from": "2026-07-17T01:00:00Z",
+      "valid_until": "2026-07-20T00:00:00Z",
+      "retire_at": null,
+      "measurements": [
+        "tdx-measurement-sha256:sample-v1"
+      ],
+      "runtime_measurements": [
+        "runtime-sha256:sample-v1"
+      ],
+      "allowed_firmware": [],
+      "min_tcb": 0,
+      "tdx_allowed_tcb_statuses": [
+        "UpToDate"
+      ],
+      "tdx_allowed_advisories": [],
+      "metadata": {
+        "description": "Customer-safe sample CPU profile"
+      }
+    }
+  ],
+  "metadata": {
+    "critical": true,
+    "purpose": "public test policy"
+  },
+  "signature": {
+    "algorithm": "ed25519",
+    "value_base64": "oOwMX4hYvJ/uyrslo1hAcOu5YcV+gQiYCThw2oyd5d+YP5H3tu/lqr25/mIv6blERGx/2wb/ID2SeOJmdhqgCg=="
+  }
+}

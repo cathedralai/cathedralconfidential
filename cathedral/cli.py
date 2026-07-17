@@ -22,6 +22,8 @@ out.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime
 import ipaddress
 import json
@@ -40,6 +42,12 @@ from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.ledger import Ledger
 from cathedral.poster import Poster
+from cathedral.policy_registry import (
+    MAX_REGISTRY_BYTES,
+    PolicyRegistryState,
+    parse_registry_json,
+    verify_registry,
+)
 from cathedral.runtime import (
     ConfidentialRuntime,
     EpochRun,
@@ -363,6 +371,109 @@ def _load_policy(path: str) -> Policy:
     )
 
 
+def _read_bounded_registry_file(path: str, label: str) -> bytes:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(MAX_REGISTRY_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"unable to load {label}") from exc
+    if len(data) > MAX_REGISTRY_BYTES:
+        raise ValueError(f"{label} exceeds the maximum encoded size")
+    return data
+
+
+def _load_registry_keys(path: str) -> dict[str, bytes]:
+    raw = parse_registry_json(
+        _read_bounded_registry_file(path, "policy registry key file")
+    )
+    keys: dict[str, bytes] = {}
+    try:
+        for key_id, encoded in raw.items():
+            if not isinstance(key_id, str) or not key_id or not isinstance(encoded, str):
+                raise ValueError
+            key = base64.b64decode(encoded, validate=True)
+            if len(key) != 32:
+                raise ValueError
+            keys[key_id] = key
+    except (binascii.Error, ValueError):
+        raise ValueError("policy registry keys must be 32-byte base64 values") from None
+    if not keys:
+        raise ValueError("policy registry key file cannot be empty")
+    return keys
+
+
+def _verified_registry_policy(
+    registry_path: str,
+    keys_path: str,
+    *,
+    state_path: str,
+    minimum_release: int | None,
+    max_age_seconds: int,
+    production_mode: bool,
+    pinned_release: int | None = None,
+    pinned_digest: str | None = None,
+) -> Policy:
+    data = _read_bounded_registry_file(registry_path, "policy registry")
+    snapshot = verify_registry(
+        data,
+        _load_registry_keys(keys_path),
+        max_age_seconds=max_age_seconds,
+    )
+    # Prove the signed snapshot can produce a usable CPU admission policy
+    # before advancing the durable high-water mark.
+    policy = snapshot.to_policy()
+    state = PolicyRegistryState(
+        state_path,
+        production_mode=production_mode,
+        minimum_release=minimum_release,
+        pinned_release=pinned_release,
+        pinned_digest=pinned_digest,
+    )
+    state.accept(snapshot)
+    return policy
+
+
+def cmd_policy_registry_verify(args: argparse.Namespace) -> int:
+    historical_at = None
+    historical_raw = getattr(args, "historical_at", None)
+    if historical_raw is not None:
+        if (
+            re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", historical_raw
+            )
+            is None
+        ):
+            raise ValueError("--historical-at must be canonical UTC time")
+        try:
+            historical_at = datetime.datetime.strptime(
+                historical_raw, "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=datetime.UTC)
+        except ValueError:
+            raise ValueError("--historical-at must be canonical UTC time") from None
+    registry_bytes = _read_bounded_registry_file(args.registry, "policy registry")
+    snapshot = verify_registry(
+        registry_bytes,
+        _load_registry_keys(args.trusted_keys),
+        max_age_seconds=args.max_age_seconds,
+        historical_at=historical_at,
+    )
+    print(
+        json.dumps(
+            {
+                "release": snapshot.release,
+                "digest": snapshot.digest,
+                "signing_key_id": snapshot.signing_key_id,
+                "profiles": [
+                    {"id": profile.profile_id, "kind": profile.kind, "status": profile.status}
+                    for profile in snapshot.profiles
+                ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _load_tokens(path: str | None, *, production_mode: bool = False) -> dict[str, str]:
     if path is None:
         return {}
@@ -430,7 +541,9 @@ def _publisher_from_args(args: argparse.Namespace) -> Poster | None:
     return Poster(endpoint, bearer, secret)
 
 
-def _build_runtime(args: argparse.Namespace) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
+def _build_runtime(
+    args: argparse.Namespace, *, require_policy: bool = False
+) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
     development = getattr(args, "development", False)
     config = RuntimeConfig(
         miner_timeout_seconds=getattr(args, "miner_timeout_seconds", 10.0),
@@ -443,12 +556,40 @@ def _build_runtime(args: argparse.Namespace) -> tuple[ConfidentialRuntime, Ledge
         getattr(args, "tokens_file", None),
         production_mode=config.production_mode,
     )
-    ledger = Ledger(args.ledger_db)
     measurements_file = getattr(args, "measurements_file", None)
+    policy_registry = getattr(args, "policy_registry", None)
+    if measurements_file and policy_registry:
+        raise ValueError(
+            "--measurements-file and --policy-registry are mutually exclusive"
+        )
+    if policy_registry is not None:
+        for name in ("policy_registry_keys", "policy_registry_state"):
+            if not getattr(args, name, None):
+                raise ValueError(f"--{name.replace('_', '-')} is required with --policy-registry")
+        policy = _verified_registry_policy(
+            policy_registry,
+            args.policy_registry_keys,
+            state_path=args.policy_registry_state,
+            minimum_release=args.policy_registry_min_release,
+            max_age_seconds=args.policy_registry_max_age_seconds,
+            production_mode=config.production_mode,
+            pinned_release=getattr(args, "policy_registry_pinned_release", None),
+            pinned_digest=getattr(args, "policy_registry_pinned_digest", None),
+        )
+    elif measurements_file:
+        policy = _load_policy(measurements_file)
+    elif require_policy:
+        raise ValueError("one of --measurements-file or --policy-registry is required")
+    else:
+        # Recovery/status commands do not admit miners or start epochs. Their
+        # runtime methods operate only on already-frozen ledger state, so they
+        # intentionally need no current admission policy.
+        policy = Policy()
+    ledger = Ledger(args.ledger_db)
     runtime = ConfidentialRuntime(
         RegistryStore(getattr(args, "registry_db", ":memory:")),
         ledger,
-        _load_policy(measurements_file) if measurements_file else Policy(),
+        policy,
         _publisher_from_args(args),
         token_provider=tokens.get,
         config=config,
@@ -540,7 +681,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_runtime_canary(args: argparse.Namespace) -> int:
-    runtime, ledger, tokens = _build_runtime(args)
+    runtime, ledger, tokens = _build_runtime(args, require_policy=True)
     try:
         outcome = runtime.check_canary(_target(args, tokens))
         print(json.dumps(_outcome_json(outcome), sort_keys=True))
@@ -550,7 +691,7 @@ def cmd_runtime_canary(args: argparse.Namespace) -> int:
 
 
 def cmd_runtime_run_epoch(args: argparse.Namespace) -> int:
-    runtime, ledger, tokens = _build_runtime(args)
+    runtime, ledger, tokens = _build_runtime(args, require_policy=True)
     try:
         run = runtime.run_epoch(
             args.source_epoch,
@@ -689,13 +830,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.set_defaults(func=cmd_worker_serve)
 
+    p_policy = sub.add_parser(
+        "policy-registry", help="verify signed public measurement policy"
+    )
+    policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)
+    p_policy_verify = policy_sub.add_parser("verify", help="verify and inspect a registry")
+    p_policy_verify.add_argument("--registry", required=True)
+    p_policy_verify.add_argument("--trusted-keys", required=True)
+    p_policy_verify.add_argument("--max-age-seconds", type=int, default=86400)
+    p_policy_verify.add_argument(
+        "--historical-at",
+        help="verify at canonical UTC receipt time instead of current admission time",
+    )
+    p_policy_verify.set_defaults(func=cmd_policy_registry_verify)
+
     p_runtime = sub.add_parser("runtime", help="operate confidential TDX report epochs")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
 
     def add_runtime_common(command: argparse.ArgumentParser) -> None:
         command.add_argument("--registry-db", required=True)
         command.add_argument("--ledger-db", required=True)
-        command.add_argument("--measurements-file", required=True)
+        command.add_argument("--measurements-file")
+        command.add_argument("--policy-registry")
+        command.add_argument("--policy-registry-keys")
+        command.add_argument("--policy-registry-state")
+        command.add_argument("--policy-registry-min-release", type=int)
+        command.add_argument("--policy-registry-pinned-release", type=int)
+        command.add_argument("--policy-registry-pinned-digest")
+        command.add_argument(
+            "--policy-registry-max-age-seconds", type=int, default=86400
+        )
         command.add_argument("--tokens-file", default=None)
         command.add_argument("--miner-timeout-seconds", type=float, default=10.0)
         command.add_argument("--miner-attempts", type=int, default=2)

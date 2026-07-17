@@ -28,6 +28,7 @@ TDX_TCB_STATUSES = frozenset(
     }
 )
 _TDX_POLICY_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MAX_SQLITE_INTEGER = 2**63 - 1
 
 
 class Tier(str, enum.Enum):
@@ -200,25 +201,40 @@ def evidence_report_data(evidence: Evidence, nonce: bytes) -> bytes:
     return report_data(nonce, evidence.miner_hotkey, evidence.ssh_host_key)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Policy:
     """Measurement policy the verifier enforces (docs/DESIGN.md §6)."""
 
-    allowed_measurements: set[str] = field(default_factory=set)
+    allowed_measurements: frozenset[str] = field(default_factory=frozenset)
     min_tcb: int = 0
-    allowed_firmware: set[str] = field(default_factory=set)
+    allowed_firmware: frozenset[str] = field(default_factory=frozenset)
     tdx_strict: bool = False
-    tdx_allowed_tcb_statuses: set[str] = field(default_factory=lambda: {"UpToDate"})
-    tdx_allowed_advisories: set[str] = field(default_factory=set)
+    tdx_allowed_tcb_statuses: frozenset[str] = field(
+        default_factory=lambda: frozenset({"UpToDate"})
+    )
+    tdx_allowed_advisories: frozenset[str] = field(default_factory=frozenset)
+    registry_release: int | None = None
+    registry_digest: str | None = None
+    registry_profile_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        for name in (
+            "allowed_measurements",
+            "allowed_firmware",
+            "tdx_allowed_tcb_statuses",
+            "tdx_allowed_advisories",
+        ):
+            values = getattr(self, name)
+            if not isinstance(values, (set, frozenset)):
+                raise ValueError(f"{name} must be a set of bounded policy tokens")
+            object.__setattr__(self, name, frozenset(values))
         if not isinstance(self.tdx_strict, bool):
             raise ValueError("tdx_strict must be a boolean")
         for name, values in (
             ("tdx_allowed_tcb_statuses", self.tdx_allowed_tcb_statuses),
             ("tdx_allowed_advisories", self.tdx_allowed_advisories),
         ):
-            if not isinstance(values, set) or any(
+            if any(
                 not isinstance(value, str) or _TDX_POLICY_TOKEN.fullmatch(value) is None
                 for value in values
             ):
@@ -230,3 +246,22 @@ class Policy:
             raise ValueError("Revoked TDX platforms cannot be allowlisted")
         if self.tdx_strict and not self.tdx_allowed_tcb_statuses:
             raise ValueError("strict TDX policy requires at least one allowed TCB status")
+        if (self.registry_release is None) != (self.registry_digest is None):
+            raise ValueError("registry release and digest must be supplied together")
+        if self.registry_release is not None and (
+            isinstance(self.registry_release, bool)
+            or not isinstance(self.registry_release, int)
+            or not 0 < self.registry_release <= _MAX_SQLITE_INTEGER
+            or not isinstance(self.registry_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", self.registry_digest) is None
+        ):
+            raise ValueError("registry policy metadata is invalid")
+        if (
+            not isinstance(self.registry_profile_ids, tuple)
+            or len(set(self.registry_profile_ids)) != len(self.registry_profile_ids)
+            or any(
+                not isinstance(profile_id, str) or not profile_id
+                for profile_id in self.registry_profile_ids
+            )
+        ):
+            raise ValueError("registry profile ids must be unique strings")

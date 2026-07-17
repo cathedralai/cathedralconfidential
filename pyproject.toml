@@ -6,12 +6,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-  # This service publishes a signed score stream. The existing Cathedral
-  # validator owns metagraph mapping and on-chain weight submission.
+  # Public policy registries use audited Ed25519 primitives rather than a
+  # project-local signature implementation.
+  "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]
-# stdlib-only runtime; third-party packages are used only for development and tests.
+# Additional validator-chain and test tooling.
 dev = ["pytest>=8.0", "substrate-interface>=1.7.0"]
 
 [project.scripts]

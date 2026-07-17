@@ -254,7 +254,11 @@ class ConfidentialRuntime:
         ):
             raise RuntimeError("an enrolled miner shares the dedicated canary TDX chip")
 
-        epoch_id = self.ledger.begin_epoch(source_epoch)
+        epoch_id = self.ledger.begin_epoch(
+            source_epoch,
+            policy_registry_release=self.policy.registry_release,
+            policy_registry_digest=self.policy.registry_digest,
+        )
         try:
             admitted = self._admit_unique_chips(epoch_id, attested, outcomes)
             self._run_sat(epoch_id, source_epoch, admitted, outcomes)
