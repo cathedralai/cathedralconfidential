@@ -385,7 +385,18 @@ class ExternalSignatureVerifier:
     production_capable = True
 
     def __init__(self, config: ExternalVerifierConfig):
-        self.config = config
+        if not isinstance(config, ExternalVerifierConfig):
+            raise TypeError("external verifier config is invalid")
+        object.__setattr__(self, "_config", config)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"config", "_config"} and hasattr(self, "_config"):
+            raise AttributeError("external verifier configuration is immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def config(self) -> ExternalVerifierConfig:
+        return self._config
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> None:
@@ -672,12 +683,14 @@ class WorkloadManifest:
 class AdmittedWorkload:
     manifest: WorkloadManifest
     admission_mode: str
+    production_admission: bool
     _capability: str = field(repr=False)
 
     def __post_init__(self) -> None:
         if (
             not isinstance(self.manifest, WorkloadManifest)
             or self.admission_mode not in {"enforced", "development_bypass"}
+            or not isinstance(self.production_admission, bool)
             or not isinstance(self._capability, str)
             or re.fullmatch(r"admission-hmac-sha256:[0-9a-f]{64}", self._capability)
             is None
@@ -743,6 +756,23 @@ AuditSink = Callable[[Mapping[str, object]], None]
 class WorkloadAdmissionController:
     """Evaluate policy and mint short-lived in-process execution capabilities."""
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if (
+            self.__dict__.get("_configuration_locked", False)
+            and name
+            in {
+                "_LOCKED_SECURITY_CONFIGURATION",
+                "_capability_key",
+                "_configuration_locked",
+                "_preflight_complete",
+                "policy",
+                "production_mode",
+                "verifier",
+            }
+        ):
+            raise AttributeError("workload admission security configuration is immutable")
+        object.__setattr__(self, name, value)
+
     def __init__(
         self,
         policy: WorkloadAdmissionPolicy,
@@ -776,8 +806,10 @@ class WorkloadAdmissionController:
         self.audit_sink = audit_sink
         self._capability_key = capability_key
         self._preflight_complete = False
+        self._configuration_locked = False
         if production_mode:
             self.startup_preflight()
+        object.__setattr__(self, "_configuration_locked", True)
 
     def _audit(
         self,
@@ -812,7 +844,7 @@ class WorkloadAdmissionController:
             raise WorkloadAdmissionError(
                 "verifier_unavailable", "signature verifier preflight failed"
             ) from exc
-        self._preflight_complete = True
+        object.__setattr__(self, "_preflight_complete", True)
 
     def _manifest(self, request: WorkloadRequest) -> WorkloadManifest:
         if not isinstance(request, WorkloadRequest):
@@ -880,8 +912,20 @@ class WorkloadAdmissionController:
             privileged=request.privileged,
         )
 
-    def _capability(self, manifest: WorkloadManifest, mode: str) -> str:
-        material = b"cathedral-workload-admission-v1\0" + mode.encode("ascii") + b"\0"
+    def _capability(
+        self,
+        manifest: WorkloadManifest,
+        mode: str,
+        production_admission: bool,
+    ) -> str:
+        environment = b"production" if production_admission else b"development"
+        material = (
+            b"cathedral-workload-admission-v2\0"
+            + mode.encode("ascii")
+            + b"\0"
+            + environment
+            + b"\0"
+        )
         digest = hmac.new(
             self._capability_key,
             material + manifest.canonical_bytes,
@@ -898,7 +942,8 @@ class WorkloadAdmissionController:
         admitted = AdmittedWorkload(
             manifest,
             "enforced",
-            self._capability(manifest, "enforced"),
+            self.production_mode,
+            self._capability(manifest, "enforced", self.production_mode),
         )
         self._audit("admitted", None, manifest.digest)
         return admitted
@@ -960,7 +1005,8 @@ class WorkloadAdmissionController:
         admitted = AdmittedWorkload(
             manifest,
             "development_bypass",
-            self._capability(manifest, "development_bypass"),
+            False,
+            self._capability(manifest, "development_bypass", False),
         )
         self._audit(
             "development_bypass",
@@ -975,19 +1021,7 @@ class WorkloadAdmissionController:
         workload: AdmittedWorkload,
         adapter: WorkloadExecutionAdapter,
     ) -> WorkloadExecutionResult:
-        if not isinstance(workload, AdmittedWorkload):
-            raise WorkloadAdmissionError(
-                "execution_denied", "execution requires an admitted workload"
-            )
-        if self.production_mode and workload.admission_mode != "enforced":
-            raise WorkloadAdmissionError(
-                "execution_denied", "production execution requires enforced admission"
-            )
-        expected = self._capability(workload.manifest, workload.admission_mode)
-        if not hmac.compare_digest(workload._capability, expected):
-            raise WorkloadAdmissionError(
-                "execution_denied", "workload admission capability is invalid"
-            )
+        self.validate_admission(workload)
         result = adapter.execute(workload)
         if (
             not isinstance(result, WorkloadExecutionResult)
@@ -997,3 +1031,44 @@ class WorkloadAdmissionController:
                 "execution_failed", "execution adapter returned a mismatched result"
             )
         return result
+
+    def validate_admission(
+        self,
+        workload: AdmittedWorkload,
+        *,
+        require_enforced: bool | None = None,
+        require_production: bool | None = None,
+    ) -> WorkloadManifest:
+        """Validate a capability for execution or a dependent protected action."""
+
+        if require_enforced is None:
+            require_enforced = self.production_mode
+        if require_production is None:
+            require_production = self.production_mode
+        if not isinstance(require_enforced, bool):
+            raise TypeError("require_enforced must be a boolean")
+        if not isinstance(require_production, bool):
+            raise TypeError("require_production must be a boolean")
+        if not isinstance(workload, AdmittedWorkload):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution requires an admitted workload"
+            )
+        if require_enforced and workload.admission_mode != "enforced":
+            raise WorkloadAdmissionError(
+                "execution_denied", "protected action requires enforced admission"
+            )
+        if require_production and not workload.production_admission:
+            raise WorkloadAdmissionError(
+                "execution_denied",
+                "protected action requires production workload admission",
+            )
+        expected = self._capability(
+            workload.manifest,
+            workload.admission_mode,
+            workload.production_admission,
+        )
+        if not hmac.compare_digest(workload._capability, expected):
+            raise WorkloadAdmissionError(
+                "execution_denied", "workload admission capability is invalid"
+            )
+        return workload.manifest

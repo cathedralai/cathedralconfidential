@@ -301,6 +301,16 @@ class Enrollment:
     endpoint_url: str
 
 
+@dataclass(frozen=True)
+class VerifiedAttestationRecord:
+    """Verifier-owned assurance persisted for one enrolled worker."""
+
+    hotkey: str
+    chip_id: str
+    tier: str
+    assurance: AssuranceClaims
+
+
 class RegistryStore:
     def __init__(
         self,
@@ -346,6 +356,9 @@ class RegistryStore:
 
     def _init(self) -> None:
         with self._connect() as conn:
+            # Serialize schema/backfill clock sampling across RegistryStore
+            # instances before any lifecycle timestamp is consumed.
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS enrollments (
@@ -855,8 +868,8 @@ class RegistryStore:
         operator_detail: str | None = None,
     ) -> LifecycleSnapshot:
         with self._lifecycle_lock, self._connect() as conn:
-            when = at or self._lifecycle_now()
             conn.execute("BEGIN IMMEDIATE")
+            when = at or self._lifecycle_now()
             return self._transition_lifecycle_in_connection(
                 conn,
                 hotkey,
@@ -898,14 +911,42 @@ class RegistryStore:
         materialize_freshness: bool = True,
     ) -> LifecycleSnapshot:
         with self._lifecycle_lock, self._connect() as conn:
-            when = at or self._lifecycle_now()
             conn.execute("BEGIN IMMEDIATE")
+            when = at or self._lifecycle_now()
             self._advance_lifecycle_clock(conn, when)
             if materialize_freshness:
                 return self._materialize_expiry_in_connection(conn, hotkey, when)
             return self._lifecycle_snapshot_from_row(
                 self._lifecycle_row(conn, hotkey)
             )
+
+    def verified_attestation_record(self, hotkey: str) -> VerifiedAttestationRecord:
+        """Return the exact verifier result on record, never caller-supplied claims."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT hotkey,chip_id,tier,verification_status,assurance_json "
+                "FROM attestations WHERE hotkey=?",
+                (hotkey,),
+            ).fetchone()
+        if (
+            row is None
+            or row["verification_status"] != "VERIFIED"
+            or not isinstance(row["chip_id"], str)
+            or not row["chip_id"]
+            or not isinstance(row["tier"], str)
+            or not row["tier"]
+        ):
+            raise LifecycleError("verified attestation record is unavailable")
+        assurance = self._stored_assurance(row["assurance_json"])
+        if not ATTESTATION_ADMISSION_POLICY.allows(assurance):
+            raise LifecycleError("verified attestation record is unavailable")
+        return VerifiedAttestationRecord(
+            hotkey=row["hotkey"],
+            chip_id=row["chip_id"],
+            tier=row["tier"],
+            assurance=assurance,
+        )
 
     def record_attested_lifecycle(
         self,
@@ -953,8 +994,8 @@ class RegistryStore:
         if connection is not None:
             return apply(connection, at or self._lifecycle_now())
         with self._lifecycle_lock, self._connect() as conn:
-            when = at or self._lifecycle_now()
             conn.execute("BEGIN IMMEDIATE")
+            when = at or self._lifecycle_now()
             return apply(conn, when)
 
     def record_refresh_failure(
@@ -1038,8 +1079,8 @@ class RegistryStore:
         if connection is not None:
             return apply(connection, at or self._lifecycle_now())
         with self._lifecycle_lock, self._connect() as conn:
-            when = at or self._lifecycle_now()
             conn.execute("BEGIN IMMEDIATE")
+            when = at or self._lifecycle_now()
             return apply(conn, when)
 
     def due_refreshes(
@@ -1055,9 +1096,9 @@ class RegistryStore:
         ):
             raise LifecycleError("refresh-ahead window is invalid")
         with self._lifecycle_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             when = at or self._lifecycle_now()
             horizon = when + timedelta(seconds=refresh_ahead_seconds)
-            conn.execute("BEGIN IMMEDIATE")
             self._advance_lifecycle_clock(conn, when)
             rows = conn.execute(
                 "SELECT hotkey FROM worker_lifecycle_current ORDER BY hotkey"
@@ -1098,8 +1139,8 @@ class RegistryStore:
             raise LifecycleError("lifecycle measurement policy is invalid")
         revoked: list[LifecycleSnapshot] = []
         with self._lifecycle_lock, self._connect() as conn:
-            when = at or self._lifecycle_now()
             conn.execute("BEGIN IMMEDIATE")
+            when = at or self._lifecycle_now()
             self._advance_lifecycle_clock(conn, when)
             rows = conn.execute(
                 "SELECT * FROM worker_lifecycle_current ORDER BY hotkey"
@@ -1177,8 +1218,8 @@ class RegistryStore:
         if connection is not None:
             return apply(connection, at or self._lifecycle_now())
         with self._lifecycle_lock, self._connect() as conn:
-            when = at or self._lifecycle_now()
             conn.execute("BEGIN IMMEDIATE")
+            when = at or self._lifecycle_now()
             return apply(conn, when)
 
     def retire_lifecycle(
@@ -1191,8 +1232,8 @@ class RegistryStore:
         if not isinstance(removed, bool):
             raise LifecycleError("removed must be a boolean")
         with self._lifecycle_lock, self._connect() as conn:
-            when = at or self._lifecycle_now()
             conn.execute("BEGIN IMMEDIATE")
+            when = at or self._lifecycle_now()
             self._advance_lifecycle_clock(conn, when)
             current = self._lifecycle_snapshot_from_row(
                 self._lifecycle_row(conn, hotkey)

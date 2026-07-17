@@ -124,6 +124,7 @@ the real `verify()` interface; the real Intel TDX path runs on hardware (see
 - [`docs/RECEIPTS.md`](docs/RECEIPTS.md) - durable signed assurance receipts and offline verification
 - [`docs/LIFECYCLE.md`](docs/LIFECYCLE.md) - continuous re-attestation, worker states, and retry behavior
 - [`docs/WORKLOAD_ADMISSION.md`](docs/WORKLOAD_ADMISSION.md) - immutable signed workload admission contract
+- [`docs/KEY_RELEASE.md`](docs/KEY_RELEASE.md) - attestation-gated encrypted data-key release contract
 - [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path
 - [`HANDOFF.md`](HANDOFF.md) - commissioning and test handoff
 - [`RUNTEST.md`](RUNTEST.md) - test commands
