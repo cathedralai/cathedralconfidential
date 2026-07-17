@@ -13,7 +13,17 @@ import os
 
 import pytest
 
-from cathedral.common import Evidence, EvidenceKind, Policy, Tier, issue_nonce, report_data
+from cathedral.common import (
+    ChannelBinding,
+    ChannelBindingType,
+    Evidence,
+    EvidenceKind,
+    Policy,
+    Tier,
+    issue_nonce,
+    report_data,
+    report_data_v2,
+)
 from cathedral.verify import verify
 
 
@@ -113,6 +123,43 @@ def test_tdx_verify_accepts_verified_claims(tmp_path, monkeypatch, caplog):
     assert attested.tcb == 7
     assert attested.policy_mode == "compatibility"
     assert "compatibility policy mode" in caplog.text
+
+
+def test_tdx_verify_accepts_report_data_v2_and_rejects_changed_binding(
+    tmp_path, monkeypatch
+):
+    nonce = issue_nonce()
+    hotkey = "hotkey-tdx"
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32)
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path))
+    monkeypatch.setenv(
+        "FAKE_REPORT_DATA", report_data_v2(nonce, hotkey, binding).hex()
+    )
+    monkeypatch.setenv("FAKE_MEASUREMENT", "tdx-measurement-1")
+    monkeypatch.setenv("FAKE_TCB", "7")
+    monkeypatch.setenv("FAKE_PLATFORM_ID", "tdx-platform-1")
+    policy = Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=7)
+    evidence = Evidence(
+        EvidenceKind.TDX,
+        b"tdx-quote",
+        nonce,
+        hotkey,
+        report_data_version=2,
+        channel_binding=binding,
+    )
+
+    assert verify(evidence, nonce, policy) is not None
+    changed = Evidence(
+        EvidenceKind.TDX,
+        b"tdx-quote",
+        nonce,
+        hotkey,
+        report_data_version=2,
+        channel_binding=ChannelBinding(
+            ChannelBindingType.TLS_SPKI_SHA256, b"b" * 32
+        ),
+    )
+    assert verify(changed, nonce, policy) is None
 
 
 def test_tdx_verify_rejects_wrong_report_data(tmp_path, monkeypatch):

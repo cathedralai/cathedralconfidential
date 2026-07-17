@@ -43,11 +43,19 @@ The miner-side collector is:
 
 ```python
 from cathedral.attest import collect_tdx
-evidence = collect_tdx(nonce, hotkey)
+evidence = collect_tdx(
+    nonce,
+    hotkey,
+    channel_binding=worker_channel_binding,
+    report_data_version=2,
+)
 ```
 
-It writes Cathedral's 64-byte `report_data(nonce, hotkey, ssh_host_key?)` value
-to Linux configfs-tsm and reads the raw quote from `outblob`.
+It writes Cathedral's 64-byte `report_data_v2(nonce, hotkey, channel_binding)`
+value to Linux configfs-tsm and reads the raw quote from `outblob`. The worker
+must be configured with the digest of a channel key generated and held inside
+the attested environment. It must not attest an arbitrary digest supplied by a
+requesting client.
 
 The validator-side verifier is:
 
@@ -83,7 +91,7 @@ claims. The strict contract is:
 
 In strict mode Cathedral enforces:
 
-- `REPORTDATA == report_data(nonce, hotkey, ssh_host_key?)`
+- `REPORTDATA == report_data_v2(nonce, hotkey, channel_binding)` in production
 - `measurement in policy.allowed_measurements`
 - a recognized, explicitly allowed DCAP TCB status
 - an exact advisory allowlist; every non-`UpToDate` exception must name at
@@ -98,6 +106,30 @@ In strict mode Cathedral enforces:
 Raw `tee_tcb_svn` remains in the audit verdict but is not numerically ordered
 for strict admission. Unknown future status strings and absent, malformed, or
 contradictory typed claims fail closed.
+
+## Production channel binding
+
+Production endpoints use HTTPS. The evidence request is credential-free and
+names the TLS SPKI digest observed by the validator. The worker accepts that
+request only when the digest equals its configured in-guest key, then binds it
+into the fresh quote. After quote verification, the validator reopens the TLS
+connection, checks the same SPKI before writing any request bytes, and only then
+sends work and its bearer credential.
+
+Configure the loopback worker behind the in-guest TLS endpoint with the public
+digest (the digest is not a secret):
+
+```bash
+cathedral worker serve \
+  --hotkey "$MINER_HOTKEY" \
+  --channel-binding-type tls_spki_sha256 \
+  --channel-binding-digest "$TLS_SPKI_SHA256"
+```
+
+The TLS private key must terminate inside the measured environment. A public
+certificate by itself does not prove confidential execution. Plain HTTP is
+limited to the explicit development loopback flag and cannot satisfy the
+production channel claim.
 
 A production policy file looks like:
 

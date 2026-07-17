@@ -53,6 +53,11 @@ def sha256_digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+CHANNEL_BINDING_POLICY_DIGEST = sha256_digest(
+    b"cathedral-channel-binding-policy-v2"
+)
+
+
 def policy_digest(policy: object) -> str:
     """Digest the admission-relevant local policy until registry #25 replaces it."""
 
@@ -319,6 +324,23 @@ def evaluated_claim(
     )
 
 
+def with_verified_channel(
+    claims: AssuranceClaims,
+    binding_material: bytes,
+    *,
+    verified_at: str | None = None,
+) -> AssuranceClaims:
+    """Attach a passed channel claim after live-key and quote checks agree."""
+
+    channel = evaluated_claim(
+        ClaimStatus.PASSED,
+        binding_material,
+        CHANNEL_BINDING_POLICY_DIGEST,
+        verified_at=verified_at,
+    )
+    return claims.with_claim(AssuranceDimension.CHANNEL, channel)
+
+
 def assurance_from_dict(value: Mapping[str, object]) -> AssuranceClaims:
     if value.get("schema") != ASSURANCE_SCHEMA or not isinstance(
         value.get("claims"), Mapping
@@ -349,4 +371,3 @@ def assurance_from_dict(value: Mapping[str, object]) -> AssuranceClaims:
         dimension.value: parse(dimension) for dimension in AssuranceDimension
     }
     return AssuranceClaims(**parsed_claims)
-

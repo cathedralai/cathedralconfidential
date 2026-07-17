@@ -26,7 +26,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from cathedral.common import Evidence, EvidenceKind
+from cathedral.common import (
+    ChannelBinding,
+    ChannelBindingType,
+    Evidence,
+    EvidenceKind,
+)
 from cathedral.lanes.sat import SatLane, _canonical_instance, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.remote import RemoteError, RemoteMiner as _RemoteMiner
@@ -397,6 +402,35 @@ def test_evidence_invalid_nonce_hex_rejected():
     assert b"hex" in body.lower()
 
 
+@pytest.mark.parametrize("version", [True, 1.0, 2.0, "2"])
+def test_worker_rejects_non_integer_report_data_version(version):
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32)
+    called = False
+
+    def must_not_collect(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("invalid version reached collector")
+
+    with WorkerServer(
+        evidence_collector=must_not_collect, channel_binding=binding
+    ) as srv:
+        _start_server(srv)
+        payload = json.dumps(
+            {
+                "nonce_hex": os.urandom(32).hex(),
+                "assigned_hotkey": HOTKEY,
+                "report_data_version": version,
+                "channel_binding_type": binding.binding_type.value,
+                "channel_binding_digest_hex": binding.digest.hex(),
+            }
+        ).encode()
+        code, _ = _post_raw(f"{srv.base_url}/v1/evidence", payload)
+
+    assert code == 400
+    assert called is False
+
+
 def test_evidence_empty_hotkey_rejected():
     with WorkerServer(evidence_collector=_fake_evidence) as srv:
         _start_server(srv)
@@ -750,29 +784,60 @@ def test_work_units_not_trusted():
 # ---------------------------------------------------------------------------
 
 def test_bearer_token_missing_returns_401():
+    item = _make_sat_item()
     with WorkerServer(evidence_collector=_fake_evidence, bearer_token="tok") as srv:
         _start_server(srv)
-        payload = json.dumps({"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}).encode()
-        code, body = _post_raw(f"{srv.base_url}/v1/evidence", payload, bearer=None)
+        payload = json.dumps(
+            {
+                "challenge_id": item.challenge_id,
+                "assigned_hotkey": HOTKEY,
+                "instance": {
+                    "n_vars": item.instance.n_vars,
+                    "clauses": item.instance.clauses,
+                },
+                "seed": item.seed,
+            }
+        ).encode()
+        code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload, bearer=None)
     assert code == 401
     assert b"unauthorized" in body.lower()
 
 
 def test_bearer_token_wrong_returns_401():
+    item = _make_sat_item()
     with WorkerServer(evidence_collector=_fake_evidence, bearer_token="correct") as srv:
         _start_server(srv)
-        payload = json.dumps({"nonce_hex": os.urandom(32).hex(), "assigned_hotkey": HOTKEY}).encode()
-        code, _ = _post_raw(f"{srv.base_url}/v1/evidence", payload, bearer="wrong")
+        payload = json.dumps(
+            {
+                "challenge_id": item.challenge_id,
+                "assigned_hotkey": HOTKEY,
+                "instance": {
+                    "n_vars": item.instance.n_vars,
+                    "clauses": item.instance.clauses,
+                },
+                "seed": item.seed,
+            }
+        ).encode()
+        code, _ = _post_raw(f"{srv.base_url}/v1/sat-work", payload, bearer="wrong")
     assert code == 401
 
 
 def test_bearer_token_correct_accepted():
-    nonce = os.urandom(32)
+    item = _make_sat_item()
     with WorkerServer(evidence_collector=_fake_evidence, bearer_token="mysecret") as srv:
         _start_server(srv)
         remote = RemoteMiner(srv.base_url, HOTKEY, bearer_token="mysecret")
-        ev = remote.fetch_evidence(nonce)
-    assert ev.miner_hotkey == HOTKEY
+        cert = remote.do_sat_work(item)
+    assert cert.assigned_hotkey == HOTKEY
+
+
+def test_evidence_challenge_never_sends_or_requires_bearer_token():
+    nonce = os.urandom(32)
+    with WorkerServer(evidence_collector=_fake_evidence, bearer_token="secret") as srv:
+        _start_server(srv)
+        remote = RemoteMiner(srv.base_url, HOTKEY, bearer_token="wrong-on-purpose")
+        evidence = remote.fetch_evidence(nonce)
+    assert evidence.nonce == nonce
 
 
 # ---------------------------------------------------------------------------

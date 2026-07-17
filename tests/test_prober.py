@@ -15,7 +15,15 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from cathedral.assurance import attestation_claims
-from cathedral.common import Attested, EvidenceKind, Policy, Tier
+from cathedral.common import (
+    Attested,
+    ChannelBinding,
+    ChannelBindingType,
+    Evidence,
+    EvidenceKind,
+    Policy,
+    Tier,
+)
 from cathedral.enroll import RegistryStore
 from cathedral.prober import policy_from_args, probe_once
 
@@ -267,6 +275,73 @@ def test_production_mode_rejects_non_global_ip_before_network(tmp_path):
     assert board["count"] == 0
     for miner in board["miners"]:
         assert miner["verification_status"] == "FAILED"
+
+
+def test_production_probe_persists_verified_channel_claim(monkeypatch, tmp_path):
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32)
+
+    class BoundRemote:
+        def __init__(self, endpoint, hotkey, *, timeout):
+            assert endpoint == "https://8.8.8.8:443"
+            assert timeout == 5
+            self.hotkey = hotkey
+
+        def fetch_evidence(self, nonce):
+            return Evidence(
+                EvidenceKind.TDX,
+                TDX_QUOTE,
+                nonce,
+                self.hotkey,
+                report_data_version=2,
+                channel_binding=binding,
+            )
+
+        def confirm_channel_binding(self, evidence):
+            assert evidence.channel_binding == binding
+            return binding
+
+    monkeypatch.setattr("cathedral.prober.RemoteMiner", BoundRemote)
+    monkeypatch.setattr("cathedral.prober.verifier.verify", _fake_tdx_verify)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "P" * 47
+    store.enroll(hotkey, "https://8.8.8.8:443")
+
+    probe_once(store, Policy(), production_mode=True)
+
+    miner = store.board()["miners"][0]
+    assert miner["verification_status"] == "VERIFIED"
+    assert miner["assurance"]["claims"]["channel"]["status"] == "passed"
+
+
+def test_production_probe_channel_mismatch_records_failed(monkeypatch, tmp_path):
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32)
+
+    class MismatchedRemote:
+        def __init__(self, endpoint, hotkey, *, timeout):
+            self.hotkey = hotkey
+
+        def fetch_evidence(self, nonce):
+            return Evidence(
+                EvidenceKind.TDX,
+                TDX_QUOTE,
+                nonce,
+                self.hotkey,
+                report_data_version=2,
+                channel_binding=binding,
+            )
+
+        def confirm_channel_binding(self, evidence):
+            return ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"b" * 32)
+
+    monkeypatch.setattr("cathedral.prober.RemoteMiner", MismatchedRemote)
+    monkeypatch.setattr("cathedral.prober.verifier.verify", _fake_tdx_verify)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "Q" * 47
+    store.enroll(hotkey, "https://8.8.4.4:443")
+
+    probe_once(store, Policy(), production_mode=True)
+
+    assert store.board()["miners"][0]["verification_status"] == "FAILED"
 
 
 # ---------------------------------------------------------------------------

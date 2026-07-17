@@ -346,6 +346,8 @@ def test_worker_serve_defaults_to_loopback():
     assert args.host == "127.0.0.1"
     assert args.bearer_token_env == DEFAULT_WORKER_BEARER_ENV
     assert args.development_no_auth is False
+    assert args.channel_binding_type is None
+    assert args.channel_binding_digest is None
 
 
 def test_worker_serve_refuses_non_loopback_without_development_flag():
@@ -369,6 +371,13 @@ def test_worker_serve_requires_default_bearer_environment_value(monkeypatch):
     monkeypatch.delenv(DEFAULT_WORKER_BEARER_ENV, raising=False)
     args = build_parser().parse_args(["worker", "serve", "--hotkey", "miner"])
     with pytest.raises(ValueError, match=DEFAULT_WORKER_BEARER_ENV):
+        cmd_worker_serve(args)
+
+
+def test_worker_production_requires_channel_binding(monkeypatch):
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
+    args = build_parser().parse_args(["worker", "serve", "--hotkey", "miner"])
+    with pytest.raises(ValueError, match="channel binding"):
         cmd_worker_serve(args)
 
 
@@ -397,6 +406,44 @@ def test_worker_development_no_auth_is_explicit(monkeypatch):
     )
     assert cmd_worker_serve(args) == 0
     assert calls[0]["bearer_token"] is None
+
+
+def test_worker_cli_builds_typed_channel_binding(monkeypatch):
+    calls = []
+
+    class FakeServer:
+        host = "127.0.0.1"
+        port = 8081
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--development-no-auth",
+            "--channel-binding-type",
+            "tls_spki_sha256",
+            "--channel-binding-digest",
+            "ab" * 32,
+        ]
+    )
+
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["channel_binding"].digest == bytes.fromhex("ab" * 32)
 
 
 def test_production_token_mapping_requires_owner_only_permissions(tmp_path: Path):

@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from cathedral.api import Allocator, Inventory, Request, WorkQueue
-from cathedral.assurance import attestation_claims
+from cathedral.assurance import attestation_claims, with_verified_channel
 from cathedral.common import Attested, Policy, Tier
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
@@ -24,12 +24,16 @@ def _canonical() -> SatWorkItem:
 
 def _attested(tier: Tier, chip_id: str) -> Attested:
     policy = Policy(allowed_measurements={"m"})
+    claims = with_verified_channel(
+        attestation_claims(chip_id.encode(), policy),
+        f"channel:{chip_id}".encode(),
+    )
     return Attested(
         tier,
         chip_id,
         "m",
         3,
-        assurance=attestation_claims(chip_id.encode(), policy),
+        assurance=claims,
     )
 
 
@@ -93,6 +97,23 @@ def test_allocator_returns_none_when_nothing_qualifies():
     inv.register("uidB", _attested(Tier.CC_GPU, "c2"))
     alloc = Allocator(inv)
     assert alloc.allocate(Request(lane=SatLane())) is None
+
+
+def test_allocator_does_not_dispatch_to_attested_but_unbound_channel():
+    inv = Inventory()
+    policy = Policy(allowed_measurements={"m"})
+    inv.register(
+        "uid",
+        Attested(
+            Tier.CC_CPU_TDX,
+            "chip",
+            "m",
+            1,
+            assurance=attestation_claims(b"quote", policy),
+        ),
+    )
+
+    assert Allocator(inv).allocate(Request(lane=SatLane())) is None
 
 
 def test_inventory_rejects_legacy_verified_flag_without_typed_claims():

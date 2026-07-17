@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,16 @@ from pathlib import Path
 import pytest
 
 from cathedral.assurance import ClaimStatus, attestation_claims
-from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce
+from cathedral.common import (
+    Attested,
+    ChannelBinding,
+    ChannelBindingType,
+    Evidence,
+    EvidenceKind,
+    Policy,
+    Tier,
+    issue_nonce,
+)
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
@@ -21,6 +31,7 @@ from cathedral.runtime import (
     RuntimeConfig,
     RuntimeError,
     SAT_WORK_POLICY_DIGEST,
+    _evidence_digest,
     _work_assurance,
 )
 
@@ -35,6 +46,8 @@ class MinerSpec:
     sat_failures: int = 0
     invalid_sat: bool = False
     evidence_kind: EvidenceKind = EvidenceKind.TDX
+    channel_mismatch: bool = False
+    legacy_evidence: bool = False
 
 
 class FakeClient:
@@ -45,6 +58,10 @@ class FakeClient:
         self.log = log
         self.evidence_calls = 0
         self.sat_calls = 0
+        self.binding = ChannelBinding(
+            ChannelBindingType.APPLICATION_KEY_SHA256,
+            hashlib.sha256(endpoint.encode("utf-8")).digest(),
+        )
 
     def collect_evidence(self, nonce: bytes) -> Evidence:
         self.log.setdefault(f"nonce:{self.hotkey}", []).append(nonce)
@@ -57,7 +74,18 @@ class FakeClient:
             nonce=nonce,
             miner_hotkey=self.hotkey,
             cert_chain=[b"chain"],
+            report_data_version=1 if self.spec.legacy_evidence else 2,
+            channel_binding=None if self.spec.legacy_evidence else self.binding,
         )
+
+    def confirm_channel_binding(self, evidence: Evidence) -> ChannelBinding:
+        if evidence.channel_binding != self.binding:
+            raise RuntimeError("test channel binding mismatch")
+        if self.spec.channel_mismatch:
+            return ChannelBinding(
+                ChannelBindingType.APPLICATION_KEY_SHA256, b"x" * 32
+            )
+        return self.binding
 
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate:
         self.log.setdefault(f"sat:{self.hotkey}", []).append(item.challenge_id)
@@ -266,7 +294,7 @@ def test_hardware_pass_with_work_failure_is_explicit_zero(tmp_path: Path) -> Non
     assert outcome.assurance is not None
     assert outcome.assurance.hardware.status is ClaimStatus.PASSED
     assert outcome.assurance.software.status is ClaimStatus.PASSED
-    assert outcome.assurance.channel.status is ClaimStatus.NOT_EVALUATED
+    assert outcome.assurance.channel.status is ClaimStatus.PASSED
     assert outcome.assurance.work.status is ClaimStatus.FAILED
 
 
@@ -282,6 +310,42 @@ def test_runtime_rejects_legacy_verified_flag_without_typed_claims(tmp_path: Pat
     with pytest.raises(RuntimeError, match="hardware and software admission claims"):
         runtime.run_epoch(1, CANARY)
     assert ledger.blocking_epoch() is None
+    assert "sat:canary" not in factory.log
+
+
+def test_channel_mismatch_never_dispatches_work_or_admits(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a", channel_mismatch=True)})
+    runtime, _, factory = make_runtime(
+        tmp_path, [("miner", "http://127.0.0.1:9001")], specs
+    )
+
+    run = runtime.run_epoch(1, CANARY)
+    outcome = next(item for item in run.outcomes if item.hotkey == "miner")
+
+    assert outcome.status == "attestation_failed"
+    assert outcome.score == 0.0
+    assert "sat:miner" not in factory.log
+
+
+def test_production_rejects_legacy_report_data_before_work(tmp_path: Path) -> None:
+    registry = RegistryStore(str(tmp_path / "registry.sqlite"))
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    factory = FakeFactory(
+        {"https://8.8.8.8:9000": MinerSpec("canary", legacy_evidence=True)}
+    )
+    runtime = ConfidentialRuntime(
+        registry,
+        ledger,
+        Policy(allowed_measurements={"measurement"}),
+        verifier=verifier,
+        remote_factory=factory,
+        config=RuntimeConfig(production_mode=True),
+    )
+
+    with pytest.raises(RuntimeError, match="report data v2"):
+        runtime.check_canary(
+            MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
+        )
     assert "sat:canary" not in factory.log
 
 
@@ -309,6 +373,38 @@ def test_invalid_untrusted_certificate_still_produces_failed_work_claim():
     assert claims.work.status is ClaimStatus.FAILED
     assert claims.work.policy_digest == SAT_WORK_POLICY_DIGEST
     assert claims.work.policy_digest != claims.software.policy_digest
+
+
+def test_evidence_audit_digest_commits_to_report_version_and_channel_binding():
+    common = dict(
+        kind=EvidenceKind.TDX,
+        quote=b"quote",
+        nonce=b"n" * 32,
+        miner_hotkey="miner",
+    )
+    legacy = Evidence(**common)
+    first = Evidence(
+        **common,
+        report_data_version=2,
+        channel_binding=ChannelBinding(
+            ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32
+        ),
+    )
+    second = Evidence(
+        **common,
+        report_data_version=2,
+        channel_binding=ChannelBinding(
+            ChannelBindingType.TLS_SPKI_SHA256, b"b" * 32
+        ),
+    )
+
+    assert len(
+        {
+            _evidence_digest(legacy),
+            _evidence_digest(first),
+            _evidence_digest(second),
+        }
+    ) == 3
 
 
 def test_runtime_persists_strict_attestation_policy_mode(tmp_path: Path) -> None:

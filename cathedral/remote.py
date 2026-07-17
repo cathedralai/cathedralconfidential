@@ -1,16 +1,19 @@
 """Typed, bounded HTTPS-by-default client for a Cathedral miner worker."""
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import socket
+import ssl
 import string
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
-from cathedral.common import Evidence, EvidenceKind
+from cathedral.channel import ChannelBindingError, tls_spki_binding
+from cathedral.common import ChannelBinding, ChannelBindingType, Evidence, EvidenceKind
 from cathedral.lanes.sat import _compute_challenge_id
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
@@ -25,6 +28,9 @@ MAX_SEED: int = 2**63 - 1
 
 _EVIDENCE_RESPONSE_KEYS = frozenset(
     {"kind", "quote_hex", "nonce_hex", "assigned_hotkey", "cert_chain_hex"}
+)
+_EVIDENCE_V2_RESPONSE_KEYS = _EVIDENCE_RESPONSE_KEYS | frozenset(
+    {"report_data_version", "channel_binding_type", "channel_binding_digest_hex"}
 )
 _SAT_RESPONSE_KEYS = frozenset(
     {"satisfiable", "assignment", "work_units", "challenge_id", "assigned_hotkey"}
@@ -53,6 +59,7 @@ class RemoteMiner:
         timeout: float = 10.0,
         max_response_body: int = MAX_RESPONSE_BODY,
         allow_insecure_http: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         if not isinstance(hotkey, str) or not hotkey or len(hotkey) > MAX_HOTKEY_LENGTH:
             raise ValueError("hotkey must be a non-empty bounded string")
@@ -81,13 +88,28 @@ class RemoteMiner:
             raise ValueError("endpoint must not contain credentials")
         if parsed.query or parsed.fragment:
             raise ValueError("endpoint must not contain a query or fragment")
+        if parsed.path not in {"", "/"}:
+            raise ValueError("endpoint must not contain a path")
+        if ssl_context is not None and not isinstance(ssl_context, ssl.SSLContext):
+            raise ValueError("ssl_context must be an SSLContext")
+        if ssl_context is not None and (
+            ssl_context.verify_mode != ssl.CERT_REQUIRED
+            or not ssl_context.check_hostname
+        ):
+            raise ValueError("ssl_context must verify certificates and hostnames")
 
         self._endpoint = endpoint.rstrip("/")
+        self._scheme = parsed.scheme
+        self._host = parsed.hostname
+        self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
         self._hotkey = hotkey
         self._bearer_token = bearer_token
         self._timeout = float(timeout)
         self._max_response_body = max_response_body
         self._opener = urllib.request.build_opener(_RejectRedirects())
+        self._ssl_context = ssl_context
+        self._pending_binding: ChannelBinding | None = None
+        self._trusted_binding: ChannelBinding | None = None
 
     @property
     def uid(self) -> str:
@@ -101,12 +123,39 @@ class RemoteMiner:
     def fetch_evidence(self, nonce: bytes) -> Evidence:
         if not isinstance(nonce, bytes) or len(nonce) != 32:
             raise RemoteError("nonce must be exactly 32 bytes")
+        self._pending_binding = None
+        self._trusted_binding = None
 
-        response = self._post(
-            "/v1/evidence",
-            {"nonce_hex": nonce.hex(), "assigned_hotkey": self._hotkey},
-        )
-        _check_exact_keys(response, _EVIDENCE_RESPONSE_KEYS, "evidence response")
+        if self._scheme == "https":
+            response, observed_binding = self._post_tls(
+                "/v1/evidence",
+                lambda binding: {
+                    "nonce_hex": nonce.hex(),
+                    "assigned_hotkey": self._hotkey,
+                    "report_data_version": 2,
+                    "channel_binding_type": binding.binding_type.value,
+                    "channel_binding_digest_hex": binding.digest.hex(),
+                },
+                expected_binding=None,
+                include_auth=False,
+            )
+            _check_exact_keys(
+                response, _EVIDENCE_V2_RESPONSE_KEYS, "evidence response"
+            )
+            response_binding = _response_channel_binding(response)
+            if response.get("report_data_version") != 2:
+                raise RemoteError("evidence response has invalid report data version")
+            if response_binding != observed_binding:
+                raise RemoteError("evidence response channel binding mismatch")
+            self._pending_binding = observed_binding
+        else:
+            response = self._post_http(
+                "/v1/evidence",
+                {"nonce_hex": nonce.hex(), "assigned_hotkey": self._hotkey},
+                include_auth=False,
+            )
+            _check_exact_keys(response, _EVIDENCE_RESPONSE_KEYS, "evidence response")
+            response_binding = None
 
         if response["nonce_hex"] != nonce.hex():
             raise RemoteError("evidence response nonce mismatch")
@@ -138,22 +187,54 @@ class RemoteMiner:
             nonce=nonce,
             miner_hotkey=self._hotkey,
             cert_chain=cert_chain,
+            report_data_version=2 if response_binding is not None else 1,
+            channel_binding=response_binding,
         )
+
+    def confirm_channel_binding(self, evidence: Evidence) -> ChannelBinding:
+        """Promote the live key after the caller has verified this exact quote.
+
+        This method checks transport state; the caller owns vendor quote and
+        REPORT_DATA verification and must call it only after that succeeds.
+        """
+
+        if (
+            self._scheme != "https"
+            or self._pending_binding is None
+            or evidence.report_data_version != 2
+            or evidence.channel_binding != self._pending_binding
+        ):
+            self._pending_binding = None
+            self._trusted_binding = None
+            raise RemoteError("attested channel binding mismatch")
+        self._trusted_binding = self._pending_binding
+        self._pending_binding = None
+        return self._trusted_binding
 
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate:
         _validate_work_item(item)
-        response = self._post(
-            "/v1/sat-work",
-            {
-                "challenge_id": item.challenge_id,
-                "assigned_hotkey": self._hotkey,
-                "instance": {
-                    "n_vars": item.instance.n_vars,
-                    "clauses": item.instance.clauses,
-                },
-                "seed": item.seed,
+        payload = {
+            "challenge_id": item.challenge_id,
+            "assigned_hotkey": self._hotkey,
+            "instance": {
+                "n_vars": item.instance.n_vars,
+                "clauses": item.instance.clauses,
             },
-        )
+            "seed": item.seed,
+        }
+        if self._scheme == "https":
+            if self._trusted_binding is None:
+                raise RemoteError("attested channel binding is required before work")
+            response, _ = self._post_tls(
+                "/v1/sat-work",
+                lambda _binding: payload,
+                expected_binding=self._trusted_binding,
+                include_auth=True,
+            )
+        else:
+            response = self._post_http(
+                "/v1/sat-work", payload, include_auth=True
+            )
         _check_exact_keys(response, _SAT_RESPONSE_KEYS, "sat-work response")
 
         if response["challenge_id"] != item.challenge_id:
@@ -186,7 +267,9 @@ class RemoteMiner:
             assigned_hotkey=self._hotkey,
         )
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_http(
+        self, path: str, payload: dict[str, Any], *, include_auth: bool
+    ) -> dict[str, Any]:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
             self._endpoint + path,
@@ -194,7 +277,7 @@ class RemoteMiner:
             method="POST",
             headers={"Content-Type": "application/json"},
         )
-        if self._bearer_token:
+        if include_auth and self._bearer_token:
             request.add_header("Authorization", f"Bearer {self._bearer_token}")
 
         try:
@@ -232,6 +315,94 @@ class RemoteMiner:
         if not isinstance(decoded, dict):
             raise RemoteError("worker response must be a JSON object")
         return decoded
+
+    def _post_tls(
+        self,
+        path: str,
+        payload_factory: Callable[[ChannelBinding], dict[str, Any]],
+        *,
+        expected_binding: ChannelBinding | None,
+        include_auth: bool,
+    ) -> tuple[dict[str, Any], ChannelBinding]:
+        connection = http.client.HTTPSConnection(
+            self._host,
+            self._port,
+            timeout=self._timeout,
+            context=self._ssl_context,
+        )
+        try:
+            connection.connect()
+            if connection.sock is None:
+                raise RemoteError("worker TLS channel unavailable")
+            certificate = connection.sock.getpeercert(binary_form=True)
+            try:
+                observed = tls_spki_binding(certificate)
+            except ChannelBindingError:
+                raise RemoteError("worker TLS certificate is invalid") from None
+            if expected_binding is not None and observed != expected_binding:
+                self._trusted_binding = None
+                raise RemoteError("worker channel key changed")
+
+            body = json.dumps(
+                payload_factory(observed), separators=(",", ":")
+            ).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if include_auth and self._bearer_token:
+                headers["Authorization"] = f"Bearer {self._bearer_token}"
+            connection.request("POST", path, body=body, headers=headers)
+            response = connection.getresponse()
+            if 300 <= response.status < 400:
+                raise RemoteError("worker redirect rejected")
+            if response.status < 200 or response.status >= 300:
+                raise RemoteError(f"worker returned HTTP {response.status}")
+            raw = _read_response(response, self._max_response_body)
+        except RemoteError:
+            raise
+        except (socket.timeout, TimeoutError):
+            raise RemoteError("worker request timed out") from None
+        except (ssl.SSLError, OSError, http.client.HTTPException):
+            raise RemoteError("worker network error") from None
+        except Exception:
+            raise RemoteError("worker request failed") from None
+        finally:
+            connection.close()
+
+        return _decode_response(raw), observed
+
+
+def _read_response(response: http.client.HTTPResponse, cap: int) -> bytes:
+    declared = response.getheader("Content-Length")
+    if declared is not None:
+        if not declared.isascii() or not declared.isdecimal():
+            raise RemoteError("worker response has invalid length")
+        if int(declared) > cap:
+            raise RemoteError("worker response exceeds body limit")
+    raw = response.read(cap + 1)
+    if len(raw) > cap:
+        raise RemoteError("worker response exceeds body limit")
+    return raw
+
+
+def _decode_response(raw: bytes) -> dict[str, Any]:
+    try:
+        decoded = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RemoteError("worker response is not valid JSON") from None
+    if not isinstance(decoded, dict):
+        raise RemoteError("worker response must be a JSON object")
+    return decoded
+
+
+def _response_channel_binding(response: dict[str, Any]) -> ChannelBinding:
+    try:
+        binding_type = ChannelBindingType(response["channel_binding_type"])
+        digest_hex = response["channel_binding_digest_hex"]
+        if not isinstance(digest_hex, str) or not _is_hex(digest_hex):
+            raise ValueError
+        digest = bytes.fromhex(digest_hex)
+        return ChannelBinding(binding_type, digest)
+    except (KeyError, TypeError, ValueError):
+        raise RemoteError("evidence response has invalid channel binding") from None
 
 
 def _validate_work_item(item: SatWorkItem) -> None:

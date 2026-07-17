@@ -178,7 +178,16 @@ Miners cannot choose their own credit. Every work unit's difficulty and credit i
 - SEV-SNP: report via `/dev/sev-guest`
 - TDX: guest calls `TDG.MR.REPORT` (TDCALL) → TDREPORT → host Quote Generation Service → DCAP quote
 - GPU: NVIDIA attestation via NVML / nvtrust
-- **Binding:** `REPORT_DATA = sha512(nonce ‖ miner_hotkey ‖ ssh_host_key?)`. The nonce gives freshness; the hotkey binds the evidence to the registered identity (defeats evidence-relay — one machine fronting for many UIDs); the SSH host key (Sandbox) binds the rental channel into the quote.
+- **Binding:** production uses `report_data_v2`, a domain-separated and versioned
+  SHA-512 encoding of tagged, length-delimited `nonce`, `miner_hotkey`, binding
+  type, and channel-key digest. The nonce gives freshness, the hotkey defeats
+  evidence relay, and the key digest binds the quote to either the live TLS
+  SubjectPublicKeyInfo or an application-encryption key. Legacy concatenation
+  remains available only to explicit non-production migration and test paths.
+- **Protected dispatch:** the validator observes the TLS key on the evidence
+  connection, verifies the same digest inside fresh quote evidence, and checks
+  the key again on the exact connection before it sends work or bearer
+  credentials. A redirect, downgrade, or certificate rotation fails closed.
 
 **Validator-side verifier** does policy; vendors do the crypto:
 - AMD KDS cert chains, Intel DCAP / Trust Authority, NVIDIA NRAS/nvtrust
@@ -198,7 +207,8 @@ runtime and lease state, must remain inside the measured trust boundary.
 The rental unit is a **CVM, not a container**. The move that makes SSH-into-a-CVM trustworthy (~30 lines):
 
 1. Host-agent launches a CVM from Cathedral's signed, measured image; renter GPU passed through in CC mode.
-2. Guest-agent generates the SSH host key at boot, requests a quote with `sha512(ssh_host_key ‖ renter_pubkey ‖ nonce)` in `REPORT_DATA`.
+2. Guest-agent generates the SSH host key at boot and requests a quote whose
+   versioned `REPORT_DATA` binds that key, the renter identity, and a fresh nonce.
 3. Renter CLI verifies the quote (measurement matches published image hash, TCB current, nonce fresh) and pins the host key from it.
 4. `ssh` connects. Matching fingerprint ⇒ the session terminates inside genuine confidential hardware running exactly Cathedral's image. Host cannot MITM, inspect, or fake it.
 

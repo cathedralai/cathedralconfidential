@@ -16,7 +16,13 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from cathedral.common import Evidence, EvidenceKind, report_data
+from cathedral.common import (
+    ChannelBinding,
+    Evidence,
+    EvidenceKind,
+    report_data,
+    report_data_v2,
+)
 
 _DEFAULT_TSM_REPORT_ROOT = Path("/sys/kernel/config/tsm/report")
 _DEFAULT_SEV_GUEST_DEV = Path("/dev/sev-guest")
@@ -32,7 +38,14 @@ def _snpguest_timeout() -> float:
         return 30.0
 
 
-def collect_snp(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) -> Evidence:
+def collect_snp(
+    nonce: bytes,
+    hotkey: str,
+    ssh_host_key: bytes | None = None,
+    *,
+    channel_binding: ChannelBinding | None = None,
+    report_data_version: int = 1,
+) -> Evidence:
     """AMD SEV-SNP attestation report via /dev/sev-guest with bound REPORT_DATA.
 
     Binds ``report_data(nonce, hotkey, ssh_host_key)`` = sha512(nonce ‖ hotkey
@@ -49,7 +62,14 @@ def collect_snp(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) ->
     Must run inside an SEV-SNP guest (needs ``/dev/sev-guest``). Uses ``snpguest``
     (github.com/virtee/snpguest); override the binary with ``CATHEDRAL_SNPGUEST``.
     """
-    rd = report_data(nonce, hotkey, ssh_host_key)  # 64 bytes — the whole binding
+    if report_data_version == 2:
+        if channel_binding is None:
+            raise ValueError("report data v2 requires a channel binding")
+        rd = report_data_v2(nonce, hotkey, channel_binding)
+    elif report_data_version == 1:
+        rd = report_data(nonce, hotkey, ssh_host_key)
+    else:
+        raise ValueError("unsupported report data version")
     dev = Path(os.environ.get("CATHEDRAL_SEV_GUEST_DEV", _DEFAULT_SEV_GUEST_DEV))
     quote, cert_chain = _collect_snpguest_report(rd, dev=dev)
     return Evidence(
@@ -59,6 +79,8 @@ def collect_snp(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) ->
         nonce=nonce,
         miner_hotkey=hotkey,
         ssh_host_key=ssh_host_key,
+        report_data_version=report_data_version,
+        channel_binding=channel_binding,
     )
 
 
@@ -150,14 +172,28 @@ def _fetch_snp_cert_chain(snpguest: str, report_path: Path, work: Path) -> list[
     ]
 
 
-def collect_tdx(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) -> Evidence:
+def collect_tdx(
+    nonce: bytes,
+    hotkey: str,
+    ssh_host_key: bytes | None = None,
+    *,
+    channel_binding: ChannelBinding | None = None,
+    report_data_version: int = 1,
+) -> Evidence:
     """Intel TDX quote via configfs-tsm (TDG.MR.REPORT -> TDREPORT -> DCAP quote).
 
     This intentionally only collects evidence. DCAP or Trust Authority
     verification happens validator-side in ``cathedral.verify.verify``.
     """
 
-    rd = report_data(nonce, hotkey, ssh_host_key)
+    if report_data_version == 2:
+        if channel_binding is None:
+            raise ValueError("report data v2 requires a channel binding")
+        rd = report_data_v2(nonce, hotkey, channel_binding)
+    elif report_data_version == 1:
+        rd = report_data(nonce, hotkey, ssh_host_key)
+    else:
+        raise ValueError("unsupported report data version")
     root = Path(os.environ.get("CATHEDRAL_TDX_TSM_REPORT_ROOT", _DEFAULT_TSM_REPORT_ROOT))
     quote, cert_chain = _collect_configfs_tsm_quote(rd, root=root)
     return Evidence(
@@ -167,6 +203,8 @@ def collect_tdx(nonce: bytes, hotkey: str, ssh_host_key: bytes | None = None) ->
         nonce=nonce,
         miner_hotkey=hotkey,
         ssh_host_key=ssh_host_key,
+        report_data_version=report_data_version,
+        channel_binding=channel_binding,
     )
 
 

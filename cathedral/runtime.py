@@ -13,21 +13,31 @@ import json
 import math
 import urllib.parse
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 
 from cathedral.assurance import (
     ATTESTATION_ADMISSION_POLICY,
     SCORE_ELIGIBILITY_POLICY,
+    WORK_DISPATCH_POLICY,
     AssuranceClaims,
     AssuranceDimension,
     ClaimStatus,
     ReasonCategory,
     evaluated_claim,
     sha256_digest,
+    with_verified_channel,
 )
-from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce
+from cathedral.common import (
+    Attested,
+    ChannelBinding,
+    Evidence,
+    EvidenceKind,
+    Policy,
+    Tier,
+    issue_nonce,
+)
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
@@ -46,6 +56,8 @@ class RuntimeError(Exception):
 
 class MinerClient(Protocol):
     def collect_evidence(self, nonce: bytes) -> Evidence: ...
+
+    def confirm_channel_binding(self, evidence: Evidence) -> ChannelBinding: ...
 
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate: ...
 
@@ -176,6 +188,8 @@ class ConfidentialRuntime:
         result = self._collect_attestation(target, endpoint)
         if result.attested is None or result.client is None:
             raise RuntimeError(f"canary attestation failed: {result.error or 'rejected'}")
+        if not WORK_DISPATCH_POLICY.allows(result.attested.assurance):
+            raise RuntimeError("canary lacks a verified protected channel")
 
         lane = SatLane(namespace=f"canary:{target.hotkey}")
         item = lane.dispatch(target.hotkey, budget=1)
@@ -446,6 +460,17 @@ class ConfidentialRuntime:
         lane = SatLane(namespace=f"source-epoch:{source_epoch}:attempt:{epoch_id}")
         issued: list[tuple[_AttestationResult, SatWorkItem]] = []
         for result in admitted:
+            assert result.attested is not None
+            if not WORK_DISPATCH_POLICY.allows(result.attested.assurance):
+                outcomes[result.target.hotkey] = MinerOutcome(
+                    result.target.hotkey,
+                    result.endpoint,
+                    "channel_binding_failed",
+                    admitted=False,
+                    error="protected work dispatch claims were not satisfied",
+                    assurance=result.attested.assurance,
+                )
+                continue
             item = lane.dispatch(result.target.hotkey, budget=1)
             if not isinstance(item, SatWorkItem):
                 raise RuntimeError("SAT lane returned a non-canonical work item")
@@ -542,6 +567,25 @@ class ConfidentialRuntime:
                 if not ATTESTATION_ADMISSION_POLICY.allows(verdict.assurance):
                     raise RuntimeError(
                         "TDX verdict does not satisfy hardware and software admission claims"
+                    )
+                if evidence.report_data_version == 2:
+                    binding = client.confirm_channel_binding(evidence)
+                    if binding != evidence.channel_binding:
+                        raise RuntimeError("live endpoint key does not match attested binding")
+                    assert verdict.assurance is not None
+                    verdict = replace(
+                        verdict,
+                        assurance=with_verified_channel(
+                            verdict.assurance, binding.canonical_bytes()
+                        ),
+                    )
+                elif self.config.production_mode:
+                    raise RuntimeError("production evidence requires report data v2")
+                if self.config.production_mode and not WORK_DISPATCH_POLICY.allows(
+                    verdict.assurance
+                ):
+                    raise RuntimeError(
+                        "production evidence requires a verified channel binding"
                     )
                 return _AttestationResult(
                     target,
@@ -683,11 +727,20 @@ def _validate_bearer_token(token: str | None, *, required: bool) -> None:
 
 def _evidence_digest(evidence: Evidence) -> str:
     digest = hashlib.sha256()
+    binding = (
+        evidence.channel_binding.canonical_bytes()
+        if evidence.channel_binding is not None
+        else b""
+    )
     for value in (
         evidence.kind.value.encode("ascii"),
         evidence.quote,
         evidence.nonce,
         evidence.miner_hotkey.encode("utf-8"),
+        evidence.report_data_version.to_bytes(2, "big"),
+        binding,
+        evidence.ssh_host_key or b"",
+        evidence.composite_jwt.encode("utf-8") if evidence.composite_jwt else b"",
         *evidence.cert_chain,
     ):
         digest.update(len(value).to_bytes(8, "big"))

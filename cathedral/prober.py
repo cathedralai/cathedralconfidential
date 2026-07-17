@@ -12,15 +12,17 @@ import logging
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from http.client import HTTPResponse
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import cathedral.verify as verifier
-from cathedral.assurance import ATTESTATION_ADMISSION_POLICY
+from cathedral.assurance import ATTESTATION_ADMISSION_POLICY, with_verified_channel
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce
 from cathedral.enroll import RegistryStore
+from cathedral.remote import RemoteMiner
 
 
 MAX_EVIDENCE_BYTES = 64 * 1024
@@ -420,18 +422,45 @@ def probe_once(
     def _probe_one(enrollment: Any) -> None:
         nonce = issue_nonce()
         try:
-            evidences = _request_evidence(
-                enrollment.endpoint_url,
-                enrollment.hotkey,
-                nonce,
-                resolver=resolver,
-                opener=opener,
-                production_mode=production_mode,
-            )
+            if production_mode:
+                _resolve_endpoint(
+                    enrollment.endpoint_url,
+                    resolver=resolver,
+                    production_mode=True,
+                )
+                if urlparse(enrollment.endpoint_url).scheme != "https":
+                    raise ValueError("production probing requires HTTPS")
+                client = RemoteMiner(
+                    enrollment.endpoint_url,
+                    enrollment.hotkey,
+                    timeout=TIMEOUT_SECONDS,
+                )
+                evidence = client.fetch_evidence(nonce)
+                evidences = [evidence]
+            else:
+                client = None
+                evidences = _request_evidence(
+                    enrollment.endpoint_url,
+                    enrollment.hotkey,
+                    nonce,
+                    resolver=resolver,
+                    opener=opener,
+                    production_mode=False,
+                )
             attested = verify_cc_evidence_bundle(evidences, nonce, policy)
             if attested is None:
                 store.record_verdict(enrollment.hotkey, None, error="verification failed")
             else:
+                if client is not None:
+                    binding = client.confirm_channel_binding(evidence)
+                    if binding != evidence.channel_binding or attested.assurance is None:
+                        raise ValueError("attested channel binding mismatch")
+                    attested = replace(
+                        attested,
+                        assurance=with_verified_channel(
+                            attested.assurance, binding.canonical_bytes()
+                        ),
+                    )
                 store.record_verdict(enrollment.hotkey, attested)
         except Exception as exc:
             try:

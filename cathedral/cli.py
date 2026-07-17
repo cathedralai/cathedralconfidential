@@ -34,7 +34,7 @@ from pathlib import Path
 from cathedral import census as census_mod
 from cathedral.api import WorkQueue
 from cathedral.assurance import AssuranceDimension
-from cathedral.common import Policy
+from cathedral.common import ChannelBinding, ChannelBindingType, Policy
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
@@ -508,11 +508,27 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             raise ValueError(
                 f"worker bearer token must be set in {bearer_env}"
             )
+    binding_type = getattr(args, "channel_binding_type", None)
+    binding_digest = getattr(args, "channel_binding_digest", None)
+    if (binding_type is None) != (binding_digest is None):
+        raise ValueError("worker channel binding type and digest must be supplied together")
+    channel_binding = None
+    if binding_type is not None:
+        try:
+            if re.fullmatch(r"[0-9a-f]{64}", binding_digest) is None:
+                raise ValueError
+            digest = bytes.fromhex(binding_digest)
+            channel_binding = ChannelBinding(ChannelBindingType(binding_type), digest)
+        except (TypeError, ValueError):
+            raise ValueError("worker channel binding is invalid") from None
+    if not getattr(args, "development_no_auth", False) and channel_binding is None:
+        raise ValueError("production worker requires a configured channel binding")
     with WorkerServer(
         args.host,
         args.port,
         configured_hotkey=args.hotkey,
         bearer_token=token,
+        channel_binding=channel_binding,
         allow_non_loopback_for_development=args.development_allow_non_loopback,
     ) as server:
         print(json.dumps({"host": server.host, "port": server.port, "hotkey": args.hotkey}))
@@ -663,6 +679,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--bearer-token-env", default=DEFAULT_WORKER_BEARER_ENV)
     p_serve.add_argument("--development-no-auth", action="store_true")
     p_serve.add_argument("--development-allow-non-loopback", action="store_true")
+    p_serve.add_argument(
+        "--channel-binding-type",
+        choices=[binding.value for binding in ChannelBindingType],
+    )
+    p_serve.add_argument(
+        "--channel-binding-digest",
+        help="32-byte channel public-key digest as 64 lowercase hex characters",
+    )
     p_serve.set_defaults(func=cmd_worker_serve)
 
     p_runtime = sub.add_parser("runtime", help="operate confidential TDX report epochs")

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cathedral.assurance import ClaimStatus, ReasonCategory, attestation_claims
-from cathedral.common import Attested, Evidence, Policy, Tier, report_data
+from cathedral.common import Attested, Evidence, Policy, Tier, evidence_report_data
 
 
 SNP_REPORT_SIZE = 1184
@@ -261,7 +261,7 @@ def verify_snp(
 ) -> Attested | None:
     """Verify SNP evidence using the existing Cathedral nonce/hotkey binding."""
 
-    expected = report_data(nonce, evidence.miner_hotkey, evidence.ssh_host_key)
+    expected = evidence_report_data(evidence, nonce)
     return verify_snp_report_data(
         evidence.quote,
         expected,

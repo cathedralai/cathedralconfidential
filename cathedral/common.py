@@ -10,6 +10,7 @@ import enum
 import hashlib
 import os
 import re
+import struct
 from dataclasses import dataclass, field
 
 from cathedral.assurance import AssuranceClaims
@@ -43,6 +44,33 @@ class EvidenceKind(str, enum.Enum):
     GPU_CC = "gpu_cc"
 
 
+class ChannelBindingType(str, enum.Enum):
+    """Public-key identities supported by the v2 attestation binding."""
+
+    TLS_SPKI_SHA256 = "tls_spki_sha256"
+    APPLICATION_KEY_SHA256 = "application_key_sha256"
+
+
+@dataclass(frozen=True)
+class ChannelBinding:
+    """A bounded digest of the key that must own the protected channel."""
+
+    binding_type: ChannelBindingType
+    digest: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding_type, ChannelBindingType):
+            raise ValueError("channel binding type is unsupported")
+        if not isinstance(self.digest, bytes) or len(self.digest) != 32:
+            raise ValueError("channel binding digest must be exactly 32 bytes")
+
+    def canonical_bytes(self) -> bytes:
+        name = self.binding_type.value.encode("ascii")
+        return b"cathedral.channel-binding\x00" + struct.pack(
+            ">H", len(name)
+        ) + name + self.digest
+
+
 @dataclass(frozen=True)
 class Evidence:
     """A miner's raw attestation evidence (mirrors proto/evidence.proto)."""
@@ -54,6 +82,18 @@ class Evidence:
     cert_chain: list[bytes] = field(default_factory=list)
     ssh_host_key: bytes | None = None
     composite_jwt: str | None = None
+    report_data_version: int = 1
+    channel_binding: ChannelBinding | None = None
+
+    def __post_init__(self) -> None:
+        if self.report_data_version not in {1, 2}:
+            raise ValueError("unsupported report data version")
+        if self.report_data_version == 1 and self.channel_binding is not None:
+            raise ValueError("legacy report data cannot carry a v2 channel binding")
+        if self.report_data_version == 2 and not isinstance(
+            self.channel_binding, ChannelBinding
+        ):
+            raise ValueError("report data v2 requires a channel binding")
 
 
 @dataclass(frozen=True)
@@ -88,10 +128,10 @@ def issue_nonce() -> bytes:
 
 
 def report_data(nonce: bytes, miner_hotkey: str, ssh_host_key: bytes | None = None) -> bytes:
-    """The 64-byte REPORT_DATA bound into a quote.
+    """Legacy 64-byte REPORT_DATA retained for migration and test fixtures.
 
-    Binds freshness (nonce), identity (hotkey — defeats evidence relay), and,
-    for Sandbox rentals, the SSH channel (host key). See docs/DESIGN.md §6, §7.
+    Binds freshness (nonce), identity (hotkey), and the optional historical SSH
+    host key. Production network admission uses :func:`report_data_v2`.
     """
 
     h = hashlib.sha512()
@@ -100,6 +140,64 @@ def report_data(nonce: bytes, miner_hotkey: str, ssh_host_key: bytes | None = No
     if ssh_host_key is not None:
         h.update(ssh_host_key)
     return h.digest()
+
+
+_REPORT_DATA_V2_DOMAIN = b"cathedral.report-data\x00"
+_REPORT_DATA_V2_VERSION = 2
+_MAX_REPORT_HOTKEY_BYTES = 512
+
+
+def _report_field(tag: int, value: bytes) -> bytes:
+    if not 0 <= tag <= 255 or len(value) > 65535:
+        raise ValueError("report data field is out of bounds")
+    return bytes((tag,)) + struct.pack(">H", len(value)) + value
+
+
+def report_data_v2(
+    nonce: bytes,
+    miner_hotkey: str,
+    channel_binding: ChannelBinding,
+) -> bytes:
+    """Domain-separated, versioned, unambiguous 64-byte REPORT_DATA.
+
+    Each variable-length field is tagged and length-delimited before SHA-512.
+    The binding digest identifies either the live TLS SPKI or a separately
+    negotiated application-encryption public key.
+    """
+
+    if not isinstance(nonce, bytes) or len(nonce) != 32:
+        raise ValueError("report data v2 nonce must be exactly 32 bytes")
+    if not isinstance(miner_hotkey, str):
+        raise ValueError("report data v2 hotkey must be a string")
+    try:
+        hotkey = miner_hotkey.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("report data v2 hotkey must be valid UTF-8") from exc
+    if not hotkey or len(hotkey) > _MAX_REPORT_HOTKEY_BYTES:
+        raise ValueError("report data v2 hotkey is out of bounds")
+    if not isinstance(channel_binding, ChannelBinding):
+        raise ValueError("report data v2 requires a supported channel binding")
+
+    payload = b"".join(
+        (
+            _REPORT_DATA_V2_DOMAIN,
+            struct.pack(">H", _REPORT_DATA_V2_VERSION),
+            _report_field(1, nonce),
+            _report_field(2, hotkey),
+            _report_field(3, channel_binding.binding_type.value.encode("ascii")),
+            _report_field(4, channel_binding.digest),
+        )
+    )
+    return hashlib.sha512(payload).digest()
+
+
+def evidence_report_data(evidence: Evidence, nonce: bytes) -> bytes:
+    """Compute the exact REPORT_DATA expected for an evidence envelope."""
+
+    if evidence.report_data_version == 2:
+        assert evidence.channel_binding is not None
+        return report_data_v2(nonce, evidence.miner_hotkey, evidence.channel_binding)
+    return report_data(nonce, evidence.miner_hotkey, evidence.ssh_host_key)
 
 
 @dataclass

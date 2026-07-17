@@ -34,7 +34,7 @@ from cathedral.common import (
     EvidenceKind,
     Policy,
     Tier,
-    report_data,
+    evidence_report_data,
 )
 from cathedral.verify.snp import verify_snp
 
@@ -54,7 +54,7 @@ def verify(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
          free sybil defense (one machine -> one UID)
     """
 
-    expected = report_data(nonce, evidence.miner_hotkey, evidence.ssh_host_key)
+    expected = evidence_report_data(evidence, nonce)
     _ = expected  # bound-in check happens against the parsed quote in Phase 1
 
     if evidence.kind is EvidenceKind.SEV_SNP:
@@ -93,7 +93,7 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
         return None
 
     actual_report_data = _claim_bytes(claims, "report_data")
-    expected_report_data = report_data(nonce, evidence.miner_hotkey, evidence.ssh_host_key)
+    expected_report_data = evidence_report_data(evidence, nonce)
     if actual_report_data != expected_report_data:
         return None
 
