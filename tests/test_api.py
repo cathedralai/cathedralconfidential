@@ -6,8 +6,11 @@ matches requests only to attested capacity whose tier/shape qualifies.
 
 from __future__ import annotations
 
+import pytest
+
 from cathedral.api import Allocator, Inventory, Request, WorkQueue
-from cathedral.common import Attested, Tier
+from cathedral.assurance import attestation_claims, with_verified_channel
+from cathedral.common import Attested, Policy, Tier
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 
@@ -16,6 +19,21 @@ def _canonical() -> SatWorkItem:
     inst = SatInstance(n_vars=1, clauses=[[1]])
     return SatWorkItem(
         instance=inst, seed=0, challenge_id=_compute_challenge_id(inst, 0)
+    )
+
+
+def _attested(tier: Tier, chip_id: str) -> Attested:
+    policy = Policy(allowed_measurements={"m"})
+    claims = with_verified_channel(
+        attestation_claims(chip_id.encode(), policy),
+        f"channel:{chip_id}".encode(),
+    )
+    return Attested(
+        tier,
+        chip_id,
+        "m",
+        3,
+        assurance=claims,
     )
 
 
@@ -49,8 +67,8 @@ def test_workqueue_is_fifo():
 
 def test_inventory_registers_and_queries_by_tier():
     inv = Inventory()
-    inv.register("uidA", Attested(Tier.CC_CPU_SNP, "c1", "m", 3))
-    inv.register("uidB", Attested(Tier.CC_GPU, "c2", "m", 3))
+    inv.register("uidA", _attested(Tier.CC_CPU_SNP, "c1"))
+    inv.register("uidB", _attested(Tier.CC_GPU, "c2"))
     assert inv.by_tier(Tier.CC_CPU_SNP) == ["uidA"]
     assert inv.by_tier(Tier.CC_GPU) == ["uidB"]
     assert inv.get("uidA").chip_id == "c1"
@@ -58,8 +76,8 @@ def test_inventory_registers_and_queries_by_tier():
 
 def test_allocator_matches_only_qualifying_tier_for_a_lane():
     inv = Inventory()
-    inv.register("uidA", Attested(Tier.CC_CPU_SNP, "c1", "m", 3))  # qualifies for SAT
-    inv.register("uidB", Attested(Tier.CC_GPU, "c2", "m", 3))      # does not
+    inv.register("uidA", _attested(Tier.CC_CPU_SNP, "c1"))  # qualifies for SAT
+    inv.register("uidB", _attested(Tier.CC_GPU, "c2"))  # does not
     alloc = Allocator(inv)
     req = Request(lane=SatLane())
     assert alloc.candidates(req) == ["uidA"]
@@ -68,14 +86,36 @@ def test_allocator_matches_only_qualifying_tier_for_a_lane():
 
 def test_allocator_matches_pod_request_by_tier():
     inv = Inventory()
-    inv.register("uidA", Attested(Tier.CC_CPU_SNP, "c1", "m", 3))
-    inv.register("uidB", Attested(Tier.CC_GPU, "c2", "m", 3))
+    inv.register("uidA", _attested(Tier.CC_CPU_SNP, "c1"))
+    inv.register("uidB", _attested(Tier.CC_GPU, "c2"))
     alloc = Allocator(inv)
     assert alloc.allocate(Request(tier=Tier.CC_GPU)) == "uidB"
 
 
 def test_allocator_returns_none_when_nothing_qualifies():
     inv = Inventory()
-    inv.register("uidB", Attested(Tier.CC_GPU, "c2", "m", 3))
+    inv.register("uidB", _attested(Tier.CC_GPU, "c2"))
     alloc = Allocator(inv)
     assert alloc.allocate(Request(lane=SatLane())) is None
+
+
+def test_allocator_does_not_dispatch_to_attested_but_unbound_channel():
+    inv = Inventory()
+    policy = Policy(allowed_measurements={"m"})
+    inv.register(
+        "uid",
+        Attested(
+            Tier.CC_CPU_TDX,
+            "chip",
+            "m",
+            1,
+            assurance=attestation_claims(b"quote", policy),
+        ),
+    )
+
+    assert Allocator(inv).allocate(Request(lane=SatLane())) is None
+
+
+def test_inventory_rejects_legacy_verified_flag_without_typed_claims():
+    with pytest.raises(ValueError, match="hardware and software claims"):
+        Inventory().register("uid", Attested(Tier.CC_CPU_TDX, "chip", "m", 1))

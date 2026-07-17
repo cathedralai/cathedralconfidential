@@ -16,7 +16,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from cathedral.common import Attested, Evidence, Policy, Tier, report_data
+from cathedral.assurance import ClaimStatus, ReasonCategory, attestation_claims
+from cathedral.common import Attested, Evidence, Policy, Tier, evidence_report_data
 
 
 SNP_REPORT_SIZE = 1184
@@ -230,6 +231,15 @@ def verify_snp_report_data(
         return None
 
     status = VERIFIED if chain_verified else STRUCTURE_OK_CHAIN_UNVERIFIED
+    assurance = attestation_claims(
+        report,
+        policy,
+        hardware_status=ClaimStatus.PASSED if chain_verified else ClaimStatus.FAILED,
+        hardware_reason=None if chain_verified else ReasonCategory.EVIDENCE_INVALID,
+        software_status=(
+            ClaimStatus.PASSED if chain_verified else ClaimStatus.NOT_EVALUATED
+        ),
+    )
     return Attested(
         tier=Tier.CC_CPU_SNP,
         chip_id=parsed.chip_id,
@@ -237,6 +247,7 @@ def verify_snp_report_data(
         tcb=parsed.tcb.reported,
         verification_status=status,
         chain_verified=chain_verified,
+        assurance=assurance,
     )
 
 
@@ -250,7 +261,7 @@ def verify_snp(
 ) -> Attested | None:
     """Verify SNP evidence using the existing Cathedral nonce/hotkey binding."""
 
-    expected = report_data(nonce, evidence.miner_hotkey, evidence.ssh_host_key)
+    expected = evidence_report_data(evidence, nonce)
     return verify_snp_report_data(
         evidence.quote,
         expected,

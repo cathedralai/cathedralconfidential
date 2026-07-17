@@ -8,14 +8,133 @@ GPU composite path remains fail-closed (no GPU verifier wired in).
 from __future__ import annotations
 
 import base64
+import argparse
 import json
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from cathedral.common import Attested, EvidenceKind, Policy, Tier
+import cathedral.prober as prober_module
+from cathedral.assurance import attestation_claims
+from cathedral.common import (
+    Attested,
+    ChannelBinding,
+    ChannelBindingType,
+    Evidence,
+    EvidenceKind,
+    Policy,
+    Tier,
+)
 from cathedral.enroll import RegistryStore
-from cathedral.prober import probe_once
+from cathedral.lifecycle import WorkerLifecycleState
+from cathedral.prober import policy_from_args, probe_once
+
+
+def test_policy_from_args_supports_strict_tdx_flags():
+    args = argparse.Namespace(
+        allow_measurement=["m"],
+        allow_measurements_file=None,
+        min_tcb=0,
+        tdx_strict=True,
+        allow_tdx_tcb_status=["UpToDate", "SWHardeningNeeded"],
+        allow_tdx_advisory=["INTEL-SA-01234"],
+    )
+
+    policy = policy_from_args(args)
+
+    assert policy.tdx_strict is True
+    assert policy.tdx_allowed_tcb_statuses == {"UpToDate", "SWHardeningNeeded"}
+    assert policy.tdx_allowed_advisories == {"INTEL-SA-01234"}
+
+
+def test_policy_from_legacy_args_defaults_to_visible_compatibility_mode():
+    args = argparse.Namespace(
+        allow_measurement=["m"], allow_measurements_file=None, min_tcb=0
+    )
+
+    policy = policy_from_args(args)
+
+    assert policy.tdx_strict is False
+    assert policy.tdx_allowed_tcb_statuses == {"UpToDate"}
+
+
+def test_prober_cli_wires_signed_gpu_configuration(monkeypatch, tmp_path):
+    policy = Policy(
+        registry_release=7,
+        registry_digest="sha256:" + "7" * 64,
+    )
+    snapshot = object()
+    profile = object()
+    gpu_verifier = object()
+    identity_registry = object()
+    captured = []
+
+    monkeypatch.setattr(
+        "cathedral.cli._verified_registry_snapshot_and_policy",
+        lambda *_args, **_kwargs: (policy, snapshot),
+    )
+    monkeypatch.setattr(
+        "cathedral.cli._load_gpu_identity_key",
+        lambda *_args, **_kwargs: b"i" * 32,
+    )
+    monkeypatch.setattr(
+        "cathedral.gpu.gpu_profile_from_registry",
+        lambda received, profile_id: profile
+        if (received, profile_id) == (snapshot, "gpu-profile")
+        else None,
+    )
+    monkeypatch.setattr(
+        "cathedral.gpu.gpu_verifier_from_env",
+        lambda **_kwargs: gpu_verifier,
+    )
+    monkeypatch.setattr(
+        "cathedral.gpu.GpuIdentityRegistry",
+        lambda *_args, **_kwargs: identity_registry,
+    )
+    monkeypatch.setattr(
+        prober_module,
+        "probe_once",
+        lambda store, received_policy, **kwargs: captured.append(
+            (store, received_policy, kwargs)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cathedral-prober",
+            "--db",
+            str(tmp_path / "registry.sqlite"),
+            "--once",
+            "--policy-registry",
+            "registry.json",
+            "--policy-registry-keys",
+            "keys.json",
+            "--policy-registry-state",
+            str(tmp_path / "policy-state.sqlite"),
+            "--gpu-profile-id",
+            "gpu-profile",
+            "--gpu-identity-db",
+            str(tmp_path / "gpu-identities.sqlite"),
+            "--gpu-identity-key-file",
+            "gpu-identity.key",
+            "--gpu-identity-anchor-file",
+            str(tmp_path / "gpu-generation.anchor"),
+        ],
+    )
+
+    prober_module.main()
+
+    assert len(captured) == 1
+    _store, received_policy, kwargs = captured[0]
+    assert received_policy is policy
+    assert kwargs["gpu_profile"] is profile
+    assert kwargs["gpu_verifier"] is gpu_verifier
+    assert kwargs["gpu_identity_registry"] is identity_registry
+    assert kwargs["expected_tier"] is Tier.CC_GPU
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +206,7 @@ def _fake_tdx_verify(evidence, nonce, policy):
             chip_id=TDX_CHIP_ID,
             measurement=TDX_MEASUREMENT,
             tcb=3,
+            assurance=attestation_claims(evidence.quote, policy),
         )
     return None
 
@@ -113,6 +233,66 @@ def test_prober_verified_tdx_evidence(monkeypatch, tmp_path):
     assert board["miners"][0]["verification_status"] == "VERIFIED"
     assert board["miners"][0]["tier"] == Tier.CC_CPU_TDX.value
     assert board["miners"][0]["chip_id_prefix"] == TDX_CHIP_ID[:16]
+
+
+def test_prober_transient_failure_recovers_without_manual_reenrollment(
+    monkeypatch, tmp_path
+):
+    server = _serve(TdxMiner)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = TdxMiner.hotkey
+    store.enroll(hotkey, f"http://127.0.0.1:{server.server_port}")
+    original_request = prober_module._request_evidence
+    calls = 0
+
+    def flaky_request(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("temporary timeout")
+        return original_request(*args, **kwargs)
+
+    monkeypatch.setattr(prober_module, "_request_evidence", flaky_request)
+    monkeypatch.setattr("cathedral.prober.verifier.verify", _fake_tdx_verify)
+
+    probe_once(store, Policy())
+    pending = store.lifecycle_snapshot(hotkey)
+    assert pending.state is WorkerLifecycleState.PENDING
+    assert pending.retry_count == 1
+    assert store.board()["miners"][0]["verification_status"] == "FAILED"
+
+    # Polling before the durable retry is due does not make another request.
+    probe_once(store, Policy())
+    assert calls == 1
+
+    # Once the persisted retry becomes due, a successful probe can recover the
+    # pending worker without manual reenrollment.
+    pending_retry = pending.next_retry_at
+    assert pending_retry is not None
+    store._clock = lambda: pending_retry
+    probe_once(store, Policy())
+    server.shutdown()
+
+    recovered = store.lifecycle_snapshot(hotkey)
+    assert recovered.state is WorkerLifecycleState.ATTESTED
+    assert recovered.retry_count == 0
+    assert store.board()["miners"][0]["verification_status"] == "VERIFIED"
+
+
+def test_prober_rejects_verified_flag_without_typed_assurance(monkeypatch, tmp_path):
+    server = _serve(TdxMiner)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = TdxMiner.hotkey
+    store.enroll(hotkey, f"http://127.0.0.1:{server.server_port}")
+
+    def legacy_verifier(evidence, nonce, policy):
+        return Attested(Tier.CC_CPU_TDX, "chip", "measurement", 1, "VERIFIED")
+
+    monkeypatch.setattr("cathedral.prober.verifier.verify", legacy_verifier)
+    probe_once(store, Policy())
+    server.shutdown()
+
+    assert store.board()["miners"][0]["verification_status"] == "FAILED"
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +400,95 @@ def test_production_mode_rejects_non_global_ip_before_network(tmp_path):
     assert board["count"] == 0
     for miner in board["miners"]:
         assert miner["verification_status"] == "FAILED"
+
+
+def test_production_probe_persists_verified_channel_claim(monkeypatch, tmp_path):
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32)
+
+    class BoundRemote:
+        def __init__(self, endpoint, hotkey, *, timeout):
+            assert endpoint == "https://8.8.8.8:443"
+            assert timeout == 5
+            self.hotkey = hotkey
+
+        def fetch_evidence(self, nonce):
+            return Evidence(
+                EvidenceKind.TDX,
+                TDX_QUOTE,
+                nonce,
+                self.hotkey,
+                report_data_version=2,
+                channel_binding=binding,
+            )
+
+        def confirm_channel_binding(self, evidence):
+            assert evidence.channel_binding == binding
+            return binding
+
+    monkeypatch.setattr("cathedral.prober.RemoteMiner", BoundRemote)
+    monkeypatch.setattr("cathedral.prober.verifier.verify", _fake_tdx_verify)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "P" * 47
+    store.enroll(hotkey, "https://8.8.8.8:443")
+
+    probe_once(store, Policy(), production_mode=True)
+
+    miner = store.board()["miners"][0]
+    assert miner["verification_status"] == "VERIFIED"
+    assert miner["assurance"]["claims"]["channel"]["status"] == "passed"
+
+
+def test_production_probe_channel_mismatch_records_failed(monkeypatch, tmp_path):
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32)
+
+    class MismatchedRemote:
+        def __init__(self, endpoint, hotkey, *, timeout):
+            self.hotkey = hotkey
+
+        def fetch_evidence(self, nonce):
+            return Evidence(
+                EvidenceKind.TDX,
+                TDX_QUOTE,
+                nonce,
+                self.hotkey,
+                report_data_version=2,
+                channel_binding=binding,
+            )
+
+        def confirm_channel_binding(self, evidence):
+            return ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"b" * 32)
+
+    monkeypatch.setattr("cathedral.prober.RemoteMiner", MismatchedRemote)
+    monkeypatch.setattr("cathedral.prober.verifier.verify", _fake_tdx_verify)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "Q" * 47
+    store.enroll(hotkey, "https://8.8.4.4:443")
+
+    probe_once(store, Policy(), production_mode=True)
+
+    assert store.board()["miners"][0]["verification_status"] == "FAILED"
+
+
+def test_prober_console_once_exits_nonzero_when_due_target_fails(tmp_path):
+    database = tmp_path / "registry.sqlite"
+    store = RegistryStore(str(database))
+    store.enroll(TdxMiner.hotkey, "http://127.0.0.1:9")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cathedral.prober",
+            "--db",
+            str(database),
+            "--once",
+        ],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode != 0
 
 
 # ---------------------------------------------------------------------------

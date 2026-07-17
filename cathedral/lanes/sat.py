@@ -21,7 +21,7 @@ import json
 import math
 import random
 
-from cathedral.common import Attested, Tier
+from cathedral.common import Attested, Policy, Tier
 from cathedral.lanes import Certificate, Lane, WorkItem
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
@@ -177,7 +177,13 @@ class SatLane(Lane):
 
     name = "sat_benchmark"
 
-    def __init__(self, namespace: str | None = None) -> None:
+    def __init__(
+        self,
+        namespace: str | None = None,
+        *,
+        gpu_profile: object | None = None,
+        gpu_policy: Policy | None = None,
+    ) -> None:
         self._queue: list[SatWorkItem] = []
         # Fresh instances should not emit the same first ID. Use a random
         # namespace to prevent collision across epochs while keeping the SAT
@@ -190,9 +196,21 @@ class SatLane(Lane):
         # Map challenge_id -> work_units for verified certificates only.
         # This ensures score() only counts certs that passed verify().
         self._verified_credits: dict[str, float] = {}
+        self._gpu_profile = gpu_profile
+        self._gpu_policy = gpu_policy
 
     def qualify(self, attested: Attested) -> bool:
-        return attested.tier in _QUALIFIED_TIERS
+        if attested.tier in _QUALIFIED_TIERS:
+            return True
+        if attested.tier is Tier.CC_GPU:
+            from cathedral.gpu import gpu_score_eligible
+
+            return gpu_score_eligible(
+                attested,
+                profile=self._gpu_profile,
+                policy=self._gpu_policy,
+            )
+        return False
 
     def enqueue(self, item: SatWorkItem) -> None:
         """Add a customer job to the internal queue (dispatch prefers these).

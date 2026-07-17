@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import threading
 import uuid
@@ -12,6 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol
+
+from cathedral.lifecycle import (
+    LifecycleReason,
+    LifecycleSnapshot,
+    WorkerLifecycleState,
+    canonical_utc,
+)
+from cathedral.receipt import ReceiptError, parse_receipt_json
 
 
 class LedgerError(Exception):
@@ -25,6 +34,13 @@ class LedgerError(Exception):
 # migration builds the widened schema under a throwaway temp name (never
 # under `epochs` itself -- see that method's docstring for why).
 _EPOCHS_MIGRATION_TEMP_PREFIX = "epochs_migration_new_"
+_MAX_SQLITE_INTEGER = 2**63 - 1
+_GPU_POLICY_MODE_RE = re.compile(
+    r"gpu-profile:[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+    r"@profile=sha256:[0-9a-f]{64}"
+    r"(?:@release=none@registry=none|"
+    r"@release=[1-9][0-9]{0,18}@registry=sha256:[0-9a-f]{64})"
+)
 
 
 def _epochs_table_sql(table_name: str) -> str:
@@ -41,6 +57,8 @@ CREATE TABLE IF NOT EXISTS {table_name} (
     generated_at TEXT,
     report_body BLOB,
     report_digest TEXT,
+    policy_registry_release INTEGER,
+    policy_registry_digest TEXT,
     abandoned_at TEXT,
     abandon_reason TEXT
 )
@@ -50,8 +68,7 @@ CREATE TABLE IF NOT EXISTS {table_name} (
 _EPOCHS_TABLE_SQL = _epochs_table_sql("epochs")
 
 _ONE_RUNNING_EPOCH_INDEX_SQL = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS one_running_epoch "
-    "ON epochs ((1)) WHERE status = 'running'"
+    "CREATE UNIQUE INDEX IF NOT EXISTS one_running_epoch ON epochs ((1)) WHERE status = 'running'"
 )
 
 _ONE_FINALIZED_SOURCE_EPOCH_INDEX_SQL = (
@@ -78,10 +95,16 @@ CREATE TABLE IF NOT EXISTS epoch_attestations (
     epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
     hotkey TEXT NOT NULL,
     verdict TEXT NOT NULL CHECK (verdict = 'VERIFIED'),
-    tee_type TEXT NOT NULL CHECK (tee_type = 'TDX'),
-    workload TEXT NOT NULL CHECK (workload = 'CPU'),
+    tee_type TEXT NOT NULL CHECK (tee_type IN ('TDX', 'TDX+GPU_CC')),
+    workload TEXT NOT NULL CHECK (workload IN ('CPU', 'GPU')),
     evidence_digest TEXT NOT NULL,
+    policy_mode TEXT NOT NULL DEFAULT 'compatibility',
+    score_eligible INTEGER NOT NULL CHECK (score_eligible IN (0, 1)),
     attested_at TEXT NOT NULL,
+    CHECK (
+        (tee_type = 'TDX' AND workload = 'CPU') OR
+        (tee_type = 'TDX+GPU_CC' AND workload = 'GPU')
+    ),
     PRIMARY KEY (epoch_id, hotkey)
 );
 
@@ -90,6 +113,33 @@ CREATE TABLE IF NOT EXISTS epoch_scores (
     hotkey TEXT NOT NULL,
     work_units REAL NOT NULL CHECK (work_units >= 0),
     score REAL NOT NULL CHECK (score >= 0 AND score <= 1),
+    PRIMARY KEY (epoch_id, hotkey)
+);
+
+CREATE TABLE IF NOT EXISTS assurance_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
+    hotkey TEXT NOT NULL,
+    challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id),
+    work_status TEXT NOT NULL CHECK (work_status IN ('verified', 'failed', 'abandoned')),
+    receipt_body BLOB NOT NULL,
+    receipt_digest TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    UNIQUE (epoch_id, hotkey)
+);
+
+CREATE TABLE IF NOT EXISTS epoch_worker_lifecycle (
+    epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
+    hotkey TEXT NOT NULL,
+    state TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    event_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_expires_at TEXT,
+    evidence_digest TEXT,
+    policy_digest TEXT,
+    snapshot_at TEXT NOT NULL,
     PRIMARY KEY (epoch_id, hotkey)
 );
 """
@@ -122,6 +172,47 @@ def _canonical_json(value: Any) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _receipt_lifecycle_values(receipt: Mapping[str, object]) -> tuple[object, ...]:
+    lifecycle = receipt.get("lifecycle")
+    assurance = receipt.get("assurance")
+    if not isinstance(lifecycle, dict) or not isinstance(assurance, dict):
+        raise LedgerError("receipt lifecycle snapshot is invalid")
+    claims = assurance.get("claims")
+    if not isinstance(claims, dict):
+        raise LedgerError("receipt lifecycle snapshot is invalid")
+    hardware = claims.get("hardware")
+    software = claims.get("software")
+    if not isinstance(hardware, dict) or not isinstance(software, dict):
+        raise LedgerError("receipt lifecycle snapshot is invalid")
+    return (
+        lifecycle.get("worker_state"),
+        lifecycle.get("worker_generation"),
+        lifecycle.get("worker_revision"),
+        lifecycle.get("worker_event_id"),
+        lifecycle.get("worker_reason"),
+        lifecycle.get("worker_evidence_expires_at"),
+        hardware.get("evidence_digest"),
+        software.get("policy_digest"),
+    )
+
+
+def _snapshot_lifecycle_values(snapshot: LifecycleSnapshot) -> tuple[object, ...]:
+    return (
+        snapshot.state.value,
+        snapshot.generation,
+        snapshot.revision,
+        snapshot.event_id,
+        snapshot.reason.value,
+        (
+            canonical_utc(snapshot.evidence_expires_at)
+            if snapshot.evidence_expires_at is not None
+            else None
+        ),
+        snapshot.evidence_digest,
+        snapshot.policy_digest,
+    )
 
 
 class ReportPoster(Protocol):
@@ -162,6 +253,114 @@ class Ledger:
             self._connection.execute("PRAGMA synchronous = FULL")
         self._connection.executescript(_SCHEMA)
         self._migrate_epochs_table_if_needed()
+        self._migrate_registry_policy_fields_if_needed()
+        self._migrate_attestation_policy_mode_if_needed()
+        self._migrate_gpu_attestations_if_needed()
+        self._migrate_worker_lifecycle_fields_if_needed()
+
+    def _migrate_registry_policy_fields_if_needed(self) -> None:
+        columns = {row["name"] for row in self._connection.execute("PRAGMA table_info(epochs)")}
+        try:
+            if "policy_registry_release" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE epochs ADD COLUMN policy_registry_release INTEGER"
+                )
+            if "policy_registry_digest" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE epochs ADD COLUMN policy_registry_digest TEXT"
+                )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add registry policy audit fields") from exc
+
+    def _migrate_attestation_policy_mode_if_needed(self) -> None:
+        """Mark historical attestation rows as compatibility-mode evidence."""
+
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(epoch_attestations)")
+        }
+        if "policy_mode" in columns:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE epoch_attestations ADD COLUMN policy_mode TEXT NOT NULL "
+                "DEFAULT 'compatibility' CHECK (policy_mode IN ('strict', 'compatibility'))"
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add attestation policy-mode audit field") from exc
+
+    def _migrate_gpu_attestations_if_needed(self) -> None:
+        """Widen historical CPU-only attestation rows for typed GPU composites."""
+
+        row = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='epoch_attestations'"
+        ).fetchone()
+        columns = {
+            item["name"]
+            for item in self._connection.execute("PRAGMA table_info(epoch_attestations)")
+        }
+        if row is None or ("TDX+GPU_CC" in row["sql"] and "score_eligible" in columns):
+            return
+        temporary = f"epoch_attestations_gpu_{uuid.uuid4().hex}"
+        previous_foreign_keys = self._connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        self._connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                f"CREATE TABLE {temporary} ("
+                "epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),"
+                "hotkey TEXT NOT NULL,"
+                "verdict TEXT NOT NULL CHECK (verdict = 'VERIFIED'),"
+                "tee_type TEXT NOT NULL CHECK (tee_type IN ('TDX','TDX+GPU_CC')),"
+                "workload TEXT NOT NULL CHECK (workload IN ('CPU','GPU')),"
+                "evidence_digest TEXT NOT NULL,"
+                "policy_mode TEXT NOT NULL DEFAULT 'compatibility',"
+                "score_eligible INTEGER NOT NULL CHECK(score_eligible IN (0,1)),"
+                "attested_at TEXT NOT NULL,"
+                "CHECK ((tee_type='TDX' AND workload='CPU') OR "
+                "(tee_type='TDX+GPU_CC' AND workload='GPU')),"
+                "PRIMARY KEY (epoch_id,hotkey))"
+            )
+            self._connection.execute(
+                f"INSERT INTO {temporary} "
+                "SELECT epoch_id,hotkey,verdict,tee_type,workload,evidence_digest,"
+                "policy_mode,CASE WHEN tee_type='TDX' AND workload='CPU' THEN 1 ELSE 0 END,"
+                "attested_at FROM epoch_attestations"
+            )
+            self._connection.execute("DROP TABLE epoch_attestations")
+            self._connection.execute(f"ALTER TABLE {temporary} RENAME TO epoch_attestations")
+            if self._connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise LedgerError("GPU attestation ledger migration broke foreign keys")
+            self._connection.execute("COMMIT")
+        except LedgerError:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        except sqlite3.DatabaseError as exc:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise LedgerError("failed to widen GPU attestation ledger") from exc
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        finally:
+            self._connection.execute(
+                f"PRAGMA foreign_keys = {'ON' if previous_foreign_keys else 'OFF'}"
+            )
+
+    def _migrate_worker_lifecycle_fields_if_needed(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(epoch_worker_lifecycle)")
+        }
+        if "evidence_expires_at" in columns:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE epoch_worker_lifecycle ADD COLUMN evidence_expires_at TEXT"
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add worker lifecycle evidence-expiry field") from exc
 
     def _migrate_epochs_table_if_needed(self) -> None:
         """Widen a pre-existing on-disk ``epochs`` table to support 'abandoned'.
@@ -235,8 +434,7 @@ class Ledger:
         """
         cx = self._connection
         existing_tables = {
-            row["name"]
-            for row in cx.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            row["name"] for row in cx.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         leftover_name = next(
             (
@@ -324,7 +522,13 @@ class Ledger:
                 f"migration table {temp_name!r} in {[row['name'] for row in stray]!r}; "
                 "the ledger file needs manual inspection"
             )
-        for child_table in ("challenges", "epoch_attestations", "epoch_scores"):
+        for child_table in (
+            "challenges",
+            "epoch_attestations",
+            "epoch_scores",
+            "assurance_receipts",
+            "epoch_worker_lifecycle",
+        ):
             row = cx.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
                 (child_table,),
@@ -347,10 +551,26 @@ class Ledger:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def begin_epoch(self, source_epoch: int) -> int:
+    def begin_epoch(
+        self,
+        source_epoch: int,
+        *,
+        policy_registry_release: int | None = None,
+        policy_registry_digest: str | None = None,
+    ) -> int:
         """Begin the next attempt, reusing an aborted attempt's source epoch."""
         if isinstance(source_epoch, bool) or not isinstance(source_epoch, int) or source_epoch < 0:
             raise LedgerError("source_epoch must be a nonnegative integer")
+        if (policy_registry_release is None) != (policy_registry_digest is None):
+            raise LedgerError("policy registry release and digest must be supplied together")
+        if policy_registry_release is not None and (
+            isinstance(policy_registry_release, bool)
+            or not isinstance(policy_registry_release, int)
+            or not 0 < policy_registry_release <= _MAX_SQLITE_INTEGER
+            or not isinstance(policy_registry_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", policy_registry_digest) is None
+        ):
+            raise LedgerError("policy registry metadata is invalid")
         with self._transaction() as cx:
             blocking = cx.execute(
                 "SELECT epoch_id, status FROM epochs WHERE status IN ('running', 'complete') LIMIT 1"
@@ -378,8 +598,15 @@ class Ledger:
                 raise LedgerError(f"source_epoch must be greater than finalized epoch {last_final}")
 
             cursor = cx.execute(
-                "INSERT INTO epochs(source_epoch, status, started_at) VALUES (?, 'running', ?)",
-                (source_epoch, _now()),
+                "INSERT INTO epochs(source_epoch, status, started_at, "
+                "policy_registry_release, policy_registry_digest) "
+                "VALUES (?, 'running', ?, ?, ?)",
+                (
+                    source_epoch,
+                    _now(),
+                    policy_registry_release,
+                    policy_registry_digest,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -447,6 +674,19 @@ class Ledger:
         *,
         validator_derived: bool = False,
     ) -> None:
+        units = self._validated_resolution_units(
+            status, work_units, validator_derived=validator_derived
+        )
+        with self._transaction() as cx:
+            self._resolve_challenge_in_transaction(cx, challenge_id, status, units)
+
+    @staticmethod
+    def _validated_resolution_units(
+        status: str,
+        work_units: float,
+        *,
+        validator_derived: bool,
+    ) -> float:
         if status not in {"verified", "failed", "abandoned"}:
             raise LedgerError(f"invalid resolve status {status!r}")
         try:
@@ -457,26 +697,133 @@ class Ledger:
             raise LedgerError("work_units must be finite and nonnegative")
         if status == "verified" and not validator_derived:
             raise LedgerError("verified work_units must be validator-derived")
-        if status != "verified":
-            units = 0.0
+        return units if status == "verified" else 0.0
 
+    @staticmethod
+    def _resolve_challenge_in_transaction(
+        cx: sqlite3.Connection,
+        challenge_id: str,
+        status: str,
+        units: float,
+    ) -> sqlite3.Row:
+        row = cx.execute(
+            "SELECT c.status, c.epoch_id, c.hotkey, e.status AS epoch_status "
+            "FROM challenges c JOIN epochs e USING(epoch_id) WHERE challenge_id = ?",
+            (challenge_id,),
+        ).fetchone()
+        if row is None:
+            raise LedgerError(f"challenge {challenge_id!r} not found")
+        if row["epoch_status"] != "running":
+            raise LedgerError("challenge can only be resolved while its epoch is running")
+        if row["status"] != "issued":
+            raise LedgerError(f"challenge {challenge_id!r} is already {row['status']}")
+        cx.execute(
+            "UPDATE challenges SET status = ?, work_units = ?, resolved_at = ? "
+            "WHERE challenge_id = ?",
+            (status, units, _now(), challenge_id),
+        )
+        return row
+
+    def resolve_challenge_with_receipt(
+        self,
+        challenge_id: str,
+        status: str,
+        work_units: float,
+        *,
+        validator_derived: bool,
+        receipt_id: str,
+        receipt_body: bytes,
+        receipt_digest: str,
+        issued_at: str,
+    ) -> None:
+        """Atomically resolve work and freeze its exact signed receipt bytes."""
+
+        units = self._validated_resolution_units(
+            status, work_units, validator_derived=validator_derived
+        )
+        if (
+            not isinstance(receipt_id, str)
+            or re.fullmatch(r"receipt-sha256:[0-9a-f]{64}", receipt_id) is None
+        ):
+            raise LedgerError("receipt_id is invalid")
+        if not isinstance(receipt_body, bytes) or not receipt_body:
+            raise LedgerError("receipt_body must be nonempty bytes")
+        if (
+            not isinstance(receipt_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", receipt_digest) is None
+        ):
+            raise LedgerError("receipt_digest is invalid")
+        if "sha256:" + hashlib.sha256(receipt_body).hexdigest() != receipt_digest:
+            raise LedgerError("receipt digest does not match receipt bytes")
+        if not isinstance(issued_at, str) or not issued_at:
+            raise LedgerError("receipt issued_at is required")
+        try:
+            receipt = parse_receipt_json(receipt_body)
+        except ReceiptError as exc:
+            raise LedgerError("receipt body is invalid") from exc
+        work = receipt.get("work")
+        allowed_claim_statuses = (
+            {"passed"} if status == "verified" else {"passed", "failed", "stale", "revoked"}
+        )
+        if (
+            _canonical_json(receipt) != receipt_body
+            or receipt.get("receipt_id") != receipt_id
+            or receipt.get("issued_at") != issued_at
+            or not isinstance(work, dict)
+            or work.get("challenge_id") != challenge_id
+            or work.get("status") not in allowed_claim_statuses
+        ):
+            raise LedgerError("receipt body does not match its work resolution")
+        receipt_units = work.get("work_units")
+        try:
+            parsed_units = float(receipt_units)
+        except (TypeError, ValueError) as exc:
+            raise LedgerError("receipt work units are invalid") from exc
+        if not math.isfinite(parsed_units) or parsed_units != units:
+            raise LedgerError("receipt work units do not match their resolution")
         with self._transaction() as cx:
-            row = cx.execute(
-                "SELECT c.status, c.epoch_id, e.status AS epoch_status "
-                "FROM challenges c JOIN epochs e USING(epoch_id) WHERE challenge_id = ?",
-                (challenge_id,),
+            row = self._resolve_challenge_in_transaction(cx, challenge_id, status, units)
+            if (
+                receipt.get("epoch_id") != row["epoch_id"]
+                or receipt.get("subject_hotkey") != row["hotkey"]
+            ):
+                raise LedgerError("receipt subject does not match its issued challenge")
+            lifecycle = cx.execute(
+                "SELECT * FROM epoch_worker_lifecycle WHERE epoch_id = ? AND hotkey = ?",
+                (row["epoch_id"], row["hotkey"]),
             ).fetchone()
-            if row is None:
-                raise LedgerError(f"challenge {challenge_id!r} not found")
-            if row["epoch_status"] != "running":
-                raise LedgerError("challenge can only be resolved while its epoch is running")
-            if row["status"] != "issued":
-                raise LedgerError(f"challenge {challenge_id!r} is already {row['status']}")
-            cx.execute(
-                "UPDATE challenges SET status = ?, work_units = ?, resolved_at = ? "
-                "WHERE challenge_id = ?",
-                (status, units, _now(), challenge_id),
-            )
+            if lifecycle is not None:
+                expected_lifecycle = (
+                    lifecycle["state"],
+                    lifecycle["generation"],
+                    lifecycle["revision"],
+                    lifecycle["event_id"],
+                    lifecycle["reason"],
+                    lifecycle["evidence_expires_at"],
+                    lifecycle["evidence_digest"],
+                    lifecycle["policy_digest"],
+                )
+                if _receipt_lifecycle_values(receipt) != expected_lifecycle:
+                    raise LedgerError("receipt does not match the epoch worker lifecycle snapshot")
+            try:
+                cx.execute(
+                    "INSERT INTO assurance_receipts("
+                    "receipt_id, epoch_id, hotkey, challenge_id, work_status, "
+                    "receipt_body, receipt_digest, issued_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        receipt_id,
+                        row["epoch_id"],
+                        row["hotkey"],
+                        challenge_id,
+                        status,
+                        receipt_body,
+                        receipt_digest,
+                        issued_at,
+                    ),
+                )
+            except sqlite3.DatabaseError as exc:
+                raise LedgerError("failed to persist receipt atomically") from exc
 
     def add_attestation(
         self,
@@ -487,28 +834,141 @@ class Ledger:
         tee_type: str,
         workload: str,
         evidence_digest: str,
+        policy_mode: str = "compatibility",
+        score_eligible: bool | None = None,
     ) -> None:
-        """Add exact VERIFIED TDX CPU evidence to a running epoch."""
-        if (verdict, tee_type, workload) != ("VERIFIED", "TDX", "CPU"):
-            raise LedgerError("attestation must be exact VERIFIED TDX CPU evidence")
+        """Add exact CPU or composite-GPU evidence to a running epoch."""
+        hardware_shape = (verdict, tee_type, workload)
+        if hardware_shape not in {
+            ("VERIFIED", "TDX", "CPU"),
+            ("VERIFIED", "TDX+GPU_CC", "GPU"),
+        }:
+            raise LedgerError("attestation hardware shape is invalid")
         if not hotkey or not evidence_digest:
             raise LedgerError("hotkey and evidence_digest are required")
+        if hardware_shape == ("VERIFIED", "TDX", "CPU"):
+            valid_policy_mode = policy_mode in {"strict", "compatibility"}
+        else:
+            valid_policy_mode = _GPU_POLICY_MODE_RE.fullmatch(policy_mode) is not None
+        if not valid_policy_mode:
+            raise LedgerError("attestation policy_mode does not match its hardware shape")
+        if score_eligible is None:
+            score_eligible = hardware_shape == ("VERIFIED", "TDX", "CPU")
+        if not isinstance(score_eligible, bool):
+            raise LedgerError("attestation score eligibility must be a boolean")
         with self._transaction() as cx:
             self._require_running(cx, epoch_id, "add attestations")
             existing = cx.execute(
-                "SELECT evidence_digest FROM epoch_attestations "
+                "SELECT tee_type,workload,evidence_digest,policy_mode,score_eligible "
+                "FROM epoch_attestations "
                 "WHERE epoch_id = ? AND hotkey = ?",
                 (epoch_id, hotkey),
             ).fetchone()
             if existing:
-                if existing["evidence_digest"] != evidence_digest:
+                if (
+                    existing["evidence_digest"] != evidence_digest
+                    or existing["policy_mode"] != policy_mode
+                    or existing["tee_type"] != tee_type
+                    or existing["workload"] != workload
+                    or bool(existing["score_eligible"]) is not score_eligible
+                ):
                     raise LedgerError("attestation evidence is immutable within an epoch")
                 return
             cx.execute(
                 "INSERT INTO epoch_attestations "
-                "(epoch_id, hotkey, verdict, tee_type, workload, evidence_digest, attested_at) "
-                "VALUES (?, ?, 'VERIFIED', 'TDX', 'CPU', ?, ?)",
-                (epoch_id, hotkey, evidence_digest, _now()),
+                "(epoch_id, hotkey, verdict, tee_type, workload, evidence_digest, "
+                "policy_mode, score_eligible, attested_at) "
+                "VALUES (?, ?, 'VERIFIED', ?, ?, ?, ?, ?, ?)",
+                (
+                    epoch_id,
+                    hotkey,
+                    tee_type,
+                    workload,
+                    evidence_digest,
+                    policy_mode,
+                    int(score_eligible),
+                    _now(),
+                ),
+            )
+
+    def add_lifecycle_snapshot(
+        self,
+        epoch_id: int,
+        snapshot: LifecycleSnapshot,
+        *,
+        snapshot_at: str | None = None,
+    ) -> None:
+        if (
+            not isinstance(snapshot, LifecycleSnapshot)
+            or not isinstance(snapshot.hotkey, str)
+            or not snapshot.hotkey
+            or not isinstance(snapshot.state, WorkerLifecycleState)
+            or not isinstance(snapshot.reason, LifecycleReason)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 < value <= _MAX_SQLITE_INTEGER
+                for value in (
+                    snapshot.generation,
+                    snapshot.revision,
+                    snapshot.event_id,
+                )
+            )
+        ):
+            raise LedgerError("worker lifecycle snapshot is invalid")
+        captured_at = _validated_generated_at(snapshot_at)
+        snapshot_values = _snapshot_lifecycle_values(snapshot)
+        with self._transaction() as cx:
+            self._require_running(cx, epoch_id, "add worker lifecycle snapshots")
+            existing = cx.execute(
+                "SELECT * FROM epoch_worker_lifecycle WHERE epoch_id = ? AND hotkey = ?",
+                (epoch_id, snapshot.hotkey),
+            ).fetchone()
+            values = snapshot_values
+            if existing is not None:
+                if (
+                    tuple(
+                        existing[name]
+                        for name in (
+                            "state",
+                            "generation",
+                            "revision",
+                            "event_id",
+                            "reason",
+                            "evidence_expires_at",
+                            "evidence_digest",
+                            "policy_digest",
+                        )
+                    )
+                    != values
+                ):
+                    raise LedgerError("worker lifecycle snapshot is immutable within an epoch")
+                return
+            receipt = cx.execute(
+                "SELECT receipt_body FROM assurance_receipts WHERE epoch_id = ? AND hotkey = ?",
+                (epoch_id, snapshot.hotkey),
+            ).fetchone()
+            if receipt is not None:
+                try:
+                    receipt_document = parse_receipt_json(receipt["receipt_body"])
+                except ReceiptError as exc:
+                    raise LedgerError("stored receipt body is invalid") from exc
+                if _receipt_lifecycle_values(receipt_document) != snapshot_values:
+                    raise LedgerError("receipt does not match the epoch worker lifecycle snapshot")
+            cx.execute(
+                """
+                INSERT INTO epoch_worker_lifecycle(
+                    epoch_id, hotkey, state, generation, revision, event_id,
+                    reason, evidence_expires_at, evidence_digest, policy_digest,
+                    snapshot_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    epoch_id,
+                    snapshot.hotkey,
+                    *values,
+                    captured_at,
+                ),
             )
 
     def complete_epoch(
@@ -517,9 +977,16 @@ class Ledger:
         all_hotkeys: Iterable[str],
         *,
         generated_at: str | None = None,
+        score_authority_valid_until: datetime | None = None,
     ) -> dict[str, float]:
         """Freeze scores and canonical report bytes in one durable transaction."""
         stable_generated_at = _validated_generated_at(generated_at)
+        if score_authority_valid_until is not None and (
+            not isinstance(score_authority_valid_until, datetime)
+            or score_authority_valid_until.tzinfo is None
+            or score_authority_valid_until.utcoffset() != timezone.utc.utcoffset(None)
+        ):
+            raise LedgerError("score authority expiry must be a UTC timestamp")
         universe = set(all_hotkeys)
         if any(not isinstance(hotkey, str) or not hotkey for hotkey in universe):
             raise LedgerError("all hotkeys must be nonempty strings")
@@ -568,30 +1035,78 @@ class Ledger:
             ):
                 current_work[row["hotkey"]] = float(row["total"])
             totals = dict(current_work)
+            current_lanes: dict[str, tuple[str, ...]] = {}
+            for row in cx.execute(
+                "SELECT hotkey,workload,policy_mode FROM epoch_attestations "
+                "WHERE epoch_id = ? AND score_eligible = 1",
+                (epoch_id,),
+            ):
+                current_lanes[row["hotkey"]] = (
+                    ("GPU", row["policy_mode"]) if row["workload"] == "GPU" else ("CPU",)
+                )
             if previous_ids:
                 placeholders = ",".join("?" for _ in previous_ids)
                 for row in cx.execute(
-                    f"SELECT hotkey, SUM(work_units) AS total FROM epoch_scores "
-                    f"WHERE epoch_id IN ({placeholders}) GROUP BY hotkey",
+                    "SELECT scores.hotkey,scores.work_units,attestations.workload,"
+                    "attestations.policy_mode FROM epoch_scores AS scores "
+                    "JOIN epoch_attestations AS attestations "
+                    "ON attestations.epoch_id=scores.epoch_id "
+                    "AND attestations.hotkey=scores.hotkey "
+                    f"WHERE scores.epoch_id IN ({placeholders}) "
+                    "AND attestations.score_eligible=1",
                     previous_ids,
                 ):
-                    totals[row["hotkey"]] = totals.get(row["hotkey"], 0.0) + float(row["total"])
+                    prior_lane = (
+                        ("GPU", row["policy_mode"]) if row["workload"] == "GPU" else ("CPU",)
+                    )
+                    if current_lanes.get(row["hotkey"]) == prior_lane:
+                        totals[row["hotkey"]] = totals.get(row["hotkey"], 0.0) + float(
+                            row["work_units"]
+                        )
 
             attested = {
                 row["hotkey"]
                 for row in cx.execute(
-                    "SELECT hotkey FROM epoch_attestations WHERE epoch_id = ?", (epoch_id,)
+                    "SELECT hotkey FROM epoch_attestations "
+                    "WHERE epoch_id = ? AND score_eligible = 1",
+                    (epoch_id,),
                 )
             }
-            gated = {hotkey: units if hotkey in attested else 0.0 for hotkey, units in totals.items()}
+            policy_modes = sorted(
+                {
+                    row["policy_mode"]
+                    for row in cx.execute(
+                        "SELECT policy_mode FROM epoch_attestations WHERE epoch_id = ?",
+                        (epoch_id,),
+                    )
+                }
+            )
+            lifecycle_rows = cx.execute(
+                "SELECT hotkey, state, generation, revision, event_id, reason, "
+                "evidence_expires_at, snapshot_at "
+                "FROM epoch_worker_lifecycle WHERE epoch_id = ? ORDER BY hotkey",
+                (epoch_id,),
+            ).fetchall()
+            lifecycle_eligible = {
+                row["hotkey"]
+                for row in lifecycle_rows
+                if row["state"] == WorkerLifecycleState.ATTESTED.value
+            }
+            if lifecycle_rows:
+                universe.update(row["hotkey"] for row in lifecycle_rows)
+                current_work.update({hotkey: current_work.get(hotkey, 0.0) for hotkey in universe})
+                totals.update({hotkey: totals.get(hotkey, 0.0) for hotkey in universe})
+                attested &= lifecycle_eligible
+            gated = {
+                hotkey: units if hotkey in attested else 0.0 for hotkey, units in totals.items()
+            }
             current_gated = {
                 hotkey: units if hotkey in attested else 0.0
                 for hotkey, units in current_work.items()
             }
             maximum = max(gated.values(), default=0.0)
             scores = {
-                hotkey: (units / maximum if maximum > 0 else 0.0)
-                for hotkey, units in gated.items()
+                hotkey: (units / maximum if maximum > 0 else 0.0) for hotkey, units in gated.items()
             }
             report = {
                 "complete": True,
@@ -600,18 +1115,39 @@ class Ledger:
                 "mechanism": "cathedral_confidential_tdx",
                 "metadata": {
                     "normalization": "max",
+                    "attestation_policy_modes": policy_modes,
+                    "policy_registry_release": epoch["policy_registry_release"],
+                    "policy_registry_digest": epoch["policy_registry_digest"],
                     "published_window_epochs": sorted(row["source_epoch"] for row in previous),
                     "published_window_size": self.window_size,
+                    "worker_lifecycle": [
+                        {
+                            "event_id": row["event_id"],
+                            "evidence_expires_at": row["evidence_expires_at"],
+                            "generation": row["generation"],
+                            "hotkey": row["hotkey"],
+                            "reason": row["reason"],
+                            "revision": row["revision"],
+                            "snapshot_at": row["snapshot_at"],
+                            "state": row["state"],
+                        }
+                        for row in lifecycle_rows
+                    ],
                 },
                 "scores": [
-                    {"miner_hotkey": hotkey, "score": scores[hotkey]}
-                    for hotkey in sorted(scores)
+                    {"miner_hotkey": hotkey, "score": scores[hotkey]} for hotkey in sorted(scores)
                 ],
                 "source": "cathedral_confidential_tdx",
             }
             body = _canonical_json(report)
             digest = hashlib.sha256(body).hexdigest()
-            completed_at = _now()
+            completion_time = datetime.now(timezone.utc)
+            if (
+                score_authority_valid_until is not None
+                and completion_time >= score_authority_valid_until
+            ):
+                raise LedgerError("score authority expired before epoch completion")
+            completed_at = completion_time.isoformat()
             cx.execute(
                 "UPDATE epochs SET status = 'complete', completed_at = ?, generated_at = ?, "
                 "report_body = ?, report_digest = ? WHERE epoch_id = ?",
@@ -678,9 +1214,7 @@ class Ledger:
         """Alias for :meth:`blocking_epoch` for restart-oriented callers."""
         return self.blocking_epoch()
 
-    def post_and_mark_published(
-        self, epoch_id: int, poster: ReportPoster
-    ) -> dict[str, Any]:
+    def post_and_mark_published(self, epoch_id: int, poster: ReportPoster) -> dict[str, Any]:
         """Post frozen bytes, then mark published after an accepted response.
 
         The network call occurs after ``report_bytes`` releases the ledger lock
@@ -699,6 +1233,16 @@ class Ledger:
                 "SELECT * FROM epochs WHERE epoch_id = ?", (epoch_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def receipt_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT receipt_id, epoch_id, hotkey, challenge_id, work_status, "
+                "receipt_body, receipt_digest, issued_at FROM assurance_receipts "
+                "WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+        return MappingProxyType(dict(row)) if row is not None else None
 
     def attested_hotkeys(self, epoch_id: int) -> frozenset[str]:
         with self._lock:

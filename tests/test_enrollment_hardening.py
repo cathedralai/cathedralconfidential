@@ -24,6 +24,7 @@ import base64
 import io
 import json
 import os
+import sqlite3
 import socket as _socket_module
 import threading
 import time
@@ -33,6 +34,7 @@ from pathlib import Path
 
 import pytest
 
+from cathedral.assurance import attestation_claims
 from substrateinterface import Keypair, KeypairType
 
 from cathedral.common import Attested, EvidenceKind, Policy, Tier
@@ -51,6 +53,17 @@ from cathedral.prober import (
     _resolve_endpoint,
     probe_once,
 )
+
+
+def _attested(chip_id: str, measurement: str = "measurement") -> Attested:
+    policy = Policy(allowed_measurements={measurement})
+    return Attested(
+        Tier.CC_CPU_TDX,
+        chip_id,
+        measurement,
+        1,
+        assurance=attestation_claims(chip_id.encode(), policy),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +174,7 @@ def _fake_tdx_verify(evidence, nonce, policy):
             chip_id=TDX_CHIP_ID,
             measurement=TDX_MEASUREMENT,
             tcb=3,
+            assurance=attestation_claims(evidence.quote, policy),
         )
     return None
 
@@ -175,7 +189,7 @@ def test_endpoint_change_clears_attestation(tmp_path: Path) -> None:
     chip_id = "ab" * 32
 
     store.enroll(hotkey, "https://old.example.com")
-    store.record_verdict(hotkey, Attested(Tier.CC_CPU_TDX, chip_id, "measurement", 1))
+    store.record_verdict(hotkey, _attested(chip_id))
 
     board = store.board()
     assert board["miners"][0]["verification_status"] == "VERIFIED"
@@ -189,6 +203,117 @@ def test_endpoint_change_clears_attestation(tmp_path: Path) -> None:
     assert board["count"] == 0
 
 
+def test_public_board_exposes_claim_statuses_without_audit_digests(tmp_path: Path) -> None:
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "P" * 47
+    store.enroll(hotkey, "http://127.0.0.1:9001")
+    policy = Policy(allowed_measurements={"measurement"})
+    claims = attestation_claims(b"quote", policy)
+    store.record_verdict(
+        hotkey,
+        Attested(
+            Tier.CC_CPU_TDX,
+            "chip",
+            "measurement",
+            1,
+            assurance=claims,
+        ),
+    )
+
+    public = store.board()["miners"][0]["assurance"]
+
+    assert public["claims"]["hardware"]["status"] == "passed"
+    assert public["claims"]["channel"]["status"] == "not_evaluated"
+    assert "evidence_digest" not in str(public)
+    assert "policy_digest" not in str(public)
+
+
+def test_registry_rejects_legacy_verified_flag_without_typed_claims(tmp_path: Path) -> None:
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "L" * 47
+    store.enroll(hotkey, "http://127.0.0.1:9001")
+
+    store.record_verdict(
+        hotkey, Attested(Tier.CC_CPU_TDX, "chip", "measurement", 1, "VERIFIED")
+    )
+
+    miner = store.board()["miners"][0]
+    assert miner["verification_status"] == "FAILED"
+    assert miner["chip_id_prefix"] is None
+    assert miner["tier"] is None
+    assert miner["assurance"]["claims"]["hardware"]["status"] == "not_evaluated"
+
+
+def test_registry_migrates_legacy_schema_and_demotes_persisted_verified_row(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-registry.sqlite"
+    hotkey = "5" + "M" * 47
+    now = now_iso()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE enrollments (
+                hotkey TEXT PRIMARY KEY,
+                endpoint_url TEXT NOT NULL,
+                enrolled_at_iso TEXT NOT NULL,
+                updated_at_iso TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE attestations (
+                hotkey TEXT PRIMARY KEY,
+                chip_id TEXT,
+                tier TEXT,
+                verification_status TEXT NOT NULL,
+                last_verified_iso TEXT NOT NULL,
+                error TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO enrollments VALUES (?, ?, ?, ?)",
+            (hotkey, "http://127.0.0.1:9001", now, now),
+        )
+        conn.execute(
+            "INSERT INTO attestations VALUES (?, ?, ?, ?, ?, ?)",
+            (hotkey, "legacy-chip", "cc_cpu_tdx", "VERIFIED", now, None),
+        )
+
+    store = RegistryStore(str(path))
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(attestations)")
+        }
+    miner = store.board()["miners"][0]
+
+    assert "assurance_json" in columns
+    assert miner["verification_status"] == "FAILED"
+    assert miner["chip_id_prefix"] is None
+    assert miner["tier"] is None
+
+
+def test_registry_chip_rotation_conflict_does_not_publish_rejected_identity(
+    tmp_path: Path,
+) -> None:
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    owner = "5" + "O" * 47
+    claimant = "5" + "C" * 47
+    for hotkey in (owner, claimant):
+        store.enroll(hotkey, f"http://127.0.0.1:{9001 if hotkey == owner else 9002}")
+
+    store.record_verdict(owner, _attested("shared-chip"))
+    store.record_verdict(claimant, _attested("shared-chip"))
+    miners = {miner["hotkey"]: miner for miner in store.board()["miners"]}
+
+    assert miners[owner]["verification_status"] == "VERIFIED"
+    assert miners[claimant]["verification_status"] == "FAILED"
+    assert miners[claimant]["chip_id_prefix"] is None
+    assert miners[claimant]["tier"] is None
+
+
 # ---------------------------------------------------------------------------
 # Test 2: Same endpoint re-enroll preserves attestation state
 # ---------------------------------------------------------------------------
@@ -199,7 +324,7 @@ def test_same_endpoint_reenroll_preserves_state(tmp_path: Path) -> None:
     chip_id = "cd" * 32
 
     store.enroll(hotkey, "https://miner.example.com")
-    store.record_verdict(hotkey, Attested(Tier.CC_CPU_TDX, chip_id, "measurement", 1))
+    store.record_verdict(hotkey, _attested(chip_id))
 
     board = store.board()
     assert board["miners"][0]["verification_status"] == "VERIFIED"
@@ -476,14 +601,14 @@ def test_expired_chip_binding_allows_rotation(tmp_path: Path) -> None:
     store.enroll(hotkey_a, "https://a.example.com")
     store.enroll(hotkey_b, "https://b.example.com")
 
-    store.record_verdict(hotkey_a, Attested(Tier.CC_CPU_TDX, chip_id, "meas", 1))
+    store.record_verdict(hotkey_a, _attested(chip_id, "meas"))
 
     board = store.board()
     statuses = {m["hotkey"]: m["verification_status"] for m in board["miners"]}
     assert statuses[hotkey_a] == "VERIFIED"
 
     # hotkey_b tries same chip while hotkey_a is live -> FAILED
-    store.record_verdict(hotkey_b, Attested(Tier.CC_CPU_TDX, chip_id, "meas", 1))
+    store.record_verdict(hotkey_b, _attested(chip_id, "meas"))
     board = store.board()
     statuses = {m["hotkey"]: m["verification_status"] for m in board["miners"]}
     assert statuses[hotkey_b] == "FAILED"
@@ -499,8 +624,10 @@ def test_expired_chip_binding_allows_rotation(tmp_path: Path) -> None:
     statuses = {m["hotkey"]: m["verification_status"] for m in board["miners"]}
     assert statuses[hotkey_a] == "STALE"
 
-    # hotkey_b can now claim the chip
-    store.record_verdict(hotkey_b, Attested(Tier.CC_CPU_TDX, chip_id, "meas", 1))
+    # Identity conflict is terminal until explicit reenrollment. Once the old
+    # owner is stale, the claimant must start a new lifecycle generation.
+    store.reenroll_lifecycle(hotkey_b)
+    store.record_verdict(hotkey_b, _attested(chip_id, "meas"))
     board = store.board()
     statuses = {m["hotkey"]: m["verification_status"] for m in board["miners"]}
     assert statuses[hotkey_a] == "STALE"

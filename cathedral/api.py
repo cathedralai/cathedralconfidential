@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
+from cathedral.assurance import ATTESTATION_ADMISSION_POLICY, WORK_DISPATCH_POLICY
 from cathedral.common import Attested, Tier
 from cathedral.lanes import WorkItem
 
@@ -38,6 +39,8 @@ class Inventory:
         self._miners: dict[str, Attested] = {}
 
     def register(self, uid: str, attested: Attested) -> None:
+        if not ATTESTATION_ADMISSION_POLICY.allows(attested.assurance):
+            raise ValueError("inventory admission requires passed hardware and software claims")
         self._miners[uid] = attested
 
     def get(self, uid: str) -> Attested | None:
@@ -69,10 +72,16 @@ class Allocator:
             return [
                 uid
                 for uid, attested in self._inventory.items()
-                if request.lane.qualify(attested)
+                if WORK_DISPATCH_POLICY.allows(attested.assurance)
+                and request.lane.qualify(attested)
             ]
         if request.tier is not None:
-            return self._inventory.by_tier(request.tier)
+            return [
+                uid
+                for uid, attested in self._inventory.items()
+                if WORK_DISPATCH_POLICY.allows(attested.assurance)
+                and attested.tier == request.tier
+            ]
         return []
 
     def allocate(self, request: Request) -> str | None:

@@ -1,7 +1,7 @@
 """Contract: nonce freshness and REPORT_DATA binding (docs/DESIGN.md §6).
 
-REPORT_DATA = sha512(nonce || hotkey [|| ssh_host_key]) binds freshness, the
-registered identity (defeats evidence relay), and the Sandbox SSH channel.
+Legacy REPORT_DATA = sha512(nonce || hotkey [|| ssh_host_key]) fixtures remain
+stable for migration. Production v2 channel tests live in test_channel_binding.
 """
 
 from __future__ import annotations

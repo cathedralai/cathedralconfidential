@@ -4,22 +4,39 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import http.client
 import ipaddress
 import json
 import logging
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from http.client import HTTPResponse
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import cathedral.verify as verifier
-from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce
+from cathedral.assurance import ATTESTATION_ADMISSION_POLICY, with_verified_channel
+from cathedral.common import (
+    Attested,
+    Evidence,
+    EvidenceKind,
+    MAX_EVIDENCE_RESPONSE_BODY,
+    MAX_GPU_EVIDENCE_CONCURRENCY,
+    Policy,
+    Tier,
+    issue_nonce,
+)
 from cathedral.enroll import RegistryStore
+from cathedral.lifecycle import (
+    LifecycleError,
+    LifecycleReason,
+    WorkerLifecycleState,
+)
+from cathedral.remote import RemoteMiner
 
 
 MAX_EVIDENCE_BYTES = 64 * 1024
@@ -77,7 +94,9 @@ class _PreResolvedHTTPSConnection(http.client.HTTPSConnection):
         )
 
 
-def _resolve_endpoint(url: str, *, resolver: Any = None, production_mode: bool = False) -> str | None:
+def _resolve_endpoint(
+    url: str, *, resolver: Any = None, production_mode: bool = False
+) -> str | None:
     """Resolve the endpoint URL's hostname and verify every resolved address is
     a public/global unicast destination.  Runs before any network call to
     prevent SSRF to loopback, link-local, or RFC-1918 targets via DNS rebinding.
@@ -135,9 +154,7 @@ def _resolve_endpoint(url: str, *, resolver: Any = None, production_mode: bool =
         try:
             infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except OSError as exc:
-            raise ValueError(
-                f"cannot resolve endpoint hostname {host!r}: {exc}"
-            ) from exc
+            raise ValueError(f"cannot resolve endpoint hostname {host!r}: {exc}") from exc
         addrs = [info[4][0] for info in infos]
 
     if not addrs:
@@ -299,7 +316,13 @@ def policy_from_args(args: argparse.Namespace) -> Policy:
     if args.allow_measurements_file:
         with open(args.allow_measurements_file) as fh:
             measurements.update(line.strip() for line in fh if line.strip())
-    return Policy(allowed_measurements=measurements, min_tcb=args.min_tcb)
+    return Policy(
+        allowed_measurements=measurements,
+        min_tcb=args.min_tcb,
+        tdx_strict=getattr(args, "tdx_strict", False),
+        tdx_allowed_tcb_statuses=set(getattr(args, "allow_tdx_tcb_status", None) or ["UpToDate"]),
+        tdx_allowed_advisories=set(getattr(args, "allow_tdx_advisory", None) or []),
+    )
 
 
 def _verify_tdx_evidence(
@@ -314,9 +337,7 @@ def _verify_tdx_evidence(
     ``tier == Tier.CC_CPU_TDX``.  Any other outcome (None, wrong status, wrong
     tier) rejects.
     """
-    tdx = next(
-        (e for e in evidences if e.kind is EvidenceKind.TDX), None
-    )
+    tdx = next((e for e in evidences if e.kind is EvidenceKind.TDX), None)
     if tdx is None:
         return None
 
@@ -325,6 +346,7 @@ def _verify_tdx_evidence(
         attested is None
         or attested.verification_status != "VERIFIED"
         or attested.tier is not Tier.CC_CPU_TDX
+        or not ATTESTATION_ADMISSION_POLICY.allows(attested.assurance)
     ):
         return None
     return attested
@@ -334,45 +356,34 @@ def verify_cc_evidence_bundle(
     evidences: list[Evidence],
     nonce: bytes,
     policy: Policy,
+    *,
+    gpu_profile=None,
+    gpu_verifier=None,
+    gpu_identity_registry=None,
+    expected_tier: Tier = Tier.CC_CPU_TDX,
 ) -> Attested | None:
-    """Verify an evidence bundle and return an admission verdict.
+    """Verify the CPU evidence bundle and return an admission verdict.
 
-    Launch paths tried in order:
-
-    1. **GPU composite** (SNP + GPU_CC): both must be VERIFIED.  GPU
-       verification is intentionally still fail-closed -- until the NVIDIA
-       NRAS or local verifier is wired in, ``verifier.verify`` returns
-       ``None`` for GPU_CC evidence and this path cannot produce a verdict.
-
-    2. **TDX-CPU**: a single TDX evidence with ``VERIFIED`` status and
-       ``CC_CPU_TDX`` tier is sufficient.
+    GPU verification is deliberately completed inside ``probe_once`` so the
+    component result cannot escape without live-channel confirmation and the
+    durable identity claim at the lifecycle admission boundary.
 
     Returns ``None`` (reject) when no path produces a verdict.
     """
 
-    # --- GPU composite path (fail-closed) ---
-    snp = next((e for e in evidences if e.kind is EvidenceKind.SEV_SNP), None)
-    gpu = next((e for e in evidences if e.kind is EvidenceKind.GPU_CC), None)
-    if snp is not None and gpu is not None:
-        snp_attested = verifier.verify(snp, nonce, policy)
-        gpu_attested = verifier.verify(gpu, nonce, policy)
-        if (
-            snp_attested is not None
-            and gpu_attested is not None
-            and snp_attested.verification_status == "VERIFIED"
-            and gpu_attested.verification_status == "VERIFIED"
-        ):
-            measurement = hashlib.sha256(
-                f"snp:{snp_attested.measurement}\ngpu:{gpu_attested.measurement}".encode("utf-8")
-            ).hexdigest()
-            return Attested(
-                tier=Tier.CC_GPU,
-                chip_id=snp_attested.chip_id,
-                measurement=measurement,
-                tcb=min(snp_attested.tcb, gpu_attested.tcb),
-            )
+    if expected_tier not in {Tier.CC_CPU_TDX, Tier.CC_GPU}:
+        return None
+    gpu_configuration = (gpu_profile, gpu_verifier, gpu_identity_registry)
+    if expected_tier is Tier.CC_GPU:
+        return None
+    if any(item is not None for item in gpu_configuration):
+        # CPU and GPU participation use separate validator-owned requests.
+        return None
 
-    # --- TDX-CPU path ---
+    gpu_components = [e for e in evidences if e.kind is EvidenceKind.GPU_CC]
+    if gpu_components:
+        return None
+
     tdx_result = _verify_tdx_evidence(evidences, nonce, policy)
     if tdx_result is not None:
         return tdx_result
@@ -388,13 +399,17 @@ def probe_once(
     resolver: Any = None,
     opener: Any = None,
     production_mode: bool = False,
-) -> None:
+    gpu_profile=None,
+    gpu_verifier=None,
+    gpu_identity_registry=None,
+    expected_tier: Tier = Tier.CC_CPU_TDX,
+) -> bool:
     """Probe all enrolled miners concurrently, bounded to *max_workers* threads.
 
-    Each enrollment is isolated: a timeout or error in one probe records a
-    FAILED verdict and does not prevent remaining enrollments from being probed
-    in the same pass.  Concurrency prevents one slow miner from serialising
-    the entire pass.
+    Each enrollment is isolated: a timeout or transport error in one probe
+    records a failed public verdict plus a bounded lifecycle retry and does not
+    prevent remaining enrollments from being probed in the same pass.
+    Concurrency prevents one slow miner from serialising the entire pass.
 
     :param production_mode: when True, any enrollment whose endpoint_url host
         is not a public IP literal is rejected before any network access
@@ -405,39 +420,228 @@ def probe_once(
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be at least 1, got {max_workers}")
-    enrollments = store.enrollments()
+    gpu_configuration = (gpu_profile, gpu_verifier, gpu_identity_registry)
+    if expected_tier is Tier.CC_GPU and any(item is None for item in gpu_configuration):
+        raise ValueError("GPU probing requires profile, verifier, and identity registry")
+    if expected_tier is Tier.CC_CPU_TDX and any(item is not None for item in gpu_configuration):
+        raise ValueError("CPU probing cannot carry GPU verifier configuration")
+    if expected_tier not in {Tier.CC_CPU_TDX, Tier.CC_GPU}:
+        raise ValueError("unsupported expected attestation tier")
+    if expected_tier is Tier.CC_GPU:
+        from cathedral.gpu import (
+            ExternalGpuVerifier,
+            GpuIdentityRegistry,
+            GpuProfile,
+        )
 
-    def _probe_one(enrollment: Any) -> None:
+        if not isinstance(gpu_profile, GpuProfile) or not isinstance(
+            gpu_identity_registry, GpuIdentityRegistry
+        ):
+            raise ValueError("GPU probe profile or identity registry is invalid")
+        if production_mode:
+            if not gpu_profile.production_ready_for(policy):
+                raise ValueError(
+                    "production GPU probe requires a live profile from its CPU policy registry"
+                )
+            if not gpu_identity_registry.production_ready:
+                raise ValueError(
+                    "production GPU probe requires a protected identity registry"
+                )
+            if not isinstance(gpu_verifier, ExternalGpuVerifier):
+                raise ValueError("production GPU probe requires the pinned external verifier")
+            if not gpu_verifier.production_ready:
+                raise ValueError("production GPU probe requires a static verifier executable")
+            gpu_verifier.preflight(gpu_profile)
+    due_snapshots = {
+        snapshot.hotkey: snapshot
+        for snapshot in store.due_refreshes(refresh_ahead_seconds=store.verification_ttl_seconds)
+    }
+    probe_targets = [
+        (enrollment, due_snapshots[enrollment.hotkey])
+        for enrollment in store.enrollments()
+        if enrollment.hotkey in due_snapshots
+    ]
+    gpu_evidence_slots = threading.BoundedSemaphore(MAX_GPU_EVIDENCE_CONCURRENCY)
+
+    def _probe_one(target: tuple[Any, Any]) -> bool:
+        enrollment, lifecycle = target
         nonce = issue_nonce()
         try:
-            evidences = _request_evidence(
-                enrollment.endpoint_url,
-                enrollment.hotkey,
-                nonce,
-                resolver=resolver,
-                opener=opener,
-                production_mode=production_mode,
-            )
-            attested = verify_cc_evidence_bundle(evidences, nonce, policy)
-            if attested is None:
-                store.record_verdict(enrollment.hotkey, None, error="verification failed")
+            if production_mode:
+                _resolve_endpoint(
+                    enrollment.endpoint_url,
+                    resolver=resolver,
+                    production_mode=True,
+                )
+                if urlparse(enrollment.endpoint_url).scheme != "https":
+                    raise ValueError("production probing requires HTTPS")
+                remote_options = {"timeout": TIMEOUT_SECONDS}
+                if expected_tier is Tier.CC_GPU:
+                    remote_options["max_response_body"] = MAX_EVIDENCE_RESPONSE_BODY
+                client = RemoteMiner(
+                    enrollment.endpoint_url,
+                    enrollment.hotkey,
+                    **remote_options,
+                )
+                if expected_tier is Tier.CC_GPU:
+                    with gpu_evidence_slots:
+                        evidences = list(client.fetch_evidence_bundle(nonce))
+                    channel_evidence = next(
+                        item for item in evidences if item.kind is EvidenceKind.TDX
+                    )
+                else:
+                    channel_evidence = client.fetch_evidence(nonce)
+                    evidences = [channel_evidence]
             else:
-                store.record_verdict(enrollment.hotkey, attested)
-        except Exception as exc:
-            try:
-                store.record_verdict(enrollment.hotkey, None, error=type(exc).__name__)
-            except Exception:
-                LOGGER.exception(
-                    "failed to record probe failure for hotkey %s", enrollment.hotkey
+                client = None
+                evidences = _request_evidence(
+                    enrollment.endpoint_url,
+                    enrollment.hotkey,
+                    nonce,
+                    resolver=resolver,
+                    opener=opener,
+                    production_mode=False,
+                )
+            composite = None
+            if expected_tier is Tier.CC_GPU:
+                from cathedral.gpu import (
+                    GpuAttestationError,
+                    gpu_error_is_evidence_denial,
+                    verify_composite_gpu,
                 )
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_probe_one, e) for e in enrollments]
+                if production_mode and not gpu_profile.production_ready_for(policy):
+                    raise ValueError("production GPU profile expired during probe")
+                tdx_components = [item for item in evidences if item.kind is EvidenceKind.TDX]
+                gpu_components = [item for item in evidences if item.kind is EvidenceKind.GPU_CC]
+                if len(evidences) != 2 or len(tdx_components) != 1 or len(gpu_components) != 1:
+                    attested = None
+                else:
+                    try:
+                        composite = verify_composite_gpu(
+                            tdx_components[0],
+                            gpu_components[0],
+                            nonce,
+                            policy,
+                            gpu_profile,
+                            gpu_verifier,
+                        )
+                        if production_mode and not gpu_profile.production_ready_for(policy):
+                            raise ValueError("production GPU profile expired during probe")
+                        attested = composite.attested
+                    except GpuAttestationError as exc:
+                        if not gpu_error_is_evidence_denial(exc):
+                            raise
+                        LOGGER.info("GPU composite rejected: %s", exc.category)
+                        attested = None
+            else:
+                attested = verify_cc_evidence_bundle(evidences, nonce, policy)
+            if attested is None:
+                store.record_verdict(
+                    enrollment.hotkey,
+                    None,
+                    error="verification failed",
+                    expected_generation=lifecycle.generation,
+                    expected_revision=lifecycle.revision,
+                    policy_registry_release=policy.registry_release,
+                    policy_registry_digest=policy.registry_digest,
+                )
+                return False
+            else:
+                if client is not None:
+                    binding = client.confirm_channel_binding(channel_evidence)
+                    if (
+                        any(item.channel_binding != binding for item in evidences)
+                        or attested.assurance is None
+                    ):
+                        raise ValueError("attested channel binding mismatch")
+                    attested = replace(
+                        attested,
+                        assurance=with_verified_channel(
+                            attested.assurance, binding.canonical_bytes()
+                        ),
+                    )
+                pending_gpu_claim = None
+                if composite is not None:
+                    if production_mode and not gpu_profile.production_ready_for(policy):
+                        raise ValueError("production GPU profile expired before admission")
+                    try:
+                        pending_gpu_claim = gpu_identity_registry.begin_claim(
+                            enrollment.hotkey,
+                            composite.gpu_component,
+                        )
+                    except GpuAttestationError as exc:
+                        if exc.category != "identity_conflict":
+                            raise
+                        store.transition_lifecycle(
+                            enrollment.hotkey,
+                            WorkerLifecycleState.REVOKED,
+                            LifecycleReason.IDENTITY_CONFLICT,
+                            expected_generation=lifecycle.generation,
+                            expected_revision=lifecycle.revision,
+                            operator_detail="GPU identity already backs another worker",
+                        )
+                        return False
+                try:
+                    gpu_commit_authority = {}
+                    if composite is not None and production_mode:
+                        gpu_commit_authority = {
+                            "gpu_profile_valid_from": gpu_profile.registry_valid_from,
+                            "gpu_profile_valid_until": gpu_profile.registry_valid_until,
+                            "gpu_profile_registry_release": gpu_profile.registry_release,
+                            "gpu_profile_registry_digest": gpu_profile.registry_digest,
+                        }
+                    store.record_verdict(
+                        enrollment.hotkey,
+                        attested,
+                        expected_generation=lifecycle.generation,
+                        expected_revision=lifecycle.revision,
+                        policy_registry_release=policy.registry_release,
+                        policy_registry_digest=policy.registry_digest,
+                        **gpu_commit_authority,
+                    )
+                except BaseException:
+                    if pending_gpu_claim is not None:
+                        gpu_identity_registry.rollback_claim(pending_gpu_claim)
+                    raise
+                if pending_gpu_claim is not None:
+                    gpu_identity_registry.commit_claim(pending_gpu_claim)
+                return True
+        except LifecycleError:
+            # The endpoint or lifecycle changed while evidence was in flight.
+            # The lifecycle CAS rejected the stale result, so do not mutate the
+            # replacement generation or schedule a retry against it.
+            return False
+        except Exception as exc:
+            try:
+                store.record_probe_failure(
+                    enrollment.hotkey,
+                    error=type(exc).__name__,
+                    expected_generation=lifecycle.generation,
+                    expected_revision=lifecycle.revision,
+                )
+            except LifecycleError:
+                return False
+            except Exception:
+                LOGGER.exception("failed to record probe failure for hotkey %s", enrollment.hotkey)
+            return False
+
+    all_succeeded = True
+    effective_workers = (
+        min(max_workers, MAX_GPU_EVIDENCE_CONCURRENCY)
+        if expected_tier is Tier.CC_GPU
+        else max_workers
+    )
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        futures = [executor.submit(_probe_one, target) for target in probe_targets]
         for future in as_completed(futures):
             try:
-                future.result()
+                if not future.result():
+                    all_succeeded = False
             except Exception:
                 LOGGER.exception("unexpected error in probe worker")
+                all_succeeded = False
+    return all_succeeded
 
 
 def main() -> None:
@@ -449,6 +653,32 @@ def main() -> None:
     parser.add_argument("--allow-measurement", action="append", default=[])
     parser.add_argument("--allow-measurements-file")
     parser.add_argument("--min-tcb", type=int, default=0)
+    parser.add_argument("--tdx-strict", action="store_true")
+    parser.add_argument("--allow-tdx-tcb-status", action="append", default=[])
+    parser.add_argument("--allow-tdx-advisory", action="append", default=[])
+    parser.add_argument("--policy-registry")
+    parser.add_argument("--policy-registry-keys")
+    parser.add_argument("--policy-registry-state")
+    parser.add_argument("--policy-registry-min-release", type=int)
+    parser.add_argument("--policy-registry-pinned-release", type=int)
+    parser.add_argument("--policy-registry-pinned-digest")
+    parser.add_argument("--policy-registry-max-age-seconds", type=int, default=86400)
+    parser.add_argument(
+        "--gpu-profile-id",
+        help="active gpu_cc profile id from the verified policy registry",
+    )
+    parser.add_argument(
+        "--gpu-identity-db",
+        help="durable pseudonymous GPU identity-claim database",
+    )
+    parser.add_argument(
+        "--gpu-identity-key-file",
+        help="owner-only file containing a 32-byte base64 identity key",
+    )
+    parser.add_argument(
+        "--gpu-identity-anchor-file",
+        help="external protected monotonic generation anchor",
+    )
     parser.add_argument(
         "--workers",
         type=int,
@@ -468,12 +698,86 @@ def main() -> None:
         parser.error("--workers must be at least 1")
 
     store = RegistryStore(args.db)
-    policy = policy_from_args(args)
+    gpu_values = (
+        args.gpu_profile_id,
+        args.gpu_identity_db,
+        args.gpu_identity_key_file,
+        args.gpu_identity_anchor_file,
+    )
+    if any(value is not None for value in gpu_values) and any(
+        value is None for value in gpu_values
+    ):
+        parser.error(
+            "--gpu-profile-id, --gpu-identity-db, --gpu-identity-key-file, and "
+            "--gpu-identity-anchor-file are required together"
+        )
+    if args.policy_registry is not None:
+        if args.allow_measurement or args.allow_measurements_file:
+            parser.error(
+                "legacy measurement flags and --policy-registry are mutually exclusive"
+            )
+        for name in ("policy_registry_keys", "policy_registry_state"):
+            if getattr(args, name) is None:
+                parser.error(f"--{name.replace('_', '-')} is required with --policy-registry")
+        from cathedral.cli import _verified_registry_snapshot_and_policy
+
+        policy, policy_snapshot = _verified_registry_snapshot_and_policy(
+            args.policy_registry,
+            args.policy_registry_keys,
+            state_path=args.policy_registry_state,
+            minimum_release=args.policy_registry_min_release,
+            max_age_seconds=args.policy_registry_max_age_seconds,
+            production_mode=args.production_mode,
+            pinned_release=args.policy_registry_pinned_release,
+            pinned_digest=args.policy_registry_pinned_digest,
+        )
+    else:
+        policy = policy_from_args(args)
+        policy_snapshot = None
+    gpu_profile = None
+    gpu_verifier = None
+    gpu_identity_registry = None
+    expected_tier = Tier.CC_CPU_TDX
+    if args.gpu_profile_id is not None:
+        if policy_snapshot is None:
+            parser.error("GPU probing requires --policy-registry authority")
+        from cathedral.cli import _load_gpu_identity_key
+        from cathedral.gpu import (
+            GpuIdentityRegistry,
+            gpu_profile_from_registry,
+            gpu_verifier_from_env,
+        )
+
+        gpu_profile = gpu_profile_from_registry(policy_snapshot, args.gpu_profile_id)
+        gpu_verifier = gpu_verifier_from_env(production_mode=args.production_mode)
+        gpu_identity_registry = GpuIdentityRegistry(
+            args.gpu_identity_db,
+            identity_digest_key=_load_gpu_identity_key(
+                args.gpu_identity_key_file,
+                production_mode=args.production_mode,
+            ),
+            production_mode=args.production_mode,
+            generation_anchor_path=args.gpu_identity_anchor_file,
+        )
+        expected_tier = Tier.CC_GPU
     while True:
         try:
-            probe_once(store, policy, max_workers=args.workers, production_mode=args.production_mode)
+            all_succeeded = probe_once(
+                store,
+                policy,
+                max_workers=args.workers,
+                production_mode=args.production_mode,
+                gpu_profile=gpu_profile,
+                gpu_verifier=gpu_verifier,
+                gpu_identity_registry=gpu_identity_registry,
+                expected_tier=expected_tier,
+            )
+            if args.once and not all_succeeded:
+                raise RuntimeError("one-shot probe did not verify every due target")
         except Exception:
             LOGGER.exception("probe pass failed")
+            if args.once:
+                raise
         if args.once:
             return
         time.sleep(args.interval)

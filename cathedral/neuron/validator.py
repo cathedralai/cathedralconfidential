@@ -25,6 +25,7 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
+from cathedral.assurance import ATTESTATION_ADMISSION_POLICY
 from cathedral.api import Inventory
 from cathedral.common import Attested, Evidence, Policy, issue_nonce
 from cathedral.economics import apply_routing
@@ -92,6 +93,8 @@ def epoch(
         attested = miner.serve_evidence(nonce, policy)
         if attested is None:
             continue  # invalid quote -> weight 0 -> no emission (DESIGN §8)
+        if not ATTESTATION_ADMISSION_POLICY.allows(attested.assurance):
+            continue
 
         # --- sybil dedup: one physical chip_id backs exactly one UID ---
         if attested.chip_id in seen_chip:
@@ -153,6 +156,8 @@ def attested_epoch(
 
             attested = verifier(evidence, nonce, policy)
             if attested is None:
+                continue
+            if not ATTESTATION_ADMISSION_POLICY.allows(attested.assurance):
                 continue
 
             if attested.chip_id in seen_chip:

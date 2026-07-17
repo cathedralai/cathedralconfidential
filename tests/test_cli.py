@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -12,9 +13,13 @@ import pytest
 
 from cathedral.cli import (
     DEFAULT_WORKER_BEARER_ENV,
+    _build_runtime,
     _dict_to_item,
     _item_to_dict,
+    _load_gpu_identity_key,
+    _load_policy,
     _load_tokens,
+    _outcome_json,
     build_parser,
     cmd_work_submit,
     cmd_work_status,
@@ -23,8 +28,54 @@ from cathedral.cli import (
 )
 from cathedral.lanes.sat import _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
+from cathedral.gpu import (
+    GpuComponentVerdict,
+    GpuDeviceClaim,
+    GpuIdentityRegistry,
+)
 from cathedral.ledger import Ledger
+from cathedral.runtime import MinerOutcome
 from cathedral.worker import WorkerServer
+
+
+def test_load_policy_supports_strict_tdx_claim_policy(tmp_path: Path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "allowed_measurements": ["tdx-measurement-1"],
+                "min_tcb": 0,
+                "tdx_strict": True,
+                "tdx_allowed_tcb_statuses": ["UpToDate", "SWHardeningNeeded"],
+                "tdx_allowed_advisories": ["INTEL-SA-01234"],
+            }
+        )
+    )
+
+    policy = _load_policy(str(policy_file))
+
+    assert policy.tdx_strict is True
+    assert policy.tdx_allowed_tcb_statuses == {"UpToDate", "SWHardeningNeeded"}
+    assert policy.tdx_allowed_advisories == {"INTEL-SA-01234"}
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"tdx_strict": "true"},
+        {"tdx_allowed_tcb_statuses": ["FutureStatus"]},
+        {"tdx_allowed_tcb_statuses": ["Revoked"]},
+        {"tdx_allowed_advisories": ["bad advisory with spaces"]},
+    ],
+)
+def test_load_policy_rejects_unsafe_tdx_configuration(tmp_path: Path, override):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps({"allowed_measurements": ["m"], "tdx_strict": True, **override})
+    )
+
+    with pytest.raises(ValueError):
+        _load_policy(str(policy_file))
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +227,216 @@ def test_runtime_restart_commands_only_require_ledger_path():
     assert args.runtime_command == "status"
 
 
+def test_gpu_runtime_and_worker_flags_are_explicit_and_complete(tmp_path: Path):
+    parser = build_parser()
+    worker = parser.parse_args(
+        ["worker", "serve", "--hotkey", "worker", "--gpu-composite"]
+    )
+    assert worker.gpu_composite is True
+
+    runtime = parser.parse_args(
+        [
+            "runtime",
+            "audit-attestation",
+            "--registry-db",
+            "registry.sqlite",
+            "--ledger-db",
+            "ledger.sqlite",
+            "--policy-registry",
+            "policy.json",
+            "--gpu-profile-id",
+            "tdx-h100-v1",
+            "--gpu-identity-db",
+            "gpu-identities.sqlite",
+            "--gpu-identity-key-file",
+            str(tmp_path / "identity.key"),
+            "--gpu-identity-anchor-file",
+            str(tmp_path / "identity-generation.anchor"),
+            "--canary-hotkey",
+            "canary",
+            "--canary-endpoint",
+            "https://8.8.8.8",
+        ]
+    )
+    assert runtime.gpu_profile_id == "tdx-h100-v1"
+    assert runtime.gpu_identity_db == "gpu-identities.sqlite"
+
+
+def test_gpu_audit_json_keeps_component_record_and_stable_failure_category():
+    successful = _outcome_json(
+        MinerOutcome(
+            "worker",
+            "https://8.8.8.8",
+            "attestation_verified",
+            admitted=True,
+            component_audit={
+                "schema": "cathedral_composite_gpu_audit_v1",
+                "cpu": {"status": "verified"},
+                "gpu": {"device_count": 2, "status": "verified"},
+            },
+        )
+    )
+    failed = _outcome_json(
+        MinerOutcome(
+            "worker",
+            "https://8.8.8.8",
+            "attestation_failed",
+            error="GPU verifier rejected the component",
+            error_category="gpu_component_denied",
+        )
+    )
+    audit_only = _outcome_json(
+        MinerOutcome(
+            "worker",
+            "https://8.8.8.8",
+            "attestation_verified",
+        )
+    )
+
+    assert successful["component_audit"]["gpu"]["device_count"] == 2
+    assert successful["verified"] is True
+    assert successful["admitted"] is True
+    assert audit_only["verified"] is True
+    assert audit_only["admitted"] is False
+    assert failed["error_category"] == "gpu_component_denied"
+
+
+def test_gpu_identity_key_file_is_bounded_and_permission_checked(tmp_path: Path):
+    key_path = tmp_path / "gpu-identity.key"
+    key_path.write_bytes(base64.b64encode(b"i" * 32) + b"\n")
+    key_path.chmod(0o600)
+    assert _load_gpu_identity_key(str(key_path), production_mode=True) == b"i" * 32
+
+    key_path.chmod(0o644)
+    with pytest.raises(ValueError, match="group/world"):
+        _load_gpu_identity_key(str(key_path), production_mode=True)
+
+
+def test_gpu_runtime_configuration_rejects_partial_identity_settings():
+    with pytest.raises(ValueError, match="required together"):
+        _build_runtime(
+            argparse.Namespace(
+                gpu_profile_id="tdx-h100-v1",
+                gpu_identity_db=None,
+                gpu_identity_key_file=None,
+            )
+        )
+
+
+def test_recover_gpu_identities_cli_is_authenticated_and_audited(
+    tmp_path: Path, capsys
+):
+    database_parent = tmp_path / "database"
+    anchor_parent = tmp_path / "anchor"
+    database_parent.mkdir(mode=0o700)
+    anchor_parent.mkdir(mode=0o700)
+    database = database_parent / "gpu-identities.sqlite"
+    anchor = anchor_parent / "generation.anchor"
+    key_path = tmp_path / "gpu-identity.key"
+    key_path.write_bytes(base64.b64encode(b"i" * 32) + b"\n")
+    key_path.chmod(0o600)
+    tmp_path.chmod(0o700)
+    identity_registry = GpuIdentityRegistry(
+        database,
+        identity_digest_key=b"i" * 32,
+        production_mode=True,
+        generation_anchor_path=anchor,
+        initialize=True,
+    )
+    identity_registry.begin_claim(
+        "worker-a",
+        GpuComponentVerdict(
+            devices=(
+                GpuDeviceClaim(
+                    "GPU-11111111-1111-4111-8111-111111111111",
+                    "NVIDIA-H100-80GB-HBM3",
+                    "CC-On",
+                    "550.90.07",
+                    "96.00.5E.00.01",
+                    "Secure",
+                    True,
+                ),
+            ),
+            evidence_digest="sha256:" + "1" * 64,
+            challenge_digest="sha256:" + "2" * 64,
+            host_session_digest="sha256:" + "3" * 64,
+            profile_digest="sha256:" + "4" * 64,
+            tdx_component_digest="sha256:" + "5" * 64,
+            topology_digest=None,
+        ),
+    )
+
+    assert main(
+        [
+            "runtime",
+            "recover-gpu-identities",
+            "--gpu-identity-db",
+            str(database),
+            "--gpu-identity-key-file",
+            str(key_path),
+            "--gpu-identity-anchor-file",
+            str(anchor),
+            "--reason",
+            "validator terminated during worker admission",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["worker_claims_committed"] == 1
+    assert payload["worker_identities_committed"] == 1
+    registry = GpuIdentityRegistry(
+        database,
+        identity_digest_key=b"i" * 32,
+        production_mode=True,
+        generation_anchor_path=anchor,
+    )
+    assert registry.recovery_history()[0]["event_id"] == payload["event_id"]
+
+
+def test_initialize_gpu_identities_cli_is_explicit_and_one_time(tmp_path: Path, capsys):
+    database_parent = tmp_path / "database"
+    anchor_parent = tmp_path / "anchor"
+    database_parent.mkdir(mode=0o700)
+    anchor_parent.mkdir(mode=0o700)
+    database = database_parent / "gpu-identities.sqlite"
+    anchor = anchor_parent / "generation.anchor"
+    key_path = tmp_path / "gpu-identity.key"
+    key_path.write_bytes(base64.b64encode(b"i" * 32) + b"\n")
+    key_path.chmod(0o600)
+    tmp_path.chmod(0o700)
+    command = [
+        "runtime",
+        "initialize-gpu-identities",
+        "--gpu-identity-db",
+        str(database),
+        "--gpu-identity-key-file",
+        str(key_path),
+        "--gpu-identity-anchor-file",
+        str(anchor),
+    ]
+
+    assert main(command) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "generation_anchor": str(anchor),
+        "identity_database": str(database),
+        "initialized": True,
+        "production_ready": True,
+    }
+    assert GpuIdentityRegistry(
+        database,
+        identity_digest_key=b"i" * 32,
+        production_mode=True,
+        generation_anchor_path=anchor,
+    ).production_ready
+
+    assert main(command) == 2
+    error_payload = json.loads(capsys.readouterr().err)
+    assert error_payload == {
+        "error": "GPU identity initialization requires unused database and anchor paths"
+    }
+
+
 # ---------------------------------------------------------------------------
 # runtime abandon-complete: audited recovery for a stuck 'complete' epoch
 # ---------------------------------------------------------------------------
@@ -305,6 +566,8 @@ def test_worker_serve_defaults_to_loopback():
     assert args.host == "127.0.0.1"
     assert args.bearer_token_env == DEFAULT_WORKER_BEARER_ENV
     assert args.development_no_auth is False
+    assert args.channel_binding_type is None
+    assert args.channel_binding_digest is None
 
 
 def test_worker_serve_refuses_non_loopback_without_development_flag():
@@ -328,6 +591,13 @@ def test_worker_serve_requires_default_bearer_environment_value(monkeypatch):
     monkeypatch.delenv(DEFAULT_WORKER_BEARER_ENV, raising=False)
     args = build_parser().parse_args(["worker", "serve", "--hotkey", "miner"])
     with pytest.raises(ValueError, match=DEFAULT_WORKER_BEARER_ENV):
+        cmd_worker_serve(args)
+
+
+def test_worker_production_requires_channel_binding(monkeypatch):
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
+    args = build_parser().parse_args(["worker", "serve", "--hotkey", "miner"])
+    with pytest.raises(ValueError, match="channel binding"):
         cmd_worker_serve(args)
 
 
@@ -356,6 +626,44 @@ def test_worker_development_no_auth_is_explicit(monkeypatch):
     )
     assert cmd_worker_serve(args) == 0
     assert calls[0]["bearer_token"] is None
+
+
+def test_worker_cli_builds_typed_channel_binding(monkeypatch):
+    calls = []
+
+    class FakeServer:
+        host = "127.0.0.1"
+        port = 8081
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--development-no-auth",
+            "--channel-binding-type",
+            "tls_spki_sha256",
+            "--channel-binding-digest",
+            "ab" * 32,
+        ]
+    )
+
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["channel_binding"].digest == bytes.fromhex("ab" * 32)
 
 
 def test_production_token_mapping_requires_owner_only_permissions(tmp_path: Path):

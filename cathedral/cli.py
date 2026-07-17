@@ -22,6 +22,8 @@ out.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime
 import ipaddress
 import json
@@ -29,16 +31,39 @@ import os
 import re
 import stat
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from cathedral import census as census_mod
 from cathedral.api import WorkQueue
-from cathedral.common import Policy
+from cathedral.attest import collect_tdx_gpu
+from cathedral.assurance import AssuranceDimension
+from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
 from cathedral.enroll import RegistryStore
+from cathedral.gpu import (
+    GpuIdentityRegistry,
+    gpu_profile_from_registry,
+    gpu_verifier_from_env,
+)
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.ledger import Ledger
 from cathedral.poster import Poster
+from cathedral.policy_registry import (
+    MAX_REGISTRY_BYTES,
+    PolicyRegistryError,
+    PolicyRegistrySnapshot,
+    PolicyRegistryState,
+    parse_registry_json,
+    verify_registry,
+)
+from cathedral.receipt import (
+    MAX_RECEIPT_BYTES,
+    ReceiptError,
+    ReceiptIssuer,
+    parse_receipt_json,
+    verify_receipt,
+)
 from cathedral.runtime import (
     ConfidentialRuntime,
     EpochRun,
@@ -178,6 +203,13 @@ def _format_run_pretty(run: EpochRun, *, out: object = None) -> None:
             f"{err_part}",
             file=out,
         )
+        if outcome.assurance is not None:
+            claim_summary = " ".join(
+                f"{dimension.value[0].upper()}="
+                f"{outcome.assurance.claim(dimension).status.value}"
+                for dimension in AssuranceDimension
+            )
+            print(f"            assurance {claim_summary}", file=out)
 
     status_flag = "  !! EPOCH FAILED" if run.status not in {"complete", "published"} else ""
     print(
@@ -319,9 +351,15 @@ def _load_policy(path: str) -> Policy:
     if isinstance(raw, list):
         measurements = raw
         min_tcb = 0
+        tdx_strict = False
+        tdx_allowed_tcb_statuses = ["UpToDate"]
+        tdx_allowed_advisories: list[str] = []
     elif isinstance(raw, dict):
         measurements = raw.get("allowed_measurements")
         min_tcb = raw.get("min_tcb", 0)
+        tdx_strict = raw.get("tdx_strict", False)
+        tdx_allowed_tcb_statuses = raw.get("tdx_allowed_tcb_statuses", ["UpToDate"])
+        tdx_allowed_advisories = raw.get("tdx_allowed_advisories", [])
     else:
         raise ValueError("measurements file must be a JSON array or object")
     if not isinstance(measurements, list) or any(
@@ -330,7 +368,301 @@ def _load_policy(path: str) -> Policy:
         raise ValueError("allowed_measurements must be a list of nonempty strings")
     if isinstance(min_tcb, bool) or not isinstance(min_tcb, int) or min_tcb < 0:
         raise ValueError("min_tcb must be a nonnegative integer")
-    return Policy(allowed_measurements=set(measurements), min_tcb=min_tcb)
+    if not isinstance(tdx_strict, bool):
+        raise ValueError("tdx_strict must be a boolean")
+    for name, values in (
+        ("tdx_allowed_tcb_statuses", tdx_allowed_tcb_statuses),
+        ("tdx_allowed_advisories", tdx_allowed_advisories),
+    ):
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            raise ValueError(f"{name} must be a list of nonempty strings")
+    return Policy(
+        allowed_measurements=set(measurements),
+        min_tcb=min_tcb,
+        tdx_strict=tdx_strict,
+        tdx_allowed_tcb_statuses=set(tdx_allowed_tcb_statuses),
+        tdx_allowed_advisories=set(tdx_allowed_advisories),
+    )
+
+
+def _read_bounded_registry_file(path: str, label: str) -> bytes:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(MAX_REGISTRY_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"unable to load {label}") from exc
+    if len(data) > MAX_REGISTRY_BYTES:
+        raise ValueError(f"{label} exceeds the maximum encoded size")
+    return data
+
+
+def _load_registry_keys(path: str) -> dict[str, bytes]:
+    raw = parse_registry_json(
+        _read_bounded_registry_file(path, "policy registry key file")
+    )
+    keys: dict[str, bytes] = {}
+    try:
+        for key_id, encoded in raw.items():
+            if not isinstance(key_id, str) or not key_id or not isinstance(encoded, str):
+                raise ValueError
+            key = base64.b64decode(encoded, validate=True)
+            if len(key) != 32:
+                raise ValueError
+            keys[key_id] = key
+    except (binascii.Error, ValueError):
+        raise ValueError("policy registry keys must be 32-byte base64 values") from None
+    if not keys:
+        raise ValueError("policy registry key file cannot be empty")
+    return keys
+
+
+def _verified_registry_policy(
+    registry_path: str,
+    keys_path: str,
+    *,
+    state_path: str,
+    minimum_release: int | None,
+    max_age_seconds: int,
+    production_mode: bool,
+    pinned_release: int | None = None,
+    pinned_digest: str | None = None,
+) -> Policy:
+    policy, _snapshot = _verified_registry_snapshot_and_policy(
+        registry_path,
+        keys_path,
+        state_path=state_path,
+        minimum_release=minimum_release,
+        max_age_seconds=max_age_seconds,
+        production_mode=production_mode,
+        pinned_release=pinned_release,
+        pinned_digest=pinned_digest,
+    )
+    return policy
+
+
+def _verified_registry_snapshot_and_policy(
+    registry_path: str,
+    keys_path: str,
+    *,
+    state_path: str,
+    minimum_release: int | None,
+    max_age_seconds: int,
+    production_mode: bool,
+    pinned_release: int | None = None,
+    pinned_digest: str | None = None,
+) -> tuple[Policy, PolicyRegistrySnapshot]:
+    data = _read_bounded_registry_file(registry_path, "policy registry")
+    snapshot = verify_registry(
+        data,
+        _load_registry_keys(keys_path),
+        max_age_seconds=max_age_seconds,
+    )
+    # Prove the signed snapshot can produce a usable CPU admission policy
+    # before advancing the durable high-water mark.
+    policy = snapshot.to_policy()
+    state = PolicyRegistryState(
+        state_path,
+        production_mode=production_mode,
+        minimum_release=minimum_release,
+        pinned_release=pinned_release,
+        pinned_digest=pinned_digest,
+    )
+    state.accept(snapshot)
+    return policy, snapshot
+
+
+def _read_bounded_receipt_file(path: str, label: str) -> bytes:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(MAX_RECEIPT_BYTES + 1)
+    except OSError as exc:
+        raise ReceiptError("schema", f"unable to load {label}") from exc
+    if len(data) > MAX_RECEIPT_BYTES:
+        raise ReceiptError("schema", f"{label} exceeds the maximum encoded size")
+    return data
+
+
+def _load_private_seed(
+    path: str,
+    *,
+    production_mode: bool,
+    label: str,
+) -> bytes:
+    target = Path(path)
+    try:
+        before = target.lstat()
+    except OSError as exc:
+        raise ValueError(f"unable to load {label}") from exc
+    if not stat.S_ISREG(before.st_mode) or target.is_symlink():
+        raise ValueError(f"{label} must be a regular non-symlink file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as exc:
+        raise ValueError(f"unable to load {label}") from exc
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise ValueError(
+                    f"{label} must be a stable regular non-symlink file"
+                )
+            if production_mode and metadata.st_mode & 0o077:
+                raise ValueError(
+                    f"production {label} must not be group/world accessible"
+                )
+            if (
+                production_mode
+                and hasattr(os, "getuid")
+                and metadata.st_uid != os.getuid()
+            ):
+                raise ValueError(
+                    f"production {label} must be owned by the runtime user"
+                )
+            raw = os.read(descriptor, 257)
+        except OSError as exc:
+            raise ValueError(f"unable to load {label}") from exc
+    finally:
+        os.close(descriptor)
+    if len(raw) > 256:
+        raise ValueError(f"{label} must be a 32-byte base64 seed")
+    try:
+        seed = base64.b64decode(raw.strip(), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{label} must be a 32-byte base64 seed") from exc
+    if len(seed) != 32:
+        raise ValueError(f"{label} must be a 32-byte base64 seed")
+    return seed
+
+
+def _load_receipt_private_seed(path: str, *, production_mode: bool) -> bytes:
+    return _load_private_seed(
+        path,
+        production_mode=production_mode,
+        label="receipt signing key",
+    )
+
+
+def _load_gpu_identity_key(path: str, *, production_mode: bool) -> bytes:
+    return _load_private_seed(
+        path,
+        production_mode=production_mode,
+        label="GPU identity key",
+    )
+
+
+def cmd_policy_registry_verify(args: argparse.Namespace) -> int:
+    historical_at = None
+    historical_raw = getattr(args, "historical_at", None)
+    if historical_raw is not None:
+        if (
+            re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", historical_raw
+            )
+            is None
+        ):
+            raise ValueError("--historical-at must be canonical UTC time")
+        try:
+            historical_at = datetime.datetime.strptime(
+                historical_raw, "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=datetime.UTC)
+        except ValueError:
+            raise ValueError("--historical-at must be canonical UTC time") from None
+    registry_bytes = _read_bounded_registry_file(args.registry, "policy registry")
+    snapshot = verify_registry(
+        registry_bytes,
+        _load_registry_keys(args.trusted_keys),
+        max_age_seconds=args.max_age_seconds,
+        historical_at=historical_at,
+    )
+    print(
+        json.dumps(
+            {
+                "release": snapshot.release,
+                "digest": snapshot.digest,
+                "signing_key_id": snapshot.signing_key_id,
+                "profiles": [
+                    {"id": profile.profile_id, "kind": profile.kind, "status": profile.status}
+                    for profile in snapshot.profiles
+                ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_receipt_verify(args: argparse.Namespace) -> int:
+    try:
+        receipt_bytes = _read_bounded_receipt_file(args.receipt, "assurance receipt")
+        preview = parse_receipt_json(receipt_bytes)
+        issued_raw = preview.get("issued_at")
+        if (
+            not isinstance(issued_raw, str)
+            or re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", issued_raw
+            )
+            is None
+        ):
+            raise ReceiptError("schema", "receipt issued_at is invalid")
+        try:
+            issued_at = datetime.datetime.strptime(
+                issued_raw, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=datetime.UTC)
+        except ValueError as exc:
+            raise ReceiptError("schema", "receipt issued_at is invalid") from exc
+        policy_registry = verify_registry(
+            _read_bounded_registry_file(args.policy_registry, "policy registry"),
+            _load_registry_keys(args.trusted_keys),
+            historical_at=issued_at,
+        )
+        key_registry = policy_registry
+        if getattr(args, "key_registry", None) is not None:
+            key_registry = verify_registry(
+                _read_bounded_registry_file(args.key_registry, "receipt key registry"),
+                _load_registry_keys(args.key_registry_trusted_keys or args.trusted_keys),
+                max_age_seconds=args.key_registry_max_age_seconds,
+            )
+        verified = verify_receipt(
+            receipt_bytes,
+            policy_registry,
+            key_registry=key_registry,
+        )
+    except ReceiptError as exc:
+        print(
+            json.dumps(
+                {"valid": False, "category": exc.category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    except (PolicyRegistryError, ValueError) as exc:
+        print(
+            json.dumps(
+                {"valid": False, "category": "policy_registry", "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "valid": True,
+                "receipt_id": verified.receipt_id,
+                "receipt_digest": verified.receipt_digest,
+                "policy_registry_release": policy_registry.release,
+                "key_registry_release": key_registry.release,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
 
 
 def _load_tokens(path: str | None, *, production_mode: bool = False) -> dict[str, str]:
@@ -400,28 +732,134 @@ def _publisher_from_args(args: argparse.Namespace) -> Poster | None:
     return Poster(endpoint, bearer, secret)
 
 
-def _build_runtime(args: argparse.Namespace) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
+def _build_runtime(
+    args: argparse.Namespace, *, require_policy: bool = False
+) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
     development = getattr(args, "development", False)
+    gpu_profile_id = getattr(args, "gpu_profile_id", None)
+    gpu_identity_db = getattr(args, "gpu_identity_db", None)
+    gpu_identity_key_file = getattr(args, "gpu_identity_key_file", None)
+    gpu_identity_anchor_file = getattr(args, "gpu_identity_anchor_file", None)
+    gpu_values = (
+        gpu_profile_id,
+        gpu_identity_db,
+        gpu_identity_key_file,
+        gpu_identity_anchor_file,
+    )
+    if any(item is not None for item in gpu_values) and any(
+        item is None for item in gpu_values
+    ):
+        raise ValueError(
+            "--gpu-profile-id, --gpu-identity-db, --gpu-identity-key-file, and "
+            "--gpu-identity-anchor-file are required together"
+        )
     config = RuntimeConfig(
         miner_timeout_seconds=getattr(args, "miner_timeout_seconds", 10.0),
         miner_attempts=getattr(args, "miner_attempts", 2),
         max_workers=getattr(args, "max_workers", 8),
         production_mode=not development,
         allow_insecure_http_for_tests=development,
+        reattestation_failures_before_failed=getattr(
+            args, "reattestation_failures_before_failed", 3
+        ),
+        reattestation_retry_base_seconds=getattr(
+            args, "reattestation_retry_base_seconds", 5
+        ),
+        reattestation_retry_maximum_seconds=getattr(
+            args, "reattestation_retry_maximum_seconds", 300
+        ),
+        reattestation_retry_jitter_seconds=getattr(
+            args, "reattestation_retry_jitter_seconds", 5
+        ),
+        expected_tier=Tier.CC_GPU if gpu_profile_id is not None else Tier.CC_CPU_TDX,
     )
     tokens = _load_tokens(
         getattr(args, "tokens_file", None),
         production_mode=config.production_mode,
     )
-    ledger = Ledger(args.ledger_db)
     measurements_file = getattr(args, "measurements_file", None)
+    policy_registry = getattr(args, "policy_registry", None)
+    policy_snapshot: PolicyRegistrySnapshot | None = None
+    if measurements_file and policy_registry:
+        raise ValueError(
+            "--measurements-file and --policy-registry are mutually exclusive"
+        )
+    if policy_registry is not None:
+        for name in ("policy_registry_keys", "policy_registry_state"):
+            if not getattr(args, name, None):
+                raise ValueError(f"--{name.replace('_', '-')} is required with --policy-registry")
+        policy, policy_snapshot = _verified_registry_snapshot_and_policy(
+            policy_registry,
+            args.policy_registry_keys,
+            state_path=args.policy_registry_state,
+            minimum_release=args.policy_registry_min_release,
+            max_age_seconds=args.policy_registry_max_age_seconds,
+            production_mode=config.production_mode,
+            pinned_release=getattr(args, "policy_registry_pinned_release", None),
+            pinned_digest=getattr(args, "policy_registry_pinned_digest", None),
+        )
+    elif measurements_file:
+        policy = _load_policy(measurements_file)
+    elif require_policy:
+        raise ValueError("one of --measurements-file or --policy-registry is required")
+    else:
+        # Recovery/status commands do not admit miners or start epochs. Their
+        # runtime methods operate only on already-frozen ledger state, so they
+        # intentionally need no current admission policy.
+        policy = Policy()
+    receipt_key_id = getattr(args, "receipt_signing_key_id", None)
+    receipt_key_file = getattr(args, "receipt_signing_key_file", None)
+    if (receipt_key_id is None) != (receipt_key_file is None):
+        raise ValueError(
+            "--receipt-signing-key-id and --receipt-signing-key-file are required together"
+        )
+    receipt_issuer = None
+    if receipt_key_id is not None:
+        if policy_snapshot is None:
+            raise ValueError("receipt issuance requires --policy-registry authority")
+        receipt_issuer = ReceiptIssuer(
+            policy_snapshot,
+            receipt_key_id,
+            _load_receipt_private_seed(
+                receipt_key_file,
+                production_mode=config.production_mode,
+            ),
+        )
+    gpu_profile = None
+    gpu_verifier = None
+    gpu_identity_registry = None
+    if gpu_profile_id is not None:
+        if policy_snapshot is None:
+            raise ValueError("GPU runtime requires --policy-registry authority")
+        if config.production_mode and gpu_identity_db == ":memory:":
+            raise ValueError("production GPU identity registry must be durable")
+        gpu_profile = gpu_profile_from_registry(policy_snapshot, gpu_profile_id)
+        if not gpu_profile.production_ready:
+            raise ValueError("GPU profile is not production ready")
+        gpu_verifier = gpu_verifier_from_env(
+            production_mode=config.production_mode
+        )
+        gpu_identity_registry = GpuIdentityRegistry(
+            gpu_identity_db,
+            identity_digest_key=_load_gpu_identity_key(
+                gpu_identity_key_file,
+                production_mode=config.production_mode,
+            ),
+            production_mode=config.production_mode,
+            generation_anchor_path=gpu_identity_anchor_file,
+        )
+    ledger = Ledger(args.ledger_db)
     runtime = ConfidentialRuntime(
         RegistryStore(getattr(args, "registry_db", ":memory:")),
         ledger,
-        _load_policy(measurements_file) if measurements_file else Policy(),
+        policy,
         _publisher_from_args(args),
         token_provider=tokens.get,
         config=config,
+        receipt_issuer=receipt_issuer,
+        gpu_profile=gpu_profile,
+        gpu_verifier=gpu_verifier,
+        gpu_identity_registry=gpu_identity_registry,
     )
     return runtime, ledger, tokens
 
@@ -438,12 +876,30 @@ def _outcome_json(outcome: MinerOutcome) -> dict[str, object]:
         "hotkey": outcome.hotkey,
         "endpoint_url": outcome.endpoint_url,
         "status": outcome.status,
+        "verified": outcome.status == "attestation_verified" or outcome.admitted,
         "admitted": outcome.admitted,
         "challenge_id": outcome.challenge_id,
         "work_units": outcome.work_units,
         "score": outcome.score,
         "error": _sanitize_error(outcome.error, maxlen=300) if outcome.error else None,
+        "error_category": outcome.error_category,
+        "assurance": outcome.assurance.to_dict() if outcome.assurance else None,
+        "component_audit": (
+            _audit_json_value(outcome.component_audit)
+            if outcome.component_audit is not None
+            else None
+        ),
     }
+
+
+def _audit_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _audit_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_audit_json_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise ValueError("component audit contains an unsupported value")
 
 
 def _run_json(run: EpochRun) -> dict[str, object]:
@@ -477,11 +933,30 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             raise ValueError(
                 f"worker bearer token must be set in {bearer_env}"
             )
+    binding_type = getattr(args, "channel_binding_type", None)
+    binding_digest = getattr(args, "channel_binding_digest", None)
+    if (binding_type is None) != (binding_digest is None):
+        raise ValueError("worker channel binding type and digest must be supplied together")
+    channel_binding = None
+    if binding_type is not None:
+        try:
+            if re.fullmatch(r"[0-9a-f]{64}", binding_digest) is None:
+                raise ValueError
+            digest = bytes.fromhex(binding_digest)
+            channel_binding = ChannelBinding(ChannelBindingType(binding_type), digest)
+        except (TypeError, ValueError):
+            raise ValueError("worker channel binding is invalid") from None
+    if not getattr(args, "development_no_auth", False) and channel_binding is None:
+        raise ValueError("production worker requires a configured channel binding")
     with WorkerServer(
         args.host,
         args.port,
         configured_hotkey=args.hotkey,
         bearer_token=token,
+        channel_binding=channel_binding,
+        evidence_collector=(
+            collect_tdx_gpu if getattr(args, "gpu_composite", False) else None
+        ),
         allow_non_loopback_for_development=args.development_allow_non_loopback,
     ) as server:
         print(json.dumps({"host": server.host, "port": server.port, "hotkey": args.hotkey}))
@@ -493,7 +968,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_runtime_canary(args: argparse.Namespace) -> int:
-    runtime, ledger, tokens = _build_runtime(args)
+    runtime, ledger, tokens = _build_runtime(args, require_policy=True)
     try:
         outcome = runtime.check_canary(_target(args, tokens))
         print(json.dumps(_outcome_json(outcome), sort_keys=True))
@@ -502,8 +977,19 @@ def cmd_runtime_canary(args: argparse.Namespace) -> int:
         ledger.close()
 
 
+def cmd_runtime_audit_attestation(args: argparse.Namespace) -> int:
+    runtime, ledger, tokens = _build_runtime(args, require_policy=True)
+    try:
+        outcome = runtime.audit_attestation(_target(args, tokens))
+        print(json.dumps(_outcome_json(outcome), sort_keys=True))
+        return 0 if outcome.status == "attestation_verified" else 1
+    finally:
+        runtime.close()
+        ledger.close()
+
+
 def cmd_runtime_run_epoch(args: argparse.Namespace) -> int:
-    runtime, ledger, tokens = _build_runtime(args)
+    runtime, ledger, tokens = _build_runtime(args, require_policy=True)
     try:
         run = runtime.run_epoch(
             args.source_epoch,
@@ -577,6 +1063,93 @@ def cmd_runtime_abandon_complete(args: argparse.Namespace) -> int:
         ledger.close()
 
 
+def cmd_runtime_recover_gpu_identities(args: argparse.Namespace) -> int:
+    """Authenticate and audit deterministic recovery of crash-left GPU claims."""
+
+    outcome = GpuIdentityRegistry.recover_interrupted(
+        args.gpu_identity_db,
+        identity_digest_key=_load_gpu_identity_key(
+            args.gpu_identity_key_file,
+            production_mode=not args.development,
+        ),
+        reason=args.reason,
+        production_mode=not args.development,
+        generation_anchor_path=args.gpu_identity_anchor_file,
+    )
+    print(json.dumps(dict(outcome), sort_keys=True))
+    return 0
+
+
+def cmd_runtime_initialize_gpu_identities(args: argparse.Namespace) -> int:
+    """Perform the explicit one-time creation of production GPU identity state."""
+
+    registry = GpuIdentityRegistry(
+        args.gpu_identity_db,
+        identity_digest_key=_load_gpu_identity_key(
+            args.gpu_identity_key_file,
+            production_mode=not args.development,
+        ),
+        production_mode=not args.development,
+        generation_anchor_path=args.gpu_identity_anchor_file,
+        initialize=True,
+    )
+    print(
+        json.dumps(
+            {
+                "generation_anchor": str(args.gpu_identity_anchor_file),
+                "identity_database": str(args.gpu_identity_db),
+                "initialized": True,
+                "production_ready": registry.production_ready,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_lifecycle_status(args: argparse.Namespace) -> int:
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    store = RegistryStore(args.registry_db)
+    snapshot = store.lifecycle_snapshot(args.hotkey)
+    payload = snapshot.operator_dict() if args.operator else snapshot.public_dict()
+    print(json.dumps({"hotkey": args.hotkey, **payload}, sort_keys=True))
+    return 0
+
+
+def cmd_lifecycle_history(args: argparse.Namespace) -> int:
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    store = RegistryStore(args.registry_db)
+    history = store.lifecycle_history(args.hotkey, operator=args.operator)
+    print(
+        json.dumps(
+            {"hotkey": args.hotkey, "events": list(history)},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_lifecycle_reenroll(args: argparse.Namespace) -> int:
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    snapshot = RegistryStore(args.registry_db).reenroll_lifecycle(args.hotkey)
+    print(json.dumps({"hotkey": args.hotkey, **snapshot.public_dict()}, sort_keys=True))
+    return 0
+
+
+def cmd_lifecycle_retire(args: argparse.Namespace) -> int:
+    if not Path(args.registry_db).is_file():
+        raise ValueError("registry database does not exist")
+    snapshot = RegistryStore(args.registry_db).retire_lifecycle(
+        args.hotkey,
+        removed=args.removed,
+    )
+    print(json.dumps({"hotkey": args.hotkey, **snapshot.public_dict()}, sort_keys=True))
+    return 0
+
+
 # --------------------------------------------------------------------------
 # argparse wiring
 # --------------------------------------------------------------------------
@@ -632,19 +1205,158 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--bearer-token-env", default=DEFAULT_WORKER_BEARER_ENV)
     p_serve.add_argument("--development-no-auth", action="store_true")
     p_serve.add_argument("--development-allow-non-loopback", action="store_true")
+    p_serve.add_argument(
+        "--gpu-composite",
+        action="store_true",
+        help=(
+            "collect bound TDX plus confidential-GPU evidence; requires "
+            "CATHEDRAL_GPU_COLLECT_CMD"
+        ),
+    )
+    p_serve.add_argument(
+        "--channel-binding-type",
+        choices=[binding.value for binding in ChannelBindingType],
+    )
+    p_serve.add_argument(
+        "--channel-binding-digest",
+        help="32-byte channel public-key digest as 64 lowercase hex characters",
+    )
     p_serve.set_defaults(func=cmd_worker_serve)
 
-    p_runtime = sub.add_parser("runtime", help="operate confidential TDX report epochs")
+    p_policy = sub.add_parser(
+        "policy-registry", help="verify signed public measurement policy"
+    )
+    policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)
+    p_policy_verify = policy_sub.add_parser("verify", help="verify and inspect a registry")
+    p_policy_verify.add_argument("--registry", required=True)
+    p_policy_verify.add_argument("--trusted-keys", required=True)
+    p_policy_verify.add_argument("--max-age-seconds", type=int, default=86400)
+    p_policy_verify.add_argument(
+        "--historical-at",
+        help="verify at canonical UTC receipt time instead of current admission time",
+    )
+    p_policy_verify.set_defaults(func=cmd_policy_registry_verify)
+
+    p_receipt = sub.add_parser("receipt", help="verify assurance receipts")
+    receipt_sub = p_receipt.add_subparsers(dest="receipt_command", required=True)
+    p_receipt_verify = receipt_sub.add_parser(
+        "verify", help="offline verification of exact signed receipt bytes"
+    )
+    p_receipt_verify.add_argument("--receipt", required=True)
+    p_receipt_verify.add_argument("--policy-registry", required=True)
+    p_receipt_verify.add_argument("--trusted-keys", required=True)
+    p_receipt_verify.add_argument(
+        "--key-registry",
+        help="newer registry used to enforce receipt-key retirement or revocation",
+    )
+    p_receipt_verify.add_argument("--key-registry-trusted-keys")
+    p_receipt_verify.add_argument(
+        "--key-registry-max-age-seconds", type=int, default=86400
+    )
+    p_receipt_verify.set_defaults(func=cmd_receipt_verify)
+
+    p_lifecycle = sub.add_parser(
+        "lifecycle", help="inspect worker attestation lifecycle state"
+    )
+    lifecycle_sub = p_lifecycle.add_subparsers(
+        dest="lifecycle_command", required=True
+    )
+    p_lifecycle_status = lifecycle_sub.add_parser(
+        "status", help="show the current customer-safe worker state"
+    )
+    p_lifecycle_status.add_argument("--registry-db", required=True)
+    p_lifecycle_status.add_argument("--hotkey", required=True)
+    p_lifecycle_status.add_argument(
+        "--operator",
+        action="store_true",
+        help="include internal evidence, policy, retry, and event identifiers",
+    )
+    p_lifecycle_status.set_defaults(func=cmd_lifecycle_status)
+
+    p_lifecycle_history = lifecycle_sub.add_parser(
+        "history", help="show append-only worker transition history"
+    )
+    p_lifecycle_history.add_argument("--registry-db", required=True)
+    p_lifecycle_history.add_argument("--hotkey", required=True)
+    p_lifecycle_history.add_argument(
+        "--operator",
+        action="store_true",
+        help="include internal evidence, policy, retry, and error details",
+    )
+    p_lifecycle_history.set_defaults(func=cmd_lifecycle_history)
+
+    p_lifecycle_reenroll = lifecycle_sub.add_parser(
+        "reenroll",
+        help="start a new pending generation after failed, retired, or revoked state",
+    )
+    p_lifecycle_reenroll.add_argument("--registry-db", required=True)
+    p_lifecycle_reenroll.add_argument("--hotkey", required=True)
+    p_lifecycle_reenroll.set_defaults(func=cmd_lifecycle_reenroll)
+
+    p_lifecycle_retire = lifecycle_sub.add_parser(
+        "retire", help="stop refresh and score eligibility for a worker"
+    )
+    p_lifecycle_retire.add_argument("--registry-db", required=True)
+    p_lifecycle_retire.add_argument("--hotkey", required=True)
+    p_lifecycle_retire.add_argument(
+        "--removed",
+        action="store_true",
+        help="finish directly in retired instead of leaving the worker retiring",
+    )
+    p_lifecycle_retire.set_defaults(func=cmd_lifecycle_retire)
+
+    p_runtime = sub.add_parser(
+        "runtime", help="operate confidential-compute report epochs"
+    )
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
 
     def add_runtime_common(command: argparse.ArgumentParser) -> None:
         command.add_argument("--registry-db", required=True)
         command.add_argument("--ledger-db", required=True)
-        command.add_argument("--measurements-file", required=True)
+        command.add_argument("--measurements-file")
+        command.add_argument("--policy-registry")
+        command.add_argument("--policy-registry-keys")
+        command.add_argument("--policy-registry-state")
+        command.add_argument("--policy-registry-min-release", type=int)
+        command.add_argument("--policy-registry-pinned-release", type=int)
+        command.add_argument("--policy-registry-pinned-digest")
+        command.add_argument(
+            "--policy-registry-max-age-seconds", type=int, default=86400
+        )
+        command.add_argument("--receipt-signing-key-id")
+        command.add_argument("--receipt-signing-key-file")
+        command.add_argument(
+            "--gpu-profile-id",
+            help="active gpu_cc profile id from the verified policy registry",
+        )
+        command.add_argument(
+            "--gpu-identity-db",
+            help="durable pseudonymous GPU identity-claim database",
+        )
+        command.add_argument(
+            "--gpu-identity-key-file",
+            help="owner-only file containing a 32-byte base64 identity key",
+        )
+        command.add_argument(
+            "--gpu-identity-anchor-file",
+            help="external protected monotonic generation anchor",
+        )
         command.add_argument("--tokens-file", default=None)
         command.add_argument("--miner-timeout-seconds", type=float, default=10.0)
         command.add_argument("--miner-attempts", type=int, default=2)
         command.add_argument("--max-workers", type=int, default=8)
+        command.add_argument(
+            "--reattestation-failures-before-failed", type=int, default=3
+        )
+        command.add_argument(
+            "--reattestation-retry-base-seconds", type=int, default=5
+        )
+        command.add_argument(
+            "--reattestation-retry-maximum-seconds", type=int, default=300
+        )
+        command.add_argument(
+            "--reattestation-retry-jitter-seconds", type=int, default=5
+        )
         command.add_argument("--development", action="store_true")
         command.add_argument("--publisher-endpoint", default=None)
         command.add_argument(
@@ -656,10 +1368,20 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--canary-hotkey", required=True)
         command.add_argument("--canary-endpoint", required=True)
 
-    p_canary = runtime_sub.add_parser("canary", help="run fresh TDX and canonical SAT canary")
+    p_canary = runtime_sub.add_parser(
+        "canary", help="run fresh requested-tier attestation and SAT canary"
+    )
     add_runtime_common(p_canary)
     add_canary(p_canary)
     p_canary.set_defaults(func=cmd_runtime_canary)
+
+    p_audit = runtime_sub.add_parser(
+        "audit-attestation",
+        help="verify fresh evidence and channel binding without work or scoring",
+    )
+    add_runtime_common(p_audit)
+    add_canary(p_audit)
+    p_audit.set_defaults(func=cmd_runtime_audit_attestation)
 
     p_run = runtime_sub.add_parser("run-epoch", help="freeze one complete report")
     add_runtime_common(p_run)
@@ -711,6 +1433,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="nonempty operator justification; recorded in the ledger audit trail",
     )
     p_abandon.set_defaults(func=cmd_runtime_abandon_complete)
+
+    p_gpu_recovery = runtime_sub.add_parser(
+        "recover-gpu-identities",
+        help="reconcile interrupted GPU claims and record an authenticated audit event",
+    )
+    p_gpu_recovery.add_argument("--gpu-identity-db", required=True)
+    p_gpu_recovery.add_argument("--gpu-identity-key-file", required=True)
+    p_gpu_recovery.add_argument("--gpu-identity-anchor-file", required=True)
+    p_gpu_recovery.add_argument(
+        "--reason",
+        required=True,
+        help="operator justification recorded in the GPU identity audit trail",
+    )
+    p_gpu_recovery.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production ownership checks for a local recovery exercise",
+    )
+    p_gpu_recovery.set_defaults(func=cmd_runtime_recover_gpu_identities)
+
+    p_gpu_initialize = runtime_sub.add_parser(
+        "initialize-gpu-identities",
+        help="perform one-time creation of the GPU identity database and external anchor",
+    )
+    p_gpu_initialize.add_argument("--gpu-identity-db", required=True)
+    p_gpu_initialize.add_argument("--gpu-identity-key-file", required=True)
+    p_gpu_initialize.add_argument("--gpu-identity-anchor-file", required=True)
+    p_gpu_initialize.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production path separation and ownership checks for a local exercise",
+    )
+    p_gpu_initialize.set_defaults(func=cmd_runtime_initialize_gpu_identities)
 
     return parser
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from cathedral.assurance import attestation_claims
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier
 from cathedral.lanes.sat import solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
@@ -119,6 +120,7 @@ def _verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | No
         chip_id=chip_id,
         measurement=GOOD_MEASUREMENT,
         tcb=GOOD_TCB,
+        assurance=attestation_claims(evidence.quote, policy),
     )
 
 
@@ -137,6 +139,7 @@ def _verifier_raises_for(bad_uid: str):
             chip_id=chip_id,
             measurement=GOOD_MEASUREMENT,
             tcb=GOOD_TCB,
+            assurance=attestation_claims(evidence.quote, policy),
         )
 
     return _v

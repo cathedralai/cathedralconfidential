@@ -12,14 +12,17 @@ def synthetic_tdx_quote(
     mr_td: bytes | None = None,
     tee_tcb_svn: bytes | None = None,
     attestation_key: bytes | None = None,
+    td_attributes: bytes | None = None,
 ) -> bytes:
     assert len(report_data) == 64
     mr_td = mr_td or (b"M" * 48)
     tee_tcb_svn = tee_tcb_svn or bytes(range(16))
     attestation_key = attestation_key or hashlib.sha512(b"cathedral-ak").digest()
+    td_attributes = td_attributes or (b"T" * 8)
     assert len(mr_td) == 48
     assert len(tee_tcb_svn) == 16
     assert len(attestation_key) == 64
+    assert len(td_attributes) == 8
 
     header = bytearray(48)
     header[0:2] = (4).to_bytes(2, "little")
@@ -35,7 +38,7 @@ def synthetic_tdx_quote(
     body[16:64] = b"S" * 48
     body[64:112] = b"s" * 48
     body[112:120] = b"A" * 8
-    body[120:128] = b"T" * 8
+    body[120:128] = td_attributes
     body[128:136] = b"X" * 8
     body[136:184] = mr_td
     body[184:232] = b"C" * 48

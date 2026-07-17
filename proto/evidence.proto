@@ -6,10 +6,9 @@ syntax = "proto3";
 // plus a measurement policy. See docs/DESIGN.md §6.
 package cathedral.v1;
 
-// What the miner sends. `report_data` in the underlying quote is bound to
-//   sha512(nonce || miner_hotkey [|| ssh_host_key])
-// so evidence is fresh (nonce), owned (hotkey — defeats relay), and — for
-// Sandbox rentals — channel-bound (ssh_host_key). See docs/DESIGN.md §6, §7.
+// What the miner sends. Production evidence uses the domain-separated,
+// versioned report_data_v2 encoding over nonce, hotkey, binding type, and the
+// channel-key digest. Fields 6 and report_data version 1 remain migration-only.
 message Evidence {
   Kind kind = 1;
 
@@ -41,4 +40,13 @@ message Evidence {
   // JWT binding the host CPU TDX quote and the GPU CC evidence together.
   // See docs/DESIGN.md §6.
   string composite_jwt = 7;
+
+  // Exact REPORT_DATA schema used by the quote. Production requires version 2.
+  uint32 report_data_version = 8;
+
+  // "tls_spki_sha256" or "application_key_sha256" for report_data version 2.
+  string channel_binding_type = 9;
+
+  // SHA-256 digest of the bound channel public key.
+  bytes channel_binding_digest = 10;
 }

@@ -4,9 +4,10 @@ import hashlib
 import hmac
 import json
 import socket
+import sqlite3
 import threading
 import urllib.error
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +17,17 @@ from cathedral.ledger import _EPOCHS_MIGRATION_TEMP_PREFIX, Ledger, LedgerError
 from cathedral.poster import Poster, PosterError
 
 
-def attest(ledger: Ledger, epoch_id: int, hotkey: str) -> None:
+GPU_AUTHORITY = (
+    "gpu-profile:tdx-h100-v1@profile=sha256:" + "a" * 64 + "@release=7@registry=sha256:" + "b" * 64
+)
+GPU_AUTHORITY_CHANGED = (
+    "gpu-profile:tdx-h100-v1@profile=sha256:" + "c" * 64 + "@release=8@registry=sha256:" + "d" * 64
+)
+
+
+def attest(
+    ledger: Ledger, epoch_id: int, hotkey: str, *, policy_mode: str = "compatibility"
+) -> None:
     ledger.add_attestation(
         epoch_id,
         hotkey,
@@ -24,6 +35,7 @@ def attest(ledger: Ledger, epoch_id: int, hotkey: str) -> None:
         tee_type="TDX",
         workload="CPU",
         evidence_digest=f"evidence-{hotkey}",
+        policy_mode=policy_mode,
     )
 
 
@@ -31,9 +43,7 @@ def verified_work(
     ledger: Ledger, epoch_id: int, challenge_id: str, hotkey: str, units: float
 ) -> None:
     ledger.issue_challenge(challenge_id, hotkey, epoch_id)
-    ledger.resolve_challenge(
-        challenge_id, "verified", units, validator_derived=True
-    )
+    ledger.resolve_challenge(challenge_id, "verified", units, validator_derived=True)
 
 
 def complete_and_publish(
@@ -167,12 +177,12 @@ class TestEvidenceAndResolution:
             ("VERIFIED", "TDX", "GPU"),
         ],
     )
-    def test_only_exact_verified_tdx_cpu_attestation(
+    def test_only_exact_verified_supported_hardware_shapes(
         self, verdict: str, tee_type: str, workload: str
     ) -> None:
         ledger = Ledger()
         epoch_id = ledger.begin_epoch(1)
-        with pytest.raises(LedgerError, match="exact VERIFIED TDX CPU"):
+        with pytest.raises(LedgerError, match="hardware shape"):
             ledger.add_attestation(
                 epoch_id,
                 "hk",
@@ -181,6 +191,71 @@ class TestEvidenceAndResolution:
                 workload=workload,
                 evidence_digest="digest",
             )
+
+    def test_composite_gpu_attestation_shape_and_profile_are_persisted(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        ledger.add_attestation(
+            epoch_id,
+            "gpu-hotkey",
+            verdict="VERIFIED",
+            tee_type="TDX+GPU_CC",
+            workload="GPU",
+            evidence_digest="composite-evidence",
+            policy_mode=GPU_AUTHORITY,
+            score_eligible=True,
+        )
+        ledger.complete_epoch(epoch_id, {"gpu-hotkey"})
+
+        assert report(ledger, epoch_id)["metadata"]["attestation_policy_modes"] == [GPU_AUTHORITY]
+
+    def test_cpu_only_attestation_schema_migrates_without_losing_rows(self, tmp_path: Path) -> None:
+        path = tmp_path / "gpu-migration.sqlite"
+        initial = Ledger(path)
+        epoch_id = initial.begin_epoch(1)
+        attest(initial, epoch_id, "cpu-hotkey", policy_mode="strict")
+        initial.close()
+
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("ALTER TABLE epoch_attestations RENAME TO attestations_current")
+            connection.execute(
+                "CREATE TABLE epoch_attestations ("
+                "epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),"
+                "hotkey TEXT NOT NULL,"
+                "verdict TEXT NOT NULL CHECK (verdict='VERIFIED'),"
+                "tee_type TEXT NOT NULL CHECK (tee_type='TDX'),"
+                "workload TEXT NOT NULL CHECK (workload='CPU'),"
+                "evidence_digest TEXT NOT NULL,"
+                "policy_mode TEXT NOT NULL DEFAULT 'compatibility',"
+                "attested_at TEXT NOT NULL,"
+                "PRIMARY KEY (epoch_id,hotkey))"
+            )
+            connection.execute(
+                "INSERT INTO epoch_attestations "
+                "SELECT epoch_id,hotkey,verdict,tee_type,workload,evidence_digest,"
+                "policy_mode,attested_at FROM attestations_current"
+            )
+            connection.execute("DROP TABLE attestations_current")
+
+        migrated = Ledger(path)
+        rows = migrated._connection.execute(
+            "SELECT hotkey,tee_type,workload,policy_mode FROM epoch_attestations "
+            "WHERE epoch_id=? ORDER BY hotkey",
+            (epoch_id,),
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [("cpu-hotkey", "TDX", "CPU", "strict")]
+        migrated.add_attestation(
+            epoch_id,
+            "gpu-hotkey",
+            verdict="VERIFIED",
+            tee_type="TDX+GPU_CC",
+            workload="GPU",
+            evidence_digest="gpu-evidence",
+            policy_mode=GPU_AUTHORITY,
+        )
+        assert migrated._connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        migrated.close()
 
     def test_attestation_only_while_running_and_is_immutable(self) -> None:
         ledger = Ledger()
@@ -199,15 +274,32 @@ class TestEvidenceAndResolution:
         with pytest.raises(LedgerError, match="cannot add attestations"):
             attest(ledger, epoch_id, "other")
 
+    def test_attestation_policy_mode_is_immutable_and_visible_in_report(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        attest(ledger, epoch_id, "hk", policy_mode="strict")
+        with pytest.raises(LedgerError, match="immutable"):
+            ledger.add_attestation(
+                epoch_id,
+                "hk",
+                verdict="VERIFIED",
+                tee_type="TDX",
+                workload="CPU",
+                evidence_digest="evidence-hk",
+                policy_mode="compatibility",
+            )
+
+        ledger.complete_epoch(epoch_id, {"hk"})
+
+        assert report(ledger, epoch_id)["metadata"]["attestation_policy_modes"] == ["strict"]
+
     @pytest.mark.parametrize("units", [-1, float("nan"), float("inf"), float("-inf")])
     def test_verified_work_must_be_finite_nonnegative(self, units: float) -> None:
         ledger = Ledger()
         epoch_id = ledger.begin_epoch(1)
         ledger.issue_challenge("challenge", "hk", epoch_id)
         with pytest.raises(LedgerError, match="finite and nonnegative"):
-            ledger.resolve_challenge(
-                "challenge", "verified", units, validator_derived=True
-            )
+            ledger.resolve_challenge("challenge", "verified", units, validator_derived=True)
 
     def test_verified_work_must_be_validator_derived(self) -> None:
         ledger = Ledger()
@@ -244,9 +336,7 @@ class TestEvidenceAndResolution:
 
 class TestReportSnapshot:
     @pytest.mark.parametrize("generated_at", ["not-a-date", "2026-01-01T00:00:00"])
-    def test_generated_at_must_be_timezone_aware_before_mutation(
-        self, generated_at: str
-    ) -> None:
+    def test_generated_at_must_be_timezone_aware_before_mutation(self, generated_at: str) -> None:
         ledger = Ledger()
         epoch_id = ledger.begin_epoch(1)
         with pytest.raises(LedgerError, match="timezone-aware ISO-8601"):
@@ -304,6 +394,86 @@ class TestReportSnapshot:
         assert scores == {"old": 1.0, "new": 300 / 1200}
         assert report(ledger, current)["metadata"]["published_window_epochs"] == [2, 3, 4]
 
+    def test_prior_cpu_score_cannot_leak_into_a_gpu_audit_epoch(self) -> None:
+        ledger = Ledger(window_size=3)
+        complete_and_publish(ledger, 1, {"worker": 100}, {"worker"})
+
+        gpu_epoch = ledger.begin_epoch(2)
+        ledger.add_attestation(
+            gpu_epoch,
+            "worker",
+            verdict="VERIFIED",
+            tee_type="TDX+GPU_CC",
+            workload="GPU",
+            evidence_digest="composite-evidence",
+            policy_mode=GPU_AUTHORITY,
+        )
+
+        assert ledger.complete_epoch(gpu_epoch, {"worker"}) == {"worker": 0.0}
+
+    def test_changed_signed_gpu_authority_cannot_inherit_prior_gpu_score(self) -> None:
+        ledger = Ledger(window_size=3)
+        first = ledger.begin_epoch(1)
+        verified_work(ledger, first, "gpu-work-1", "worker", 100)
+        ledger.add_attestation(
+            first,
+            "worker",
+            verdict="VERIFIED",
+            tee_type="TDX+GPU_CC",
+            workload="GPU",
+            evidence_digest="gpu-evidence-1",
+            policy_mode=GPU_AUTHORITY,
+            score_eligible=True,
+        )
+        ledger.complete_epoch(first, {"worker"})
+        ledger.mark_published(first)
+
+        second = ledger.begin_epoch(2)
+        ledger.add_attestation(
+            second,
+            "worker",
+            verdict="VERIFIED",
+            tee_type="TDX+GPU_CC",
+            workload="GPU",
+            evidence_digest="gpu-evidence-2",
+            policy_mode=GPU_AUTHORITY_CHANGED,
+            score_eligible=True,
+        )
+
+        assert ledger.complete_epoch(second, {"worker"}) == {"worker": 0.0}
+
+    def test_expired_gpu_score_authority_cannot_complete_epoch(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        verified_work(ledger, epoch_id, "gpu-work", "worker", 100)
+        ledger.add_attestation(
+            epoch_id,
+            "worker",
+            verdict="VERIFIED",
+            tee_type="TDX+GPU_CC",
+            workload="GPU",
+            evidence_digest="gpu-evidence",
+            policy_mode=GPU_AUTHORITY,
+            score_eligible=True,
+        )
+
+        with pytest.raises(LedgerError, match="score authority expired"):
+            ledger.complete_epoch(
+                epoch_id,
+                {"worker"},
+                score_authority_valid_until=datetime.now(UTC) - timedelta(seconds=1),
+            )
+
+        assert ledger.get_epoch(epoch_id)["status"] == "running"
+        with ledger._lock:
+            assert (
+                ledger._connection.execute(
+                    "SELECT COUNT(*) FROM epoch_scores WHERE epoch_id = ?",
+                    (epoch_id,),
+                ).fetchone()[0]
+                == 0
+            )
+
     def test_unpublished_completed_epoch_cannot_leak_into_window(self) -> None:
         ledger = Ledger()
         prior = ledger.begin_epoch(1)
@@ -330,9 +500,7 @@ class TestReportSnapshot:
         epoch_id = ledger.begin_epoch(7)
         verified_work(ledger, epoch_id, "challenge", "hk", 3)
         attest(ledger, epoch_id, "hk")
-        first_scores = ledger.complete_epoch(
-            epoch_id, {"hk"}, generated_at="2026-01-07T12:00:00Z"
-        )
+        first_scores = ledger.complete_epoch(epoch_id, {"hk"}, generated_at="2026-01-07T12:00:00Z")
         first_body = ledger.report_bytes(epoch_id)
         first_digest = ledger.report_digest(epoch_id)
 
@@ -341,7 +509,9 @@ class TestReportSnapshot:
         )
         assert second_scores == first_scores
         assert ledger.report_bytes(epoch_id) == first_body
-        assert ledger.report_digest(epoch_id) == first_digest == hashlib.sha256(first_body).hexdigest()
+        assert (
+            ledger.report_digest(epoch_id) == first_digest == hashlib.sha256(first_body).hexdigest()
+        )
 
         payload = json.loads(first_body)
         assert payload["source"] == payload["mechanism"] == "cathedral_confidential_tdx"
@@ -349,9 +519,10 @@ class TestReportSnapshot:
         assert payload["complete"] is True
         assert payload["generated_at"] == "2026-01-07T12:00:00Z"
         assert payload["scores"] == [{"miner_hotkey": "hk", "score": 1.0}]
-        assert first_body == json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode()
+        assert (
+            first_body
+            == json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        )
 
     def test_publish_requires_persisted_digest(self) -> None:
         ledger = Ledger()
@@ -634,9 +805,7 @@ class TestEpochsTableMigration:
         finally:
             cx.close()
 
-        with pytest.raises(
-            LedgerError, match="leftover 'epochs_pre_abandon_migration'"
-        ):
+        with pytest.raises(LedgerError, match="leftover 'epochs_pre_abandon_migration'"):
             Ledger(path)
 
         # The refusal must not have mutated anything further: both tables
@@ -645,9 +814,7 @@ class TestEpochsTableMigration:
         try:
             tables = {
                 row[0]
-                for row in verify_cx.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
+                for row in verify_cx.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             }
             assert "epochs_pre_abandon_migration" in tables
             assert "epochs" in tables
@@ -712,9 +879,7 @@ class TestEpochsTableMigration:
         try:
             tables = {
                 row[0]
-                for row in verify_cx.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
+                for row in verify_cx.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             }
             assert not any(name.startswith(_EPOCHS_MIGRATION_TEMP_PREFIX) for name in tables)
             assert "epochs_pre_abandon_migration" not in tables
@@ -741,9 +906,7 @@ class TestEpochsTableMigration:
         ledger = Ledger(path)
         assert ledger.get_epoch(1)["abandon_reason"] is None
 
-    def test_refuses_to_open_with_leftover_new_temp_migration_table(
-        self, tmp_path: Path
-    ) -> None:
+    def test_refuses_to_open_with_leftover_new_temp_migration_table(self, tmp_path: Path) -> None:
         """A stranded temp table from an interrupted *new-style* rebuild is refused.
 
         Mirrors `test_refuses_to_open_with_leftover_pre_abandon_table` but for
@@ -775,9 +938,7 @@ class TestEpochsTableMigration:
         try:
             tables = {
                 row[0]
-                for row in verify_cx.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
+                for row in verify_cx.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             }
             assert leftover_name in tables
             assert "epochs" in tables
@@ -839,9 +1000,9 @@ class TestEpochsTableMigration:
                 "SELECT epoch_id, hotkey, status FROM challenges WHERE challenge_id = 'legacy-challenge'"
             ).fetchone() == (1, "hk", "verified")
             assert raw.execute(
-                "SELECT epoch_id, hotkey, evidence_digest FROM epoch_attestations "
+                "SELECT epoch_id, hotkey, evidence_digest, policy_mode FROM epoch_attestations "
                 "WHERE epoch_id = 1 AND hotkey = 'hk'"
-            ).fetchone() == (1, "hk", "evidence-hk")
+            ).fetchone() == (1, "hk", "evidence-hk", "compatibility")
             assert raw.execute(
                 "SELECT epoch_id, hotkey, score FROM epoch_scores WHERE epoch_id = 1 AND hotkey = 'hk'"
             ).fetchone() == (1, "hk", 1.0)

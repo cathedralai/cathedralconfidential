@@ -27,10 +27,15 @@ points import cleanly) and pulls in `pytest`. No runtime deps beyond the stdlib.
 .venv/bin/python -m pytest -q
 ```
 
-Expected: **469 passed, 3 skipped**. All hardware-free tests pass. Hardware-gated
-coverage includes the TDX quote round trip, SAT lane e2e, and non-TDX negative
-controls; those cases are skipped unless `CATHEDRAL_RUN_TDX_HW=1` or
-`CATHEDRAL_RUN_TDX_NEGATIVE=1` is set on the appropriate machine.
+All hardware-free tests must pass. Hardware-gated coverage includes the TDX
+quote round trip, SAT lane e2e, and non-TDX negative controls; those cases are
+skipped unless `CATHEDRAL_RUN_TDX_HW=1` or `CATHEDRAL_RUN_TDX_NEGATIVE=1` is set
+on the appropriate machine.
+
+The plain-HTTP worker path is loopback-only test compatibility and cannot
+satisfy protected work dispatch. Runtime integration tests use injected channel
+clients; a real worker/runtime exercise requires the TLS-SPKI setup in
+[`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md).
 
 ## 3. Run the SAT demo
 
