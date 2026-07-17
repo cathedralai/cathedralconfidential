@@ -7,7 +7,9 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -142,8 +144,15 @@ def make_runtime(
     nonce_factory=None,
     policy: Policy | None = None,
     receipt_issuer: ReceiptIssuer | None = None,
+    registry_clock: Callable[[], datetime] | None = None,
 ) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
-    registry = RegistryStore(str(tmp_path / "registry.sqlite"))
+    if registry_clock is None:
+        registry = RegistryStore(str(tmp_path / "registry.sqlite"))
+    else:
+        registry = RegistryStore(
+            str(tmp_path / "registry.sqlite"),
+            clock=registry_clock,
+        )
     for hotkey, endpoint in enrollments:
         registry.enroll(hotkey, endpoint)
     actual_ledger = ledger or Ledger(tmp_path / "ledger.sqlite")
@@ -319,6 +328,7 @@ def test_runtime_atomically_persists_offline_verifiable_receipt(
         specs,
         policy=policy,
         receipt_issuer=issuer,
+        registry_clock=lambda: ISSUED,
     )
 
     def registry_verifier(evidence: Evidence, nonce: bytes, active: Policy) -> Attested:
