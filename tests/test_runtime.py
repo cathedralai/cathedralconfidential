@@ -9,12 +9,20 @@ from pathlib import Path
 
 import pytest
 
+from cathedral.assurance import ClaimStatus, attestation_claims
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.ledger import Ledger, LedgerError
-from cathedral.runtime import ConfidentialRuntime, MinerTarget, RuntimeConfig, RuntimeError
+from cathedral.runtime import (
+    ConfidentialRuntime,
+    MinerTarget,
+    RuntimeConfig,
+    RuntimeError,
+    SAT_WORK_POLICY_DIGEST,
+    _work_assurance,
+)
 
 
 CANARY = MinerTarget("canary", "http://127.0.0.1:9000")
@@ -80,10 +88,17 @@ class FakeFactory:
         return FakeClient(endpoint, hotkey, spec, self.log)
 
 
-def verifier(evidence: Evidence, nonce: bytes, _policy: Policy) -> Attested | None:
+def verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
     assert evidence.nonce == nonce
     chip = evidence.quote.decode().removeprefix("chip:")
-    return Attested(Tier.CC_CPU_TDX, chip, "measurement", 1, "VERIFIED")
+    return Attested(
+        Tier.CC_CPU_TDX,
+        chip,
+        "measurement",
+        1,
+        "VERIFIED",
+        assurance=attestation_claims(evidence.quote, policy),
+    )
 
 
 def make_runtime(
@@ -238,13 +253,71 @@ def test_two_unique_tdx_miners_complete_normalized(tmp_path: Path) -> None:
     assert all(outcome.work_units == 20 for outcome in run.outcomes)
 
 
+def test_hardware_pass_with_work_failure_is_explicit_zero(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a", invalid_sat=True)})
+    runtime, _, _ = make_runtime(
+        tmp_path, [("miner", "http://127.0.0.1:9001")], specs
+    )
+
+    run = runtime.run_epoch(1, CANARY)
+    outcome = next(item for item in run.outcomes if item.hotkey == "miner")
+
+    assert outcome.score == 0.0
+    assert outcome.assurance is not None
+    assert outcome.assurance.hardware.status is ClaimStatus.PASSED
+    assert outcome.assurance.software.status is ClaimStatus.PASSED
+    assert outcome.assurance.channel.status is ClaimStatus.NOT_EVALUATED
+    assert outcome.assurance.work.status is ClaimStatus.FAILED
+
+
+def test_runtime_rejects_legacy_verified_flag_without_typed_claims(tmp_path: Path) -> None:
+    runtime, ledger, factory = make_runtime(tmp_path, [], default_specs())
+
+    def legacy_verifier(evidence: Evidence, nonce: bytes, _policy: Policy) -> Attested:
+        assert evidence.nonce == nonce
+        return Attested(Tier.CC_CPU_TDX, "chip", "measurement", 1, "VERIFIED")
+
+    runtime.verifier = legacy_verifier
+
+    with pytest.raises(RuntimeError, match="hardware and software admission claims"):
+        runtime.run_epoch(1, CANARY)
+    assert ledger.blocking_epoch() is None
+    assert "sat:canary" not in factory.log
+
+
+def test_invalid_untrusted_certificate_still_produces_failed_work_claim():
+    policy = Policy(allowed_measurements={"measurement"})
+    attested = Attested(
+        Tier.CC_CPU_TDX,
+        "chip",
+        "measurement",
+        1,
+        assurance=attestation_claims(b"quote", policy),
+    )
+    item = SatLane().dispatch("miner", budget=1)
+    assert isinstance(item, SatWorkItem)
+    certificate = SatCertificate(
+        satisfiable=False,
+        assignment=None,
+        work_units=float("nan"),
+        challenge_id=item.challenge_id,
+        assigned_hotkey="miner",
+    )
+
+    claims = _work_assurance(attested, item, certificate, passed=False)
+
+    assert claims.work.status is ClaimStatus.FAILED
+    assert claims.work.policy_digest == SAT_WORK_POLICY_DIGEST
+    assert claims.work.policy_digest != claims.software.policy_digest
+
+
 def test_runtime_persists_strict_attestation_policy_mode(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("a")})
     runtime, ledger, _ = make_runtime(
         tmp_path, [("miner-a", "http://127.0.0.1:9001")], specs
     )
 
-    def strict_verifier(evidence: Evidence, nonce: bytes, _policy: Policy) -> Attested:
+    def strict_verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested:
         assert evidence.nonce == nonce
         chip = evidence.quote.decode().removeprefix("chip:")
         return Attested(
@@ -253,6 +326,7 @@ def test_runtime_persists_strict_attestation_policy_mode(tmp_path: Path) -> None
             "measurement",
             1,
             policy_mode="strict",
+            assurance=attestation_claims(evidence.quote, policy),
         )
 
     runtime.verifier = strict_verifier

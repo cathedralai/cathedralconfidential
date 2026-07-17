@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from cathedral.assurance import ClaimStatus
 from cathedral.common import Policy
 from cathedral.verify.snp import (
     STRUCTURE_OK_CHAIN_UNVERIFIED,
@@ -89,3 +90,6 @@ def test_chain_unavailable_diagnostic_status_via_opt_in():
     assert verdict.verification_status == STRUCTURE_OK_CHAIN_UNVERIFIED
     assert verdict.verification_status != VERIFIED
     assert verdict.chain_verified is False
+    assert verdict.assurance is not None
+    assert verdict.assurance.hardware.status is ClaimStatus.FAILED
+    assert verdict.assurance.software.status is ClaimStatus.NOT_EVALUATED

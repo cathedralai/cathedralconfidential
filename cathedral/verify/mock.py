@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from cathedral.assurance import attestation_claims
 from cathedral.common import Attested, EvidenceKind, Policy, Tier, report_data
 
 
@@ -138,4 +139,16 @@ def verify_mock(evidence: MockEvidence, nonce: bytes, policy: Policy) -> Atteste
         chip_id=evidence.chip_id,
         measurement=evidence.measurement,
         tcb=evidence.tcb,
+        assurance=attestation_claims(
+            b"\0".join(
+                (
+                    evidence.kind.value.encode("ascii"),
+                    evidence.chip_id.encode("utf-8"),
+                    evidence.measurement.encode("utf-8"),
+                    str(evidence.tcb).encode("ascii"),
+                    evidence.bound_report_data,
+                )
+            ),
+            policy,
+        ),
     )

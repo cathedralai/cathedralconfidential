@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from cathedral.assurance import attestation_claims
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier
 from cathedral.lanes.sat import solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
@@ -59,6 +60,7 @@ def _verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | No
         chip_id=miner.chip_id,
         measurement=miner.measurement,
         tcb=miner.tcb,
+        assurance=attestation_claims(evidence.quote, policy),
     )
 
 
@@ -115,6 +117,33 @@ def test_attested_epoch_rejects_bad_measurement_before_work():
         Policy(allowed_measurements={"other-measurement"}, min_tcb=0),
         routing={"sat_benchmark": 1.0},
         verifier=_verifier,
+    )
+
+    assert result.admitted == []
+    assert result.weights == {}
+    assert result.burn == 1.0
+
+
+def test_attested_epoch_rejects_legacy_verified_flag_without_assurance():
+    miner = EvidenceBackedMiner("uid-1", "hotkey-1", "chip-1")
+
+    def legacy_verifier(
+        evidence: Evidence, nonce: bytes, policy: Policy
+    ) -> Attested:
+        assert evidence.nonce == nonce
+        return Attested(
+            Tier.CC_CPU_TDX,
+            "chip-1",
+            "tdx-measurement-1",
+            7,
+            "VERIFIED",
+        )
+
+    result = attested_epoch(
+        [miner],
+        Policy(allowed_measurements={"tdx-measurement-1"}, min_tcb=7),
+        routing={"sat_benchmark": 1.0},
+        verifier=legacy_verifier,
     )
 
     assert result.admitted == []

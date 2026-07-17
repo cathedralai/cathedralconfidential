@@ -12,6 +12,8 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from cathedral.assurance import AssuranceClaims
+
 
 TDX_TCB_STATUSES = frozenset(
     {
@@ -76,6 +78,7 @@ class Attested:
     pck_cert_id: str | None = None
     attestation_key_id: str | None = None
     policy_mode: str | None = None
+    assurance: AssuranceClaims | None = None
 
 
 def issue_nonce() -> bytes:

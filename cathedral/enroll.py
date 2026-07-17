@@ -26,6 +26,12 @@ from typing import Any, Protocol
 from urllib.parse import urlparse
 from wsgiref.simple_server import make_server
 
+from cathedral.assurance import (
+    ATTESTATION_ADMISSION_POLICY,
+    AssuranceClaims,
+    assurance_from_dict,
+    empty_assurance_claims,
+)
 from cathedral.common import Attested
 
 try:
@@ -320,10 +326,16 @@ class RegistryStore:
                     verification_status TEXT NOT NULL,
                     last_verified_iso TEXT NOT NULL,
                     error TEXT,
+                    assurance_json TEXT,
                     FOREIGN KEY(hotkey) REFERENCES enrollments(hotkey)
                 )
                 """
             )
+            attestation_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(attestations)")
+            }
+            if "assurance_json" not in attestation_columns:
+                conn.execute("ALTER TABLE attestations ADD COLUMN assurance_json TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS attestations_chip_id_idx
@@ -438,30 +450,51 @@ class RegistryStore:
             status = "FAILED"
             chip_id = None
             tier = None
+            assurance_json = None
         else:
             status = attested.verification_status
             chip_id = attested.chip_id
             tier = attested.tier.value
+            assurance_json = (
+                json.dumps(
+                    attested.assurance.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if attested.assurance is not None
+                else None
+            )
+        if status == "VERIFIED" and not ATTESTATION_ADMISSION_POLICY.allows(
+            attested.assurance if attested is not None else None
+        ):
+            status = "FAILED"
+            chip_id = None
+            tier = None
+            error = "typed hardware and software assurance claims are required"
         with self._connect() as conn:
             if status == "VERIFIED" and chip_id is not None:
                 conflict = self._chip_rotation_owner(conn, chip_id, hotkey)
                 if conflict is not None:
                     status = "FAILED"
+                    chip_id = None
+                    tier = None
                     error = f"chip_id already bound to hotkey {conflict}"
             conn.execute(
                 """
                 INSERT INTO attestations(
-                    hotkey, chip_id, tier, verification_status, last_verified_iso, error
+                    hotkey, chip_id, tier, verification_status, last_verified_iso, error,
+                    assurance_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hotkey) DO UPDATE SET
                     chip_id=excluded.chip_id,
                     tier=excluded.tier,
                     verification_status=excluded.verification_status,
                     last_verified_iso=excluded.last_verified_iso,
-                    error=excluded.error
+                    error=excluded.error,
+                    assurance_json=excluded.assurance_json
                 """,
-                (hotkey, chip_id, tier, status, ts, error),
+                (hotkey, chip_id, tier, status, ts, error, assurance_json),
             )
 
     def chip_rotation_owner(self, chip_id: str, hotkey: str) -> str | None:
@@ -522,7 +555,8 @@ class RegistryStore:
                     a.chip_id,
                     a.tier,
                     COALESCE(a.verification_status, 'PENDING') AS verification_status,
-                    a.last_verified_iso
+                    a.last_verified_iso,
+                    a.assurance_json
                 FROM enrollments e
                 LEFT JOIN attestations a ON a.hotkey = e.hotkey
                 ORDER BY e.updated_at_iso, e.hotkey
@@ -534,23 +568,44 @@ class RegistryStore:
         verified_chips: set[str] = set()
         for row in rows:
             chip_id = row["chip_id"]
+            tier = row["tier"]
+            assurance = self._stored_assurance(row["assurance_json"])
             status = self._effective_status(
                 row["verification_status"],
                 row["last_verified_iso"],
                 now,
             )
+            if status == "VERIFIED" and not ATTESTATION_ADMISSION_POLICY.allows(
+                assurance
+            ):
+                status = "FAILED"
+                chip_id = None
+                tier = None
             if status == "VERIFIED" and chip_id is not None:
                 verified_chips.add(chip_id)
             miners.append(
                 {
                     "hotkey": row["hotkey"],
                     "chip_id_prefix": chip_id[:16] if chip_id else None,
-                    "tier": row["tier"],
+                    "tier": tier,
                     "verification_status": status,
                     "last_verified_iso": row["last_verified_iso"],
+                    "assurance": assurance.to_dict(include_digests=False),
                 }
             )
         return {"count": len(verified_chips), "miners": miners}
+
+    @staticmethod
+    def _stored_assurance(raw: str | None) -> AssuranceClaims:
+        claims = empty_assurance_claims()
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    claims = assurance_from_dict(parsed)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return claims
 
 
 class IpRateLimiter:

@@ -14,6 +14,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from cathedral.assurance import attestation_claims
 from cathedral.common import Attested, EvidenceKind, Policy, Tier
 from cathedral.enroll import RegistryStore
 from cathedral.prober import policy_from_args, probe_once
@@ -116,6 +117,7 @@ def _fake_tdx_verify(evidence, nonce, policy):
             chip_id=TDX_CHIP_ID,
             measurement=TDX_MEASUREMENT,
             tcb=3,
+            assurance=attestation_claims(evidence.quote, policy),
         )
     return None
 
@@ -142,6 +144,22 @@ def test_prober_verified_tdx_evidence(monkeypatch, tmp_path):
     assert board["miners"][0]["verification_status"] == "VERIFIED"
     assert board["miners"][0]["tier"] == Tier.CC_CPU_TDX.value
     assert board["miners"][0]["chip_id_prefix"] == TDX_CHIP_ID[:16]
+
+
+def test_prober_rejects_verified_flag_without_typed_assurance(monkeypatch, tmp_path):
+    server = _serve(TdxMiner)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = TdxMiner.hotkey
+    store.enroll(hotkey, f"http://127.0.0.1:{server.server_port}")
+
+    def legacy_verifier(evidence, nonce, policy):
+        return Attested(Tier.CC_CPU_TDX, "chip", "measurement", 1, "VERIFIED")
+
+    monkeypatch.setattr("cathedral.prober.verifier.verify", legacy_verifier)
+    probe_once(store, Policy())
+    server.shutdown()
+
+    assert store.board()["miners"][0]["verification_status"] == "FAILED"
 
 
 # ---------------------------------------------------------------------------

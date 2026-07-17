@@ -105,7 +105,7 @@ Hardware-free core. Requires Python 3.11+.
 python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
-python -m pytest -q            # 469 passed, 3 skipped
+python -m pytest -q
 ```
 
 The hardware-free suite exercises TDX policy verification, signed enrollment,
@@ -119,6 +119,7 @@ the real `verify()` interface; the real Intel TDX path runs on hardware (see
 - [`BUILD_STATUS.md`](BUILD_STATUS.md) - canonical mainnet and testnet launch evidence
 - [`MINING.md`](MINING.md) - step-by-step miner onboarding
 - [`docs/DESIGN.md`](docs/DESIGN.md) - protocol and scoring design
+- [`docs/ASSURANCE.md`](docs/ASSURANCE.md) - four independent assurance claims
 - [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path
 - [`HANDOFF.md`](HANDOFF.md) - commissioning and test handoff
 - [`RUNTEST.md`](RUNTEST.md) - test commands

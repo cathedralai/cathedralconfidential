@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import math
 import urllib.parse
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -16,6 +17,16 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 
+from cathedral.assurance import (
+    ATTESTATION_ADMISSION_POLICY,
+    SCORE_ELIGIBILITY_POLICY,
+    AssuranceClaims,
+    AssuranceDimension,
+    ClaimStatus,
+    ReasonCategory,
+    evaluated_claim,
+    sha256_digest,
+)
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
@@ -26,6 +37,7 @@ from cathedral.remote import RemoteMiner
 from cathedral.verify import verify
 
 MAX_BEARER_TOKEN_LENGTH = 4096
+SAT_WORK_POLICY_DIGEST = sha256_digest(b"cathedral-sat-work-verification-policy-v1")
 
 
 class RuntimeError(Exception):
@@ -92,6 +104,7 @@ class MinerOutcome:
     work_units: float = 0.0
     score: float = 0.0
     error: str | None = None
+    assurance: AssuranceClaims | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +185,9 @@ class ConfidentialRuntime:
         accepted = lane.verify(item, certificate) if certificate is not None else None
         if accepted is None:
             raise RuntimeError(f"canary SAT failed: {error or 'invalid certificate'}")
+        assurance = _work_assurance(result.attested, item, certificate, passed=True)
+        if not SCORE_ELIGIBILITY_POLICY.allows(assurance):
+            raise RuntimeError("canary claims do not satisfy score eligibility policy")
         units = lane.score(target.hotkey, [accepted])
         if units <= 0:
             raise RuntimeError("canary SAT produced no verified work")
@@ -183,6 +199,7 @@ class ConfidentialRuntime:
                 admitted=True,
                 challenge_id=item.challenge_id,
                 work_units=units,
+                assurance=assurance,
             ),
             attestation=result,
         )
@@ -240,6 +257,7 @@ class ConfidentialRuntime:
                     work_units=outcome.work_units,
                     score=scores.get(hotkey, 0.0),
                     error=outcome.error,
+                    assurance=outcome.assurance,
                 )
                 for hotkey, outcome in outcomes.items()
             }
@@ -409,7 +427,11 @@ class ConfidentialRuntime:
             )
             self.registry.record_verdict(result.target.hotkey, result.attested)
             outcomes[result.target.hotkey] = MinerOutcome(
-                result.target.hotkey, result.endpoint, "attested", admitted=True
+                result.target.hotkey,
+                result.endpoint,
+                "attested",
+                admitted=True,
+                assurance=result.attested.assurance,
             )
             admitted.append(result)
         return sorted(admitted, key=lambda result: result.target.hotkey)
@@ -440,6 +462,9 @@ class ConfidentialRuntime:
                 accepted = lane.verify(item, certificate) if certificate is not None else None
                 if accepted is None:
                     self.ledger.resolve_challenge(item.challenge_id, "failed")
+                    assurance = _work_assurance(
+                        result.attested, item, certificate, passed=False
+                    )
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
                         result.endpoint,
@@ -447,6 +472,22 @@ class ConfidentialRuntime:
                         admitted=True,
                         challenge_id=item.challenge_id,
                         error=error or "invalid SAT certificate",
+                        assurance=assurance,
+                    )
+                    continue
+                assurance = _work_assurance(
+                    result.attested, item, certificate, passed=True
+                )
+                if not SCORE_ELIGIBILITY_POLICY.allows(assurance):
+                    self.ledger.resolve_challenge(item.challenge_id, "failed")
+                    outcomes[result.target.hotkey] = MinerOutcome(
+                        result.target.hotkey,
+                        result.endpoint,
+                        "assurance_failed",
+                        admitted=True,
+                        challenge_id=item.challenge_id,
+                        error="score eligibility claims were not satisfied",
+                        assurance=assurance,
                     )
                     continue
                 units = lane.score(result.target.hotkey, [accepted])
@@ -463,6 +504,7 @@ class ConfidentialRuntime:
                     admitted=True,
                     challenge_id=item.challenge_id,
                     work_units=units,
+                    assurance=assurance,
                 )
 
     def _collect_attestation(self, target: MinerTarget, endpoint: str) -> _AttestationResult:
@@ -497,6 +539,10 @@ class ConfidentialRuntime:
                     raise RuntimeError("verdict must be exact VERIFIED CC_CPU_TDX")
                 if not verdict.chip_id:
                     raise RuntimeError("verified TDX evidence must identify a chip")
+                if not ATTESTATION_ADMISSION_POLICY.allows(verdict.assurance):
+                    raise RuntimeError(
+                        "TDX verdict does not satisfy hardware and software admission claims"
+                    )
                 return _AttestationResult(
                     target,
                     endpoint,
@@ -543,6 +589,50 @@ class ConfidentialRuntime:
                 raise RuntimeError(
                     f"production bearer authentication is required for target {target.hotkey!r}"
                 ) from exc
+
+
+def _work_assurance(
+    attested: Attested,
+    item: SatWorkItem,
+    certificate: SatCertificate | None,
+    *,
+    passed: bool,
+) -> AssuranceClaims:
+    claims = attested.assurance
+    if claims is None or claims.software.policy_digest is None:
+        raise RuntimeError("attested verdict is missing typed assurance claims")
+    material = {
+        "assigned_hotkey": certificate.assigned_hotkey if certificate else None,
+        "assignment": (
+            list(certificate.assignment)
+            if certificate is not None and isinstance(certificate.assignment, list)
+            else None
+        ),
+        "challenge_id": item.challenge_id,
+        "satisfiable": certificate.satisfiable if certificate else None,
+        "work_units": certificate.work_units if certificate else None,
+    }
+    try:
+        encoded = json.dumps(
+            material,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError):
+        encoded = json.dumps(
+            {"challenge_id": item.challenge_id, "invalid_certificate": True},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    work = evaluated_claim(
+        ClaimStatus.PASSED if passed else ClaimStatus.FAILED,
+        encoded,
+        SAT_WORK_POLICY_DIGEST,
+        reason=None if passed else ReasonCategory.WORK_INVALID,
+    )
+    return claims.with_claim(AssuranceDimension.WORK, work)
 
 
 def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:

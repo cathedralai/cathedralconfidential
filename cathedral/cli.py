@@ -33,6 +33,7 @@ from pathlib import Path
 
 from cathedral import census as census_mod
 from cathedral.api import WorkQueue
+from cathedral.assurance import AssuranceDimension
 from cathedral.common import Policy
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
@@ -178,6 +179,13 @@ def _format_run_pretty(run: EpochRun, *, out: object = None) -> None:
             f"{err_part}",
             file=out,
         )
+        if outcome.assurance is not None:
+            claim_summary = " ".join(
+                f"{dimension.value[0].upper()}="
+                f"{outcome.assurance.claim(dimension).status.value}"
+                for dimension in AssuranceDimension
+            )
+            print(f"            assurance {claim_summary}", file=out)
 
     status_flag = "  !! EPOCH FAILED" if run.status not in {"complete", "published"} else ""
     print(
@@ -465,6 +473,7 @@ def _outcome_json(outcome: MinerOutcome) -> dict[str, object]:
         "work_units": outcome.work_units,
         "score": outcome.score,
         "error": _sanitize_error(outcome.error, maxlen=300) if outcome.error else None,
+        "assurance": outcome.assurance.to_dict() if outcome.assurance else None,
     }
 
 

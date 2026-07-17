@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from cathedral.assurance import attestation_claims
 from cathedral.common import (
     TDX_TCB_STATUSES,
     Attested,
@@ -182,6 +183,7 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
         pck_cert_id=pck_cert_id,
         attestation_key_id=attestation_key_id,
         policy_mode="strict" if policy.tdx_strict else "compatibility",
+        assurance=attestation_claims(evidence.quote, policy),
     )
 
 

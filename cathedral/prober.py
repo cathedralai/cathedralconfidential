@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import cathedral.verify as verifier
+from cathedral.assurance import ATTESTATION_ADMISSION_POLICY
 from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, issue_nonce
 from cathedral.enroll import RegistryStore
 
@@ -333,6 +334,7 @@ def _verify_tdx_evidence(
         attested is None
         or attested.verification_status != "VERIFIED"
         or attested.tier is not Tier.CC_CPU_TDX
+        or not ATTESTATION_ADMISSION_POLICY.allows(attested.assurance)
     ):
         return None
     return attested
