@@ -1,4 +1,4 @@
-"""Confidential TDX report runtime.
+"""Confidential CPU-TDX and audit-only composite-GPU report runtime.
 
 This module only freezes and optionally publishes Cathedral confidential-compute
 reports. The existing validator remains the sole owner of score composition,
@@ -35,6 +35,8 @@ from cathedral.common import (
     ChannelBinding,
     Evidence,
     EvidenceKind,
+    MAX_EVIDENCE_RESPONSE_BODY,
+    MAX_GPU_EVIDENCE_CONCURRENCY,
     Policy,
     Tier,
     issue_nonce,
@@ -67,6 +69,8 @@ class RuntimeError(Exception):
 class MinerClient(Protocol):
     def collect_evidence(self, nonce: bytes) -> Evidence: ...
 
+    def collect_evidence_bundle(self, nonce: bytes) -> tuple[Evidence, ...]: ...
+
     def confirm_channel_binding(self, evidence: Evidence) -> ChannelBinding: ...
 
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate: ...
@@ -90,6 +94,7 @@ class RuntimeConfig:
     reattestation_retry_base_seconds: int = 5
     reattestation_retry_maximum_seconds: int = 300
     reattestation_retry_jitter_seconds: int = 5
+    expected_tier: Tier = Tier.CC_CPU_TDX
 
     def __post_init__(self) -> None:
         timeout = self.miner_timeout_seconds
@@ -118,6 +123,8 @@ class RuntimeConfig:
             raise ValueError("allow_insecure_http_for_tests must be a boolean")
         if self.production_mode and self.allow_insecure_http_for_tests:
             raise ValueError("insecure HTTP is unavailable in production mode")
+        if self.expected_tier not in {Tier.CC_CPU_TDX, Tier.CC_GPU}:
+            raise ValueError("runtime expected tier must be CPU TDX or GPU composite")
         if (
             isinstance(self.reattestation_failures_before_failed, bool)
             or not isinstance(self.reattestation_failures_before_failed, int)
@@ -152,7 +159,17 @@ class MinerOutcome:
     work_units: float = 0.0
     score: float = 0.0
     error: str | None = None
+    error_category: str | None = None
     assurance: AssuranceClaims | None = None
+    component_audit: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if self.component_audit is not None:
+            object.__setattr__(
+                self,
+                "component_audit",
+                MappingProxyType(dict(self.component_audit)),
+            )
 
 
 @dataclass(frozen=True)
@@ -176,6 +193,9 @@ class _AttestationResult:
     evidence_digest: str | None = None
     client: MinerClient | None = None
     error: str | None = None
+    error_category: str | None = None
+    component_audit: Mapping[str, object] | None = None
+    gpu_component: object | None = field(default=None, repr=False)
     lifecycle_generation: int | None = None
     lifecycle_revision: int | None = None
 
@@ -193,7 +213,7 @@ RemoteFactory = Callable[..., MinerClient]
 
 
 class ConfidentialRuntime:
-    """Run one fresh TDX attestation and one canonical SAT job per enrollment."""
+    """Run one fresh requested-tier attestation and canonical SAT job per worker."""
 
     def __init__(
         self,
@@ -209,6 +229,9 @@ class ConfidentialRuntime:
         config: RuntimeConfig | None = None,
         receipt_issuer: ReceiptIssuer | None = None,
         reattestor: SingleFlightReattestor[_AttestationResult] | None = None,
+        gpu_profile=None,
+        gpu_verifier=None,
+        gpu_identity_registry=None,
     ) -> None:
         self.registry = registry
         self.ledger = ledger
@@ -219,15 +242,98 @@ class ConfidentialRuntime:
         self.nonce_factory = nonce_factory
         self.remote_factory = remote_factory
         self.config = config or RuntimeConfig()
+        gpu_configuration = (gpu_profile, gpu_verifier, gpu_identity_registry)
+        if self.config.expected_tier is Tier.CC_GPU and any(
+            item is None for item in gpu_configuration
+        ):
+            raise ValueError(
+                "GPU runtime requires profile, verifier, and durable identity registry"
+            )
+        if self.config.expected_tier is Tier.CC_CPU_TDX and any(
+            item is not None for item in gpu_configuration
+        ):
+            raise ValueError("CPU runtime cannot carry GPU verifier configuration")
+        if self.config.expected_tier is Tier.CC_GPU:
+            from cathedral.gpu import (
+                ExternalGpuVerifier,
+                GpuIdentityRegistry,
+                GpuProfile,
+            )
+
+            if not isinstance(gpu_profile, GpuProfile) or not isinstance(
+                gpu_identity_registry, GpuIdentityRegistry
+            ):
+                raise ValueError("GPU runtime profile or identity registry is invalid")
+            if self.config.production_mode:
+                if not gpu_profile.production_ready_for(self.policy):
+                    raise ValueError(
+                        "production GPU runtime requires a live profile from its CPU policy registry"
+                    )
+                if not gpu_identity_registry.production_ready:
+                    raise ValueError(
+                        "production GPU runtime requires a protected identity registry"
+                    )
+                if not isinstance(gpu_verifier, ExternalGpuVerifier):
+                    raise ValueError("production GPU runtime requires the pinned external verifier")
+                if not gpu_verifier.production_ready:
+                    raise ValueError("production GPU runtime requires a static verifier executable")
+                gpu_verifier.preflight(gpu_profile)
+        self.gpu_profile = gpu_profile
+        self.gpu_verifier = gpu_verifier
+        self.gpu_identity_registry = gpu_identity_registry
+        if self.config.expected_tier is Tier.CC_GPU and receipt_issuer is not None:
+            raise ValueError(
+                "GPU receipt issuance is disabled until a composite receipt schema is active"
+            )
         self.receipt_issuer = receipt_issuer
-        self.reattestor = reattestor or SingleFlightReattestor(
-            max_workers=self.config.max_workers
+        attestation_workers = (
+            min(self.config.max_workers, MAX_GPU_EVIDENCE_CONCURRENCY)
+            if self.config.expected_tier is Tier.CC_GPU
+            else self.config.max_workers
         )
+        self._attestation_workers = attestation_workers
+        self._gpu_evidence_slots = threading.BoundedSemaphore(MAX_GPU_EVIDENCE_CONCURRENCY)
+        self.reattestor = reattestor or SingleFlightReattestor(max_workers=attestation_workers)
         self._owns_reattestor = reattestor is None
         self._run_lock = threading.Lock()
 
+    def _require_live_gpu_profile(self) -> None:
+        if self.config.expected_tier is not Tier.CC_GPU or not self.config.production_mode:
+            return
+        from cathedral.gpu import GpuProfile
+
+        if not isinstance(
+            self.gpu_profile, GpuProfile
+        ) or not self.gpu_profile.production_ready_for(self.policy):
+            raise RuntimeError(
+                "production GPU profile is expired or no longer matches the CPU policy"
+            )
+
     def check_canary(self, canary: MinerTarget) -> MinerOutcome:
+        self._require_live_gpu_profile()
         return self._check_canary_result(canary).outcome
+
+    def audit_attestation(self, target: MinerTarget) -> MinerOutcome:
+        """Verify fresh evidence and its live channel without dispatch or scoring."""
+
+        self._require_live_gpu_profile()
+        checked, endpoint = self._validate_target(target)
+        result = self._collect_attestation(checked, endpoint)
+        if result.attested is None:
+            return MinerOutcome(
+                hotkey=checked.hotkey,
+                endpoint_url=endpoint,
+                status="attestation_failed",
+                error=result.error or "rejected",
+                error_category=result.error_category or "attestation_rejected",
+            )
+        return MinerOutcome(
+            hotkey=checked.hotkey,
+            endpoint_url=endpoint,
+            status="attestation_verified",
+            assurance=result.attested.assurance,
+            component_audit=result.component_audit,
+        )
 
     def _check_canary_result(self, canary: MinerTarget) -> _CanaryResult:
         target, endpoint = self._validate_target(canary)
@@ -236,8 +342,32 @@ class ConfidentialRuntime:
             raise RuntimeError(f"canary attestation failed: {result.error or 'rejected'}")
         if not WORK_DISPATCH_POLICY.allows(result.attested.assurance):
             raise RuntimeError("canary lacks a verified protected channel")
+        if self.config.expected_tier is Tier.CC_GPU:
+            from cathedral.gpu import (
+                GpuAttestationError,
+                GpuComponentVerdict,
+                GpuIdentityRegistry,
+            )
 
-        lane = SatLane(namespace=f"canary:{target.hotkey}")
+            if not isinstance(self.gpu_identity_registry, GpuIdentityRegistry) or not isinstance(
+                result.gpu_component, GpuComponentVerdict
+            ):
+                raise RuntimeError("GPU canary is missing its identity component")
+            try:
+                self.gpu_identity_registry.assert_unclaimed(result.gpu_component)
+            except GpuAttestationError as exc:
+                if exc.category != "identity_conflict":
+                    raise
+                raise RuntimeError("canary GPU identity is already enrolled") from exc
+
+        self._require_live_gpu_profile()
+        lane = SatLane(
+            namespace=f"canary:{target.hotkey}",
+            gpu_profile=self.gpu_profile,
+            gpu_policy=self.policy,
+        )
+        if not lane.qualify(result.attested):
+            raise RuntimeError("canary hardware tier is not enabled for SAT scoring")
         item = lane.dispatch(target.hotkey, budget=1)
         if not isinstance(item, SatWorkItem):
             raise RuntimeError("canary did not receive canonical SAT work")
@@ -248,6 +378,7 @@ class ConfidentialRuntime:
         assurance = _work_assurance(result.attested, item, certificate, passed=True)
         if not SCORE_ELIGIBILITY_POLICY.allows(assurance):
             raise RuntimeError("canary claims do not satisfy score eligibility policy")
+        self._require_live_gpu_profile()
         units = lane.score(target.hotkey, [accepted])
         if units <= 0:
             raise RuntimeError("canary SAT produced no verified work")
@@ -263,6 +394,30 @@ class ConfidentialRuntime:
             ),
             attestation=result,
         )
+
+    def _reserve_gpu_canary(self, canary: _CanaryResult):
+        if self.config.expected_tier is not Tier.CC_GPU:
+            return None
+        from cathedral.gpu import (
+            GpuAttestationError,
+            GpuComponentVerdict,
+            GpuIdentityRegistry,
+        )
+
+        component = canary.attestation.gpu_component
+        if not isinstance(self.gpu_identity_registry, GpuIdentityRegistry) or not isinstance(
+            component, GpuComponentVerdict
+        ):
+            raise RuntimeError("GPU canary is missing its identity component")
+        try:
+            return self.gpu_identity_registry.begin_exclusive_reservation(
+                canary.attestation.target.hotkey,
+                component,
+            )
+        except GpuAttestationError as exc:
+            if exc.category != "identity_conflict":
+                raise
+            raise RuntimeError("canary GPU identity is already enrolled") from exc
 
     def run_epoch(
         self,
@@ -287,16 +442,24 @@ class ConfidentialRuntime:
     ) -> EpochRun:
         if not isinstance(publish, bool):
             raise ValueError("publish must be a boolean")
+        self._require_live_gpu_profile()
         canary_target, canary_endpoint = self._validate_target(canary)
 
+        lifecycle_measurements = self.policy.allowed_measurements
+        if self.config.expected_tier is Tier.CC_GPU:
+            from cathedral.gpu import gpu_lifecycle_measurements
+
+            lifecycle_measurements = gpu_lifecycle_measurements(self.policy, self.gpu_profile)
         revoked = self.registry.apply_lifecycle_policy(
-            self.policy.allowed_measurements,
+            lifecycle_measurements,
             policy_registry_release=self.policy.registry_release,
             policy_registry_digest=self.policy.registry_digest,
         )
         for snapshot in revoked:
             self.reattestor.cancel(snapshot.hotkey)
         enrollments = self.registry.enrollments()
+        if any(item.hotkey == canary_target.hotkey for item in enrollments):
+            raise RuntimeError("canary identity must be dedicated and not enrolled")
         refresh_due = {
             snapshot.hotkey
             for snapshot in self.registry.due_refreshes(
@@ -338,74 +501,100 @@ class ConfidentialRuntime:
             raise RuntimeError("canary endpoint must be dedicated and not enrolled")
 
         canary_result = self._check_canary_result(canary_target)
-        attested = self._attest_targets(prepared, outcomes)
-        canary_attested = canary_result.attestation.attested
-        assert canary_attested is not None
-        if any(
-            result.attested is not None
-            and result.attested.chip_id == canary_attested.chip_id
-            for result in attested
-        ):
-            raise RuntimeError("an enrolled miner shares the dedicated canary TDX chip")
-
-        epoch_id = self.ledger.begin_epoch(
-            source_epoch,
-            policy_registry_release=self.policy.registry_release,
-            policy_registry_digest=self.policy.registry_digest,
-        )
+        canary_reservation = self._reserve_gpu_canary(canary_result)
         try:
-            admitted = self._admit_unique_chips(epoch_id, attested, outcomes)
-            self._run_sat(epoch_id, source_epoch, admitted, outcomes)
-
-            for enrollment in enrollments:
-                self.ledger.add_lifecycle_snapshot(
-                    epoch_id,
-                    self.registry.lifecycle_snapshot(enrollment.hotkey),
+            attested = self._attest_targets(prepared, outcomes)
+            canary_attested = canary_result.attestation.attested
+            assert canary_attested is not None
+            if any(
+                result.attested is not None and result.attested.chip_id == canary_attested.chip_id
+                for result in attested
+            ):
+                raise RuntimeError(
+                    "an enrolled miner shares the dedicated canary TDX chip or "
+                    "composite hardware identity"
                 )
+            if self.config.expected_tier is Tier.CC_GPU:
+                from cathedral.gpu import GpuComponentVerdict
 
-            all_hotkeys = {enrollment.hotkey for enrollment in enrollments}
-            scores = self.ledger.complete_epoch(epoch_id, all_hotkeys)
-            outcomes = {
-                hotkey: MinerOutcome(
-                    hotkey=outcome.hotkey,
-                    endpoint_url=outcome.endpoint_url,
-                    status=outcome.status,
-                    admitted=outcome.admitted,
-                    challenge_id=outcome.challenge_id,
-                    work_units=outcome.work_units,
-                    score=scores.get(hotkey, 0.0),
-                    error=outcome.error,
-                    assurance=outcome.assurance,
-                )
-                for hotkey, outcome in outcomes.items()
-            }
-            if publish:
-                self.publish_completed(epoch_id)
-            row = self.ledger.get_epoch(epoch_id)
-            assert row is not None
-            return EpochRun(
-                epoch_id=epoch_id,
-                source_epoch=source_epoch,
-                status=str(row["status"]),
-                outcomes=tuple(outcomes[key] for key in sorted(outcomes)),
-                scores=scores,
-                published=row["status"] == "published",
+                canary_component = canary_result.attestation.gpu_component
+                if not isinstance(canary_component, GpuComponentVerdict):
+                    raise RuntimeError("GPU canary is missing its identity component")
+                if any(
+                    isinstance(result.gpu_component, GpuComponentVerdict)
+                    and bool(canary_component.identity_set & result.gpu_component.identity_set)
+                    for result in attested
+                ):
+                    raise RuntimeError("an enrolled miner shares the dedicated canary GPU identity")
+
+            epoch_id = self.ledger.begin_epoch(
+                source_epoch,
+                policy_registry_release=self.policy.registry_release,
+                policy_registry_digest=self.policy.registry_digest,
             )
-        except BaseException:
-            row = self.ledger.get_epoch(epoch_id)
-            if row is not None and row["status"] == "running":
-                self.ledger.abort_epoch(epoch_id)
-            raise
+            try:
+                admitted = self._admit_unique_chips(epoch_id, attested, outcomes)
+                self._run_sat(epoch_id, source_epoch, admitted, outcomes)
+                self._require_live_gpu_profile()
+
+                for enrollment in enrollments:
+                    self.ledger.add_lifecycle_snapshot(
+                        epoch_id,
+                        self.registry.lifecycle_snapshot(enrollment.hotkey),
+                    )
+
+                all_hotkeys = {enrollment.hotkey for enrollment in enrollments}
+                self._require_live_gpu_profile()
+                score_authority_valid_until = None
+                if self.config.expected_tier is Tier.CC_GPU and self.config.production_mode:
+                    score_authority_valid_until = self.gpu_profile.registry_valid_until
+                scores = self.ledger.complete_epoch(
+                    epoch_id,
+                    all_hotkeys,
+                    score_authority_valid_until=score_authority_valid_until,
+                )
+                outcomes = {
+                    hotkey: MinerOutcome(
+                        hotkey=outcome.hotkey,
+                        endpoint_url=outcome.endpoint_url,
+                        status=outcome.status,
+                        admitted=outcome.admitted,
+                        challenge_id=outcome.challenge_id,
+                        work_units=outcome.work_units,
+                        score=scores.get(hotkey, 0.0),
+                        error=outcome.error,
+                        error_category=outcome.error_category,
+                        assurance=outcome.assurance,
+                        component_audit=outcome.component_audit,
+                    )
+                    for hotkey, outcome in outcomes.items()
+                }
+                if publish:
+                    self.publish_completed(epoch_id)
+                row = self.ledger.get_epoch(epoch_id)
+                assert row is not None
+                return EpochRun(
+                    epoch_id=epoch_id,
+                    source_epoch=source_epoch,
+                    status=str(row["status"]),
+                    outcomes=tuple(outcomes[key] for key in sorted(outcomes)),
+                    scores=scores,
+                    published=row["status"] == "published",
+                )
+            except BaseException:
+                row = self.ledger.get_epoch(epoch_id)
+                if row is not None and row["status"] == "running":
+                    self.ledger.abort_epoch(epoch_id)
+                raise
+        finally:
+            if canary_reservation is not None:
+                self.gpu_identity_registry.rollback_claim(canary_reservation)
 
     def publish_completed(self, epoch_id: int) -> Mapping[str, object]:
         if self.poster is None:
             raise RuntimeError("publisher is not configured")
         blocking = self.ledger.blocking_epoch()
-        if (
-            blocking is None
-            or blocking["status"] != "complete"
-            or blocking["epoch_id"] != epoch_id
-        ):
+        if blocking is None or blocking["status"] != "complete" or blocking["epoch_id"] != epoch_id:
             raise RuntimeError("epoch_id must identify the exact completed blocking epoch")
         acknowledgement = self.ledger.post_and_mark_published(epoch_id, self.poster)
         return MappingProxyType(dict(acknowledgement))
@@ -455,11 +644,7 @@ class ConfidentialRuntime:
         guarantees.
         """
         blocking = self.ledger.blocking_epoch()
-        if (
-            blocking is None
-            or blocking["status"] != "complete"
-            or blocking["epoch_id"] != epoch_id
-        ):
+        if blocking is None or blocking["status"] != "complete" or blocking["epoch_id"] != epoch_id:
             raise RuntimeError("epoch_id must identify the exact completed blocking epoch")
         self.ledger.abandon_completed_epoch(epoch_id, reason)
         return epoch_id
@@ -503,7 +688,7 @@ class ConfidentialRuntime:
         outcomes: dict[str, MinerOutcome],
     ) -> list[_AttestationResult]:
         results: list[_AttestationResult] = []
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self._attestation_workers) as executor:
             futures: dict[str, Future[_AttestationResult]] = {
                 target.hotkey: executor.submit(
                     self._collect_attestation_singleflight, target, endpoint
@@ -541,7 +726,11 @@ class ConfidentialRuntime:
                             # won the compare-and-swap. Ignore this stale result.
                             pass
                     outcomes[hotkey] = MinerOutcome(
-                        hotkey, endpoint, "attestation_failed", error=result.error
+                        hotkey,
+                        endpoint,
+                        "attestation_failed",
+                        error=result.error,
+                        error_category=result.error_category,
                     )
                 else:
                     results.append(result)
@@ -567,10 +756,7 @@ class ConfidentialRuntime:
                     target, endpoint, cancel_event=cancelled
                 ),
                 timeout_seconds=(
-                    self.config.miner_timeout_seconds
-                    * self.config.miner_attempts
-                    * 2
-                    + 1
+                    self.config.miner_timeout_seconds * self.config.miner_attempts * 2 + 1
                 ),
             )
         except LifecycleError as exc:
@@ -640,7 +826,46 @@ class ConfidentialRuntime:
                     error=f"chip_id already bound to hotkey {rotation_owner}",
                 )
                 continue
+            pending_gpu_claim = None
+            if result.attested.tier is Tier.CC_GPU:
+                from cathedral.gpu import (
+                    GpuAttestationError,
+                    GpuComponentVerdict,
+                    GpuIdentityRegistry,
+                )
+
+                if not isinstance(
+                    self.gpu_identity_registry, GpuIdentityRegistry
+                ) or not isinstance(result.gpu_component, GpuComponentVerdict):
+                    raise RuntimeError("verified GPU admission is missing its identity component")
+                self._require_live_gpu_profile()
+                try:
+                    pending_gpu_claim = self.gpu_identity_registry.begin_claim(
+                        result.target.hotkey,
+                        result.gpu_component,
+                    )
+                except GpuAttestationError as exc:
+                    if exc.category != "identity_conflict":
+                        raise
+                    self._revoke_lifecycle(result, LifecycleReason.IDENTITY_CONFLICT)
+                    outcomes[result.target.hotkey] = MinerOutcome(
+                        result.target.hotkey,
+                        result.endpoint,
+                        "gpu_identity_conflict",
+                        error=_safe_error(exc),
+                        error_category=exc.category,
+                        component_audit=result.component_audit,
+                    )
+                    continue
             try:
+                gpu_commit_authority = {}
+                if result.attested.tier is Tier.CC_GPU and self.config.production_mode:
+                    gpu_commit_authority = {
+                        "gpu_profile_valid_from": self.gpu_profile.registry_valid_from,
+                        "gpu_profile_valid_until": self.gpu_profile.registry_valid_until,
+                        "gpu_profile_registry_release": self.gpu_profile.registry_release,
+                        "gpu_profile_registry_digest": self.gpu_profile.registry_digest,
+                    }
                 self.registry.record_verdict(
                     result.target.hotkey,
                     result.attested,
@@ -648,8 +873,11 @@ class ConfidentialRuntime:
                     expected_revision=result.lifecycle_revision,
                     policy_registry_release=self.policy.registry_release,
                     policy_registry_digest=self.policy.registry_digest,
+                    **gpu_commit_authority,
                 )
             except LifecycleError:
+                if pending_gpu_claim is not None:
+                    self.gpu_identity_registry.rollback_claim(pending_gpu_claim)
                 outcomes[result.target.hotkey] = MinerOutcome(
                     result.target.hotkey,
                     result.endpoint,
@@ -657,14 +885,32 @@ class ConfidentialRuntime:
                     error="worker lifecycle changed during re-attestation",
                 )
                 continue
+            except BaseException:
+                if pending_gpu_claim is not None:
+                    self.gpu_identity_registry.rollback_claim(pending_gpu_claim)
+                raise
+            if pending_gpu_claim is not None:
+                # The lifecycle compare-and-swap is now accepted. Finalize the
+                # durable GPU claim only at this last admission boundary.
+                self.gpu_identity_registry.commit_claim(pending_gpu_claim)
+            score_eligible = True
+            if result.attested.tier is Tier.CC_GPU:
+                from cathedral.gpu import gpu_score_eligible
+
+                score_eligible = gpu_score_eligible(
+                    result.attested,
+                    profile=self.gpu_profile,
+                    policy=self.policy,
+                )
             self.ledger.add_attestation(
                 epoch_id,
                 result.target.hotkey,
                 verdict="VERIFIED",
-                tee_type="TDX",
-                workload="CPU",
+                tee_type=("TDX+GPU_CC" if result.attested.tier is Tier.CC_GPU else "TDX"),
+                workload=("GPU" if result.attested.tier is Tier.CC_GPU else "CPU"),
                 evidence_digest=result.evidence_digest,
                 policy_mode=result.attested.policy_mode or "compatibility",
+                score_eligible=score_eligible,
             )
             outcomes[result.target.hotkey] = MinerOutcome(
                 result.target.hotkey,
@@ -672,6 +918,7 @@ class ConfidentialRuntime:
                 "attested",
                 admitted=True,
                 assurance=result.attested.assurance,
+                component_audit=result.component_audit,
             )
             admitted.append(result)
         return sorted(admitted, key=lambda result: result.target.hotkey)
@@ -710,10 +957,25 @@ class ConfidentialRuntime:
         admitted: list[_AttestationResult],
         outcomes: dict[str, MinerOutcome],
     ) -> None:
-        lane = SatLane(namespace=f"source-epoch:{source_epoch}:attempt:{epoch_id}")
+        self._require_live_gpu_profile()
+        lane = SatLane(
+            namespace=f"source-epoch:{source_epoch}:attempt:{epoch_id}",
+            gpu_profile=self.gpu_profile,
+            gpu_policy=self.policy,
+        )
         issued: list[tuple[_AttestationResult, SatWorkItem]] = []
         for result in admitted:
             assert result.attested is not None
+            if not lane.qualify(result.attested):
+                outcomes[result.target.hotkey] = MinerOutcome(
+                    result.target.hotkey,
+                    result.endpoint,
+                    "tier_not_score_eligible",
+                    admitted=True,
+                    error="hardware tier is not enabled for SAT scoring",
+                    assurance=result.attested.assurance,
+                )
+                continue
             if not WORK_DISPATCH_POLICY.allows(result.attested.assurance):
                 outcomes[result.target.hotkey] = MinerOutcome(
                     result.target.hotkey,
@@ -732,16 +994,13 @@ class ConfidentialRuntime:
 
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
             futures = [
-                executor.submit(self._request_sat, result.client, item)
-                for result, item in issued
+                executor.submit(self._request_sat, result.client, item) for result, item in issued
             ]
             for (result, item), future in zip(issued, futures, strict=True):
                 certificate, error = future.result()
                 accepted = lane.verify(item, certificate) if certificate is not None else None
                 if accepted is None:
-                    assurance = _work_assurance(
-                        result.attested, item, certificate, passed=False
-                    )
+                    assurance = _work_assurance(result.attested, item, certificate, passed=False)
                     self._resolve_work(
                         epoch_id,
                         source_epoch,
@@ -761,9 +1020,7 @@ class ConfidentialRuntime:
                         assurance=assurance,
                     )
                     continue
-                assurance = _work_assurance(
-                    result.attested, item, certificate, passed=True
-                )
+                assurance = _work_assurance(result.attested, item, certificate, passed=True)
                 if not SCORE_ELIGIBILITY_POLICY.allows(assurance):
                     self._resolve_work(
                         epoch_id,
@@ -784,6 +1041,7 @@ class ConfidentialRuntime:
                         assurance=assurance,
                     )
                     continue
+                self._require_live_gpu_profile()
                 units = lane.score(result.target.hotkey, [accepted])
                 self._resolve_work(
                     epoch_id,
@@ -861,55 +1119,117 @@ class ConfidentialRuntime:
         if cancel_event is not None and cancel_event.is_set():
             return _AttestationResult(target, endpoint, error="reattestation cancelled")
         try:
+            remote_options = {
+                "bearer_token": target.bearer_token,
+                "timeout": self.config.miner_timeout_seconds,
+                "allow_insecure_http": self.config.allow_insecure_http_for_tests,
+            }
+            if self.config.expected_tier is Tier.CC_GPU:
+                remote_options["max_response_body"] = MAX_EVIDENCE_RESPONSE_BODY
             client = self.remote_factory(
                 endpoint,
                 target.hotkey,
-                bearer_token=target.bearer_token,
-                timeout=self.config.miner_timeout_seconds,
-                allow_insecure_http=self.config.allow_insecure_http_for_tests,
+                **remote_options,
             )
         except Exception as exc:
             return _AttestationResult(target, endpoint, error=_safe_error(exc))
 
         last_error = "attestation rejected"
+        last_error_category = "attestation_rejected"
         for _ in range(self.config.miner_attempts):
             if cancel_event is not None and cancel_event.is_set():
-                return _AttestationResult(
-                    target, endpoint, error="reattestation cancelled"
-                )
+                return _AttestationResult(target, endpoint, error="reattestation cancelled")
+            gpu_budget_reserved = False
             try:
                 nonce = self.nonce_factory()
                 if not isinstance(nonce, bytes) or len(nonce) != 32:
                     raise RuntimeError("nonce_factory must return exactly 32 bytes")
-                evidence = client.collect_evidence(nonce)
+                if self.config.expected_tier is Tier.CC_GPU:
+                    # The response body, decoded evidence, and expanded verifier
+                    # request coexist until composite verification finishes. Keep
+                    # the validator-wide memory reservation for that full lifetime,
+                    # including direct audit calls that bypass the worker pool.
+                    self._gpu_evidence_slots.acquire()
+                    gpu_budget_reserved = True
+                    evidences = client.collect_evidence_bundle(nonce)
+                    if (
+                        not isinstance(evidences, tuple)
+                        or len(evidences) != 2
+                        or {evidence.kind for evidence in evidences}
+                        != {EvidenceKind.TDX, EvidenceKind.GPU_CC}
+                    ):
+                        raise RuntimeError(
+                            "GPU runtime requires exact TDX and GPU evidence components"
+                        )
+                else:
+                    evidences = (client.collect_evidence(nonce),)
                 if cancel_event is not None and cancel_event.is_set():
-                    return _AttestationResult(
-                        target, endpoint, error="reattestation cancelled"
-                    )
-                if evidence.nonce != nonce:
+                    return _AttestationResult(target, endpoint, error="reattestation cancelled")
+                if any(evidence.nonce != nonce for evidence in evidences):
                     raise RuntimeError("evidence nonce mismatch")
-                if evidence.miner_hotkey != target.hotkey:
+                if any(evidence.miner_hotkey != target.hotkey for evidence in evidences):
                     raise RuntimeError("evidence hotkey mismatch")
-                if evidence.kind is not EvidenceKind.TDX:
-                    raise RuntimeError("evidence kind must be TDX")
-                verdict = self.verifier(evidence, nonce, self.policy)
-                if verdict is None:
-                    raise RuntimeError("TDX verification rejected")
-                if verdict.verification_status != "VERIFIED" or verdict.tier is not Tier.CC_CPU_TDX:
-                    raise RuntimeError("verdict must be exact VERIFIED CC_CPU_TDX")
+                tdx_evidence = next(
+                    (evidence for evidence in evidences if evidence.kind is EvidenceKind.TDX),
+                    None,
+                )
+                if tdx_evidence is None:
+                    raise RuntimeError("TDX evidence component is required")
+                if self.config.expected_tier is Tier.CC_GPU:
+                    from cathedral.gpu import verify_composite_gpu
+
+                    self._require_live_gpu_profile()
+                    gpu_evidence = next(
+                        evidence for evidence in evidences if evidence.kind is EvidenceKind.GPU_CC
+                    )
+                    composite = verify_composite_gpu(
+                        tdx_evidence,
+                        gpu_evidence,
+                        nonce,
+                        self.policy,
+                        self.gpu_profile,
+                        self.gpu_verifier,
+                    )
+                    self._require_live_gpu_profile()
+                    verdict = composite.attested
+                    evidence_digest = _evidence_bundle_digest(evidences)
+                    component_audit = MappingProxyType(
+                        {
+                            "bundle_evidence_digest": evidence_digest,
+                            "cpu": composite.cpu_audit,
+                            "gpu": composite.gpu_audit,
+                            "schema": "cathedral_composite_gpu_audit_v1",
+                            "status": "verified",
+                        }
+                    )
+                    gpu_component = composite.gpu_component
+                else:
+                    if len(evidences) != 1:
+                        raise RuntimeError("CPU runtime requires one TDX component")
+                    verdict = self.verifier(tdx_evidence, nonce, self.policy)
+                    if verdict is None:
+                        raise RuntimeError("TDX verification rejected")
+                    evidence_digest = _evidence_digest(tdx_evidence)
+                    component_audit = None
+                    gpu_component = None
+                if (
+                    verdict.verification_status != "VERIFIED"
+                    or verdict.tier is not self.config.expected_tier
+                ):
+                    raise RuntimeError("verdict does not match the requested hardware tier")
                 if not verdict.chip_id:
-                    raise RuntimeError("verified TDX evidence must identify a chip")
+                    raise RuntimeError("verified evidence must identify the hardware")
                 if not ATTESTATION_ADMISSION_POLICY.allows(verdict.assurance):
                     raise RuntimeError(
-                        "TDX verdict does not satisfy hardware and software admission claims"
+                        "verdict does not satisfy hardware and software admission claims"
                     )
-                if evidence.report_data_version == 2:
-                    binding = client.confirm_channel_binding(evidence)
+                if tdx_evidence.report_data_version == 2:
+                    binding = client.confirm_channel_binding(tdx_evidence)
                     if cancel_event is not None and cancel_event.is_set():
-                        return _AttestationResult(
-                            target, endpoint, error="reattestation cancelled"
-                        )
-                    if binding != evidence.channel_binding:
+                        return _AttestationResult(target, endpoint, error="reattestation cancelled")
+                    if binding != tdx_evidence.channel_binding or any(
+                        evidence.channel_binding != binding for evidence in evidences
+                    ):
                         raise RuntimeError("live endpoint key does not match attested binding")
                     assert verdict.assurance is not None
                     verdict = replace(
@@ -923,19 +1243,33 @@ class ConfidentialRuntime:
                 if self.config.production_mode and not WORK_DISPATCH_POLICY.allows(
                     verdict.assurance
                 ):
-                    raise RuntimeError(
-                        "production evidence requires a verified channel binding"
-                    )
+                    raise RuntimeError("production evidence requires a verified channel binding")
                 return _AttestationResult(
                     target,
                     endpoint,
                     attested=verdict,
-                    evidence_digest=_evidence_digest(evidence),
+                    evidence_digest=evidence_digest,
                     client=client,
+                    component_audit=component_audit,
+                    gpu_component=gpu_component,
                 )
             except Exception as exc:
                 last_error = _safe_error(exc)
-        return _AttestationResult(target, endpoint, error=last_error)
+                last_error_category = _safe_error_category(exc)
+            finally:
+                if gpu_budget_reserved:
+                    # Drop every local raw-evidence reference before another
+                    # caller can reserve the validator-wide memory budget.
+                    evidences = ()
+                    tdx_evidence = None
+                    gpu_evidence = None
+                    self._gpu_evidence_slots.release()
+        return _AttestationResult(
+            target,
+            endpoint,
+            error=last_error,
+            error_category=last_error_category,
+        )
 
     def _request_sat(
         self, client: MinerClient | None, item: SatWorkItem
@@ -1087,9 +1421,7 @@ def _validate_bearer_token(token: str | None, *, required: bool) -> None:
 def _evidence_digest(evidence: Evidence) -> str:
     digest = hashlib.sha256()
     binding = (
-        evidence.channel_binding.canonical_bytes()
-        if evidence.channel_binding is not None
-        else b""
+        evidence.channel_binding.canonical_bytes() if evidence.channel_binding is not None else b""
     )
     for value in (
         evidence.kind.value.encode("ascii"),
@@ -1107,6 +1439,26 @@ def _evidence_digest(evidence: Evidence) -> str:
     return digest.hexdigest()
 
 
+def _evidence_bundle_digest(evidences: tuple[Evidence, ...]) -> str:
+    digest = hashlib.sha256(b"cathedral-evidence-bundle-v1\0")
+    for evidence in sorted(evidences, key=lambda item: item.kind.value):
+        component = bytes.fromhex(_evidence_digest(evidence))
+        digest.update(evidence.kind.value.encode("ascii"))
+        digest.update(component)
+    return digest.hexdigest()
+
+
 def _safe_error(exc: BaseException) -> str:
     message = str(exc).strip()
     return message[:300] if message else type(exc).__name__
+
+
+def _safe_error_category(exc: BaseException) -> str:
+    category = getattr(exc, "category", None)
+    if (
+        isinstance(category, str)
+        and 1 <= len(category) <= 64
+        and all(character.isalnum() or character == "_" for character in category)
+    ):
+        return category
+    return "attestation_error"

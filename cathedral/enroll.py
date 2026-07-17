@@ -1399,6 +1399,8 @@ class RegistryStore:
         hotkey: str,
         *,
         error: str | None = None,
+        expected_generation: int | None = None,
+        expected_revision: int | None = None,
         maximum_attempts: int = 3,
         retry_base_seconds: int = 5,
         retry_maximum_seconds: int = 300,
@@ -1448,8 +1450,16 @@ class RegistryStore:
                 retry_maximum_seconds=retry_maximum_seconds,
                 retry_jitter_seconds=retry_jitter_seconds,
                 operator_detail=error,
-                expected_generation=current.generation,
-                expected_revision=current.revision,
+                expected_generation=(
+                    current.generation
+                    if expected_generation is None
+                    else expected_generation
+                ),
+                expected_revision=(
+                    current.revision
+                    if expected_revision is None
+                    else expected_revision
+                ),
                 connection=conn,
             )
 
@@ -1463,7 +1473,40 @@ class RegistryStore:
         expected_revision: int | None = None,
         policy_registry_release: int | None = None,
         policy_registry_digest: str | None = None,
+        gpu_profile_valid_from: datetime | None = None,
+        gpu_profile_valid_until: datetime | None = None,
+        gpu_profile_registry_release: int | None = None,
+        gpu_profile_registry_digest: str | None = None,
     ) -> None:
+        gpu_profile_values = (
+            gpu_profile_valid_from,
+            gpu_profile_valid_until,
+            gpu_profile_registry_release,
+            gpu_profile_registry_digest,
+        )
+        if any(value is not None for value in gpu_profile_values):
+            if any(value is None for value in gpu_profile_values):
+                raise LifecycleError("GPU profile commit authority is incomplete")
+            assert gpu_profile_valid_from is not None
+            assert gpu_profile_valid_until is not None
+            if (
+                not isinstance(gpu_profile_valid_from, datetime)
+                or not isinstance(gpu_profile_valid_until, datetime)
+                or gpu_profile_valid_from.tzinfo is None
+                or gpu_profile_valid_from.utcoffset() != timedelta(0)
+                or gpu_profile_valid_until.tzinfo is None
+                or gpu_profile_valid_until.utcoffset() != timedelta(0)
+                or gpu_profile_valid_from >= gpu_profile_valid_until
+                or isinstance(gpu_profile_registry_release, bool)
+                or not isinstance(gpu_profile_registry_release, int)
+                or gpu_profile_registry_release <= 0
+                or not isinstance(gpu_profile_registry_digest, str)
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", gpu_profile_registry_digest
+                )
+                is None
+            ):
+                raise LifecycleError("GPU profile commit authority is invalid")
         ts = now_iso()
         if attested is None:
             status = "FAILED"
@@ -1493,6 +1536,15 @@ class RegistryStore:
         with self._lifecycle_lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             lifecycle_when = self._lifecycle_now()
+            if any(value is not None for value in gpu_profile_values) and (
+                status != "VERIFIED"
+                or not gpu_profile_valid_from <= lifecycle_when < gpu_profile_valid_until
+                or policy_registry_release != gpu_profile_registry_release
+                or policy_registry_digest != gpu_profile_registry_digest
+            ):
+                raise LifecycleError(
+                    "GPU profile is not active at lifecycle commit time"
+                )
             identity_conflict = False
             if status == "VERIFIED" and chip_id is not None:
                 conflict = self._chip_rotation_owner(conn, chip_id, hotkey)

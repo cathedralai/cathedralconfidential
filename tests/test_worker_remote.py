@@ -31,10 +31,16 @@ from cathedral.common import (
     ChannelBindingType,
     Evidence,
     EvidenceKind,
+    MAX_CPU_EVIDENCE_RESPONSE_BODY,
 )
 from cathedral.lanes.sat import SatLane, _canonical_instance, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
-from cathedral.remote import RemoteError, RemoteMiner as _RemoteMiner
+from cathedral.remote import (
+    MAX_RESPONSE_BODY,
+    MAX_SAT_RESPONSE_BODY,
+    RemoteError,
+    RemoteMiner as _RemoteMiner,
+)
 from cathedral.worker import WorkerServer as _WorkerServer
 
 # ---------------------------------------------------------------------------
@@ -54,6 +60,10 @@ def WorkerServer(*args, **kwargs):
 def RemoteMiner(endpoint, hotkey, **kwargs):
     kwargs.setdefault("allow_insecure_http", True)
     return _RemoteMiner(endpoint, hotkey, **kwargs)
+
+
+def test_remote_default_retains_cpu_specific_response_limit():
+    assert MAX_RESPONSE_BODY == MAX_CPU_EVIDENCE_RESPONSE_BODY == 128 * 1024
 
 
 def _fake_evidence(nonce: bytes, hotkey: str) -> Evidence:
@@ -541,6 +551,39 @@ def test_oversized_response_rejected():
             remote.fetch_evidence(os.urandom(32))
     finally:
         fake_srv.shutdown()
+
+
+def test_sat_response_keeps_small_cap_when_evidence_limit_is_large():
+    """A malicious SAT peer cannot consume the evidence response budget."""
+    item = _make_sat_item()
+
+    class _OversizedSatHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = b"{" + b"x" * MAX_SAT_RESPONSE_BODY + b"}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+
+    server = HTTPServer(("127.0.0.1", 0), _OversizedSatHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        remote = RemoteMiner(
+            f"http://127.0.0.1:{server.server_address[1]}",
+            HOTKEY,
+        )
+        with pytest.raises(RemoteError, match="body limit"):
+            remote.do_sat_work(item)
+    finally:
+        server.shutdown()
 
 
 def test_actual_response_body_over_cap_rejected_without_content_length():

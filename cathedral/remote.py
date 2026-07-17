@@ -13,11 +13,22 @@ import urllib.request
 from typing import Any, Callable
 
 from cathedral.channel import ChannelBindingError, tls_spki_binding
-from cathedral.common import ChannelBinding, ChannelBindingType, Evidence, EvidenceKind
+from cathedral.common import (
+    ChannelBinding,
+    ChannelBindingType,
+    Evidence,
+    EvidenceKind,
+    MAX_COMPOSITE_JWT_BYTES,
+    MAX_CPU_EVIDENCE_RESPONSE_BODY,
+    MAX_EVIDENCE_CERTIFICATE_BYTES,
+    MAX_EVIDENCE_CERTIFICATES,
+    MAX_EVIDENCE_QUOTE_BYTES,
+)
 from cathedral.lanes.sat import _compute_challenge_id
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
-MAX_RESPONSE_BODY: int = 128 * 1024
+MAX_RESPONSE_BODY: int = MAX_CPU_EVIDENCE_RESPONSE_BODY
+MAX_SAT_RESPONSE_BODY: int = 64 * 1024
 MAX_HOTKEY_LENGTH: int = 256
 MAX_N_VARS: int = 4096
 MAX_CLAUSES: int = 8192
@@ -31,6 +42,10 @@ _EVIDENCE_RESPONSE_KEYS = frozenset(
 )
 _EVIDENCE_V2_RESPONSE_KEYS = _EVIDENCE_RESPONSE_KEYS | frozenset(
     {"report_data_version", "channel_binding_type", "channel_binding_digest_hex"}
+)
+_EVIDENCE_BUNDLE_RESPONSE_KEYS = frozenset({"evidence"})
+_EVIDENCE_BUNDLE_ITEM_KEYS = _EVIDENCE_V2_RESPONSE_KEYS | frozenset(
+    {"composite_jwt"}
 )
 _SAT_RESPONSE_KEYS = frozenset(
     {"satisfiable", "assignment", "work_units", "challenge_id", "assigned_hotkey"}
@@ -121,6 +136,17 @@ class RemoteMiner:
         return self.fetch_evidence(nonce)
 
     def fetch_evidence(self, nonce: bytes) -> Evidence:
+        evidences = self.fetch_evidence_bundle(nonce)
+        if len(evidences) != 1:
+            self._pending_binding = None
+            raise RemoteError("single-component evidence was requested")
+        return evidences[0]
+
+    def collect_evidence_bundle(self, nonce: bytes) -> tuple[Evidence, ...]:
+        """Collect a bounded evidence bundle for composite admission."""
+        return self.fetch_evidence_bundle(nonce)
+
+    def fetch_evidence_bundle(self, nonce: bytes) -> tuple[Evidence, ...]:
         if not isinstance(nonce, bytes) or len(nonce) != 32:
             raise RemoteError("nonce must be exactly 32 bytes")
         self._pending_binding = None
@@ -139,57 +165,53 @@ class RemoteMiner:
                 expected_binding=None,
                 include_auth=False,
             )
-            _check_exact_keys(
-                response, _EVIDENCE_V2_RESPONSE_KEYS, "evidence response"
-            )
-            response_binding = _response_channel_binding(response)
-            if response.get("report_data_version") != 2:
-                raise RemoteError("evidence response has invalid report data version")
-            if response_binding != observed_binding:
-                raise RemoteError("evidence response channel binding mismatch")
-            self._pending_binding = observed_binding
         else:
             response = self._post_http(
                 "/v1/evidence",
                 {"nonce_hex": nonce.hex(), "assigned_hotkey": self._hotkey},
                 include_auth=False,
             )
-            _check_exact_keys(response, _EVIDENCE_RESPONSE_KEYS, "evidence response")
-            response_binding = None
+        if set(response) == _EVIDENCE_BUNDLE_RESPONSE_KEYS:
+            if self._scheme != "https" or not isinstance(response["evidence"], list):
+                raise RemoteError("evidence bundle has invalid schema")
+            items = response["evidence"]
+            if len(items) != 2 or any(not isinstance(item, dict) for item in items):
+                raise RemoteError("evidence bundle has invalid component count")
+            evidences = tuple(
+                _evidence_from_response(
+                    item,
+                    nonce,
+                    self._hotkey,
+                    observed_binding,
+                    bundle_item=True,
+                )
+                for item in items
+            )
+            if {evidence.kind for evidence in evidences} != {
+                EvidenceKind.TDX,
+                EvidenceKind.GPU_CC,
+            }:
+                raise RemoteError("evidence bundle has invalid component kinds")
+            self._pending_binding = observed_binding
+            return evidences
 
-        if response["nonce_hex"] != nonce.hex():
-            raise RemoteError("evidence response nonce mismatch")
-        if response["assigned_hotkey"] != self._hotkey:
-            raise RemoteError("evidence response hotkey mismatch")
-
-        kind_raw = response["kind"]
-        quote_raw = response["quote_hex"]
-        chain_raw = response["cert_chain_hex"]
-        if not isinstance(kind_raw, str):
-            raise RemoteError("evidence response has invalid kind")
-        if not _is_hex(quote_raw) or not quote_raw:
-            raise RemoteError("evidence response has invalid quote")
-        if not isinstance(chain_raw, list) or len(chain_raw) > 16:
-            raise RemoteError("evidence response has invalid certificate chain")
-        if any(not _is_hex(value) or not value for value in chain_raw):
-            raise RemoteError("evidence response has invalid certificate chain")
-
-        try:
-            kind = EvidenceKind(kind_raw)
-            quote = bytes.fromhex(quote_raw)
-            cert_chain = [bytes.fromhex(value) for value in chain_raw]
-        except (TypeError, ValueError):
-            raise RemoteError("evidence response is invalid") from None
-
-        return Evidence(
-            kind=kind,
-            quote=quote,
-            nonce=nonce,
-            miner_hotkey=self._hotkey,
-            cert_chain=cert_chain,
-            report_data_version=2 if response_binding is not None else 1,
-            channel_binding=response_binding,
+        expected = (
+            _EVIDENCE_V2_RESPONSE_KEYS
+            if self._scheme == "https"
+            else _EVIDENCE_RESPONSE_KEYS
         )
+        _check_exact_keys(response, expected, "evidence response")
+        binding = observed_binding if self._scheme == "https" else None
+        evidence = _evidence_from_response(
+            response,
+            nonce,
+            self._hotkey,
+            binding,
+            bundle_item=False,
+        )
+        if binding is not None:
+            self._pending_binding = binding
+        return (evidence,)
 
     def confirm_channel_binding(self, evidence: Evidence) -> ChannelBinding:
         """Promote the live key after the caller has verified this exact quote.
@@ -230,10 +252,14 @@ class RemoteMiner:
                 lambda _binding: payload,
                 expected_binding=self._trusted_binding,
                 include_auth=True,
+                response_body_limit=MAX_SAT_RESPONSE_BODY,
             )
         else:
             response = self._post_http(
-                "/v1/sat-work", payload, include_auth=True
+                "/v1/sat-work",
+                payload,
+                include_auth=True,
+                response_body_limit=MAX_SAT_RESPONSE_BODY,
             )
         _check_exact_keys(response, _SAT_RESPONSE_KEYS, "sat-work response")
 
@@ -268,8 +294,19 @@ class RemoteMiner:
         )
 
     def _post_http(
-        self, path: str, payload: dict[str, Any], *, include_auth: bool
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        include_auth: bool,
+        response_body_limit: int | None = None,
     ) -> dict[str, Any]:
+        response_body_limit = min(
+            self._max_response_body,
+            self._max_response_body
+            if response_body_limit is None
+            else response_body_limit,
+        )
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
             self._endpoint + path,
@@ -286,10 +323,10 @@ class RemoteMiner:
                 if declared is not None:
                     if not declared.isascii() or not declared.isdecimal():
                         raise RemoteError("worker response has invalid length")
-                    if int(declared) > self._max_response_body:
+                    if int(declared) > response_body_limit:
                         raise RemoteError("worker response exceeds body limit")
-                raw = response.read(self._max_response_body + 1)
-                if len(raw) > self._max_response_body:
+                raw = response.read(response_body_limit + 1)
+                if len(raw) > response_body_limit:
                     raise RemoteError("worker response exceeds body limit")
         except RemoteError:
             raise
@@ -323,7 +360,14 @@ class RemoteMiner:
         *,
         expected_binding: ChannelBinding | None,
         include_auth: bool,
+        response_body_limit: int | None = None,
     ) -> tuple[dict[str, Any], ChannelBinding]:
+        response_body_limit = min(
+            self._max_response_body,
+            self._max_response_body
+            if response_body_limit is None
+            else response_body_limit,
+        )
         connection = http.client.HTTPSConnection(
             self._host,
             self._port,
@@ -355,7 +399,7 @@ class RemoteMiner:
                 raise RemoteError("worker redirect rejected")
             if response.status < 200 or response.status >= 300:
                 raise RemoteError(f"worker returned HTTP {response.status}")
-            raw = _read_response(response, self._max_response_body)
+            raw = _read_response(response, response_body_limit)
         except RemoteError:
             raise
         except (socket.timeout, TimeoutError):
@@ -403,6 +447,82 @@ def _response_channel_binding(response: dict[str, Any]) -> ChannelBinding:
         return ChannelBinding(binding_type, digest)
     except (KeyError, TypeError, ValueError):
         raise RemoteError("evidence response has invalid channel binding") from None
+
+
+def _evidence_from_response(
+    response: dict[str, Any],
+    nonce: bytes,
+    hotkey: str,
+    expected_binding: ChannelBinding | None,
+    *,
+    bundle_item: bool,
+) -> Evidence:
+    expected_keys = (
+        _EVIDENCE_BUNDLE_ITEM_KEYS
+        if bundle_item
+        else (
+            _EVIDENCE_V2_RESPONSE_KEYS
+            if expected_binding is not None
+            else _EVIDENCE_RESPONSE_KEYS
+        )
+    )
+    _check_exact_keys(response, expected_keys, "evidence component")
+    if response["nonce_hex"] != nonce.hex():
+        raise RemoteError("evidence response nonce mismatch")
+    if response["assigned_hotkey"] != hotkey:
+        raise RemoteError("evidence response hotkey mismatch")
+    if expected_binding is not None:
+        if response.get("report_data_version") != 2:
+            raise RemoteError("evidence response has invalid report data version")
+        if _response_channel_binding(response) != expected_binding:
+            raise RemoteError("evidence response channel binding mismatch")
+    kind_raw = response["kind"]
+    quote_raw = response["quote_hex"]
+    chain_raw = response["cert_chain_hex"]
+    jwt = response.get("composite_jwt")
+    if (
+        not isinstance(kind_raw, str)
+        or not _is_hex(quote_raw)
+        or not quote_raw
+        or len(quote_raw) > 2 * MAX_EVIDENCE_QUOTE_BYTES
+    ):
+        raise RemoteError("evidence response has invalid quote or kind")
+    if (
+        not isinstance(chain_raw, list)
+        or len(chain_raw) > MAX_EVIDENCE_CERTIFICATES
+    ):
+        raise RemoteError("evidence response has invalid certificate chain")
+    if any(
+        not _is_hex(value)
+        or not value
+        or len(value) > 2 * MAX_EVIDENCE_CERTIFICATE_BYTES
+        for value in chain_raw
+    ):
+        raise RemoteError("evidence response has invalid certificate chain")
+    if jwt is not None and (
+        not isinstance(jwt, str)
+        or not jwt
+        or not jwt.isascii()
+        or len(jwt) > MAX_COMPOSITE_JWT_BYTES
+        or any(ord(character) < 0x20 for character in jwt)
+    ):
+        raise RemoteError("evidence response has invalid composite JWT")
+    try:
+        kind = EvidenceKind(kind_raw)
+        quote = bytes.fromhex(quote_raw)
+        cert_chain = [bytes.fromhex(value) for value in chain_raw]
+    except (TypeError, ValueError):
+        raise RemoteError("evidence response is invalid") from None
+    return Evidence(
+        kind=kind,
+        quote=quote,
+        nonce=nonce,
+        miner_hotkey=hotkey,
+        cert_chain=cert_chain,
+        composite_jwt=jwt,
+        report_data_version=2 if expected_binding is not None else 1,
+        channel_binding=expected_binding,
+    )
 
 
 def _validate_work_item(item: SatWorkItem) -> None:

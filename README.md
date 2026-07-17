@@ -70,7 +70,9 @@ Future product direction, not yet scored on chain:
 
 - Customer jobs, long-running agents, inference, and evaluation as scored
   workloads.
-- Confidential GPU workloads (NVIDIA H100/H200 in CC mode); B200-class later.
+- Confidential GPU workloads (NVIDIA H100/H200 in CC mode) now have a
+  fail-closed, hardware-free composite-attestation foundation. Live hardware
+  acceptance and scoring remain disabled; B200-class remains later work.
 - AMD SEV-SNP as a second CPU platform. Quote parsing and cryptographic
   verification exist in-repo; runtime scoring is not yet enabled.
 
@@ -80,7 +82,7 @@ Future product direction, not yet scored on chain:
 |---|---|
 | Intel TDX CPU | Proven launch path |
 | AMD SEV-SNP CPU | Planned second platform (crypto exists, scoring not enabled) |
-| NVIDIA H100/H200 CC | Planned |
+| NVIDIA H100/H200 CC | Audit-only foundation; live acceptance pending |
 | NVIDIA B200-class | Planned |
 
 Attestation grants admission. Emissions come from verified delivery. Validators
@@ -125,6 +127,7 @@ the real `verify()` interface; the real Intel TDX path runs on hardware (see
 - [`docs/LIFECYCLE.md`](docs/LIFECYCLE.md) - continuous re-attestation, worker states, and retry behavior
 - [`docs/WORKLOAD_ADMISSION.md`](docs/WORKLOAD_ADMISSION.md) - immutable signed workload admission contract
 - [`docs/KEY_RELEASE.md`](docs/KEY_RELEASE.md) - attestation-gated encrypted data-key release contract
+- [`docs/GPU_ATTESTATION.md`](docs/GPU_ATTESTATION.md) - composite TDX plus confidential-GPU evidence and rollout gates
 - [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path
 - [`HANDOFF.md`](HANDOFF.md) - commissioning and test handoff
 - [`RUNTEST.md`](RUNTEST.md) - test commands

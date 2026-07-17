@@ -10,6 +10,8 @@ from __future__ import annotations
 import base64
 import argparse
 import json
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -56,6 +58,83 @@ def test_policy_from_legacy_args_defaults_to_visible_compatibility_mode():
 
     assert policy.tdx_strict is False
     assert policy.tdx_allowed_tcb_statuses == {"UpToDate"}
+
+
+def test_prober_cli_wires_signed_gpu_configuration(monkeypatch, tmp_path):
+    policy = Policy(
+        registry_release=7,
+        registry_digest="sha256:" + "7" * 64,
+    )
+    snapshot = object()
+    profile = object()
+    gpu_verifier = object()
+    identity_registry = object()
+    captured = []
+
+    monkeypatch.setattr(
+        "cathedral.cli._verified_registry_snapshot_and_policy",
+        lambda *_args, **_kwargs: (policy, snapshot),
+    )
+    monkeypatch.setattr(
+        "cathedral.cli._load_gpu_identity_key",
+        lambda *_args, **_kwargs: b"i" * 32,
+    )
+    monkeypatch.setattr(
+        "cathedral.gpu.gpu_profile_from_registry",
+        lambda received, profile_id: profile
+        if (received, profile_id) == (snapshot, "gpu-profile")
+        else None,
+    )
+    monkeypatch.setattr(
+        "cathedral.gpu.gpu_verifier_from_env",
+        lambda **_kwargs: gpu_verifier,
+    )
+    monkeypatch.setattr(
+        "cathedral.gpu.GpuIdentityRegistry",
+        lambda *_args, **_kwargs: identity_registry,
+    )
+    monkeypatch.setattr(
+        prober_module,
+        "probe_once",
+        lambda store, received_policy, **kwargs: captured.append(
+            (store, received_policy, kwargs)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cathedral-prober",
+            "--db",
+            str(tmp_path / "registry.sqlite"),
+            "--once",
+            "--policy-registry",
+            "registry.json",
+            "--policy-registry-keys",
+            "keys.json",
+            "--policy-registry-state",
+            str(tmp_path / "policy-state.sqlite"),
+            "--gpu-profile-id",
+            "gpu-profile",
+            "--gpu-identity-db",
+            str(tmp_path / "gpu-identities.sqlite"),
+            "--gpu-identity-key-file",
+            "gpu-identity.key",
+            "--gpu-identity-anchor-file",
+            str(tmp_path / "gpu-generation.anchor"),
+        ],
+    )
+
+    prober_module.main()
+
+    assert len(captured) == 1
+    _store, received_policy, kwargs = captured[0]
+    assert received_policy is policy
+    assert kwargs["gpu_profile"] is profile
+    assert kwargs["gpu_verifier"] is gpu_verifier
+    assert kwargs["gpu_identity_registry"] is identity_registry
+    assert kwargs["expected_tier"] is Tier.CC_GPU
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +467,28 @@ def test_production_probe_channel_mismatch_records_failed(monkeypatch, tmp_path)
     probe_once(store, Policy(), production_mode=True)
 
     assert store.board()["miners"][0]["verification_status"] == "FAILED"
+
+
+def test_prober_console_once_exits_nonzero_when_due_target_fails(tmp_path):
+    database = tmp_path / "registry.sqlite"
+    store = RegistryStore(str(database))
+    store.enroll(TdxMiner.hotkey, "http://127.0.0.1:9")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cathedral.prober",
+            "--db",
+            str(database),
+            "--once",
+        ],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode != 0
 
 
 # ---------------------------------------------------------------------------

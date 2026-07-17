@@ -241,12 +241,50 @@ def _collect_configfs_tsm_quote(report_data_bytes: bytes, *, root: Path) -> tupl
         report_dir.rmdir()
 
 
-def collect_gpu_cc(nonce: bytes, hotkey: str) -> Evidence:
-    """NVIDIA GPU attestation report via NVML / nvtrust.
+def collect_gpu_cc(
+    nonce: bytes,
+    hotkey: str,
+    *,
+    channel_binding: ChannelBinding,
+    report_data_version: int = 2,
+) -> Evidence:
+    """Collect bounded NVIDIA evidence for the independent v2 GPU challenge.
 
-    TODO(phase1): pull the GPU attestation report; compose with the host CPU
-    TEE quote via Intel Trust Authority into a single JWT (docs/DESIGN.md §6).
+    ``CATHEDRAL_GPU_COLLECT_CMD`` names a shell-free external collector. The
+    result remains a GPU component; only composite TDX plus GPU verification can
+    produce a confidential-GPU admission verdict.
     """
 
-    _ = EvidenceKind.GPU_CC
-    raise NotImplementedError("GPU CC collector — Phase 1, needs a CC-capable H100/H200")
+    if report_data_version != 2:
+        raise ValueError("confidential GPU evidence requires report data v2")
+
+    from cathedral.gpu import collect_gpu_from_env
+
+    return collect_gpu_from_env(nonce, hotkey, channel_binding)
+
+
+def collect_tdx_gpu(
+    nonce: bytes,
+    hotkey: str,
+    *,
+    channel_binding: ChannelBinding,
+    report_data_version: int = 2,
+) -> tuple[Evidence, Evidence]:
+    """Collect the first supported two-component confidential-GPU bundle."""
+
+    if report_data_version != 2:
+        raise ValueError("composite GPU evidence requires report data v2")
+    return (
+        collect_tdx(
+            nonce,
+            hotkey,
+            channel_binding=channel_binding,
+            report_data_version=2,
+        ),
+        collect_gpu_cc(
+            nonce,
+            hotkey,
+            channel_binding=channel_binding,
+            report_data_version=2,
+        ),
+    )

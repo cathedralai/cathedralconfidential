@@ -18,6 +18,7 @@ dev = ["pytest>=8.0", "substrate-interface>=1.7.0"]
 [project.scripts]
 cathedral = "cathedral.cli:main"
 cathedral-census = "cathedral.census:main"
+cathedral-prober = "cathedral.prober:main"
 # Operator aliases for the worker and score-publication runtime.
 cathedral-validator = "cathedral.neuron.validator:main"
 cathedral-miner = "cathedral.neuron.miner:main"

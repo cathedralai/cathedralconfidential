@@ -380,6 +380,24 @@ def test_child_holding_verifier_pipes_cannot_defeat_timeout(tmp_path: Path):
     assert time.monotonic() - started < 1
 
 
+def test_child_not_reading_large_stdin_cannot_defeat_timeout(tmp_path: Path):
+    helper = tmp_path / "does-not-read.py"
+    helper.write_text("import time; time.sleep(2)\n", encoding="utf-8")
+    verifier = ExternalSignatureVerifier(
+        ExternalVerifierConfig(
+            (str(Path(sys.executable).resolve()), str(helper)),
+            timeout_seconds=0.1,
+        )
+    )
+    started = time.monotonic()
+
+    with pytest.raises(SignatureVerifierError) as raised:
+        verifier._invoke({"payload": "x" * (4 * 1024 * 1024)})
+
+    assert raised.value.category == "timeout"
+    assert time.monotonic() - started < 1
+
+
 def test_external_verifier_wrong_signer_fails_exact_request_binding(tmp_path: Path):
     controller = WorkloadAdmissionController(
         _policy(),

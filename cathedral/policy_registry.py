@@ -10,7 +10,7 @@ import re
 import sqlite3
 import threading
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -286,6 +286,11 @@ class PolicyRegistrySnapshot:
     receipt_signing_keys: tuple[ReceiptVerificationKey, ...]
     metadata: Mapping[str, object]
     canonical_document: bytes
+    _signature_verified: bool = field(default=False, init=False, repr=False, compare=False)
+
+    @property
+    def signature_verified(self) -> bool:
+        return self._signature_verified
 
     def receipt_key(self, key_id: str) -> ReceiptVerificationKey | None:
         return next(
@@ -593,7 +598,7 @@ def verify_registry(
     ):
         raise PolicyRegistryError("receipt replacement key must exist in the registry")
     canonical_document = canonical_json(document)
-    return PolicyRegistrySnapshot(
+    snapshot = PolicyRegistrySnapshot(
         release=release,
         generated_at=generated,
         valid_from=valid_from,
@@ -605,6 +610,8 @@ def verify_registry(
         metadata=_validate_metadata(document["metadata"], "registry metadata"),
         canonical_document=canonical_document,
     )
+    object.__setattr__(snapshot, "_signature_verified", True)
+    return snapshot
 
 
 def sign_registry(

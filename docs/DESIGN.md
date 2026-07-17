@@ -63,9 +63,10 @@ Two products, two *different* guarantees. Keeping them distinct is a correctness
 ## 3. Two supply chains
 
 **Subnet supply = confidential hardware only.** Admission requires a valid TEE
-attestation. Intel TDX CPU is the proven path today. AMD SEV-SNP and NVIDIA CC
-GPU evidence classes are planned platform extensions and do not earn in the
-current runtime. Emissions bootstrap attested confidential hardware; delegated
+attestation. Intel TDX CPU is the proven path today. AMD SEV-SNP remains a
+planned runtime extension. NVIDIA CC has a hardware-free, audit-only composite
+foundation, but has not passed live acceptance and does not earn in the current
+runtime. Emissions bootstrap attested confidential hardware; delegated
 commodity compute in the future Core product is not itself subnet supply. The
 validator accepts only vendor-backed evidence that satisfies current nonce,
 measurement, TCB, platform, and hotkey-binding policy.
@@ -191,9 +192,27 @@ Miners cannot choose their own credit. Every work unit's difficulty and credit i
 
 **Validator-side verifier** does policy; vendors do the crypto:
 - AMD KDS cert chains, Intel DCAP / Trust Authority, NVIDIA NRAS/nvtrust
-- **Composite attestation** (Sandbox on CC-GPU): Intel Trust Authority binds the CPU TDX quote and the GPU CC evidence into a single JWT
+- **Composite attestation** (Sandbox on CC-GPU): the first profile requires a
+  TDX component and NVIDIA GPU evidence under the same fresh nonce, hotkey, and
+  protected-channel binding. A vendor aggregation JWT is optional, but never
+  replaces the typed component and profile checks.
 - Policy engine: allowed measurements, minimum TCB, allowed firmware/driver versions
-- **Sybil defense is free:** SNP `CHIP_ID`, TDX platform ID, and certified GPU UUIDs live in the evidence — one physical machine backs exactly one UID; dedup is a dictionary, not a subsystem.
+- **GPU identity defense:** every expected certified GPU UUID participates in
+  a two-phase, durable device-to-worker claim finalized only after live-channel
+  and lifecycle admission. Rejected attempts roll back their pending claim. The
+  public signed profile contains domain-separated identity digests; the durable
+  registry stores keyed pseudonyms, not raw device or worker identifiers, and
+  refuses an identity-key mismatch. Reported interconnect topology is audit-only
+  until its evidence source is explicitly authenticated. A scored canary holds
+  an exclusive temporary GPU reservation and
+  is compared by GPU identity set, independently of its composite CPU+GPU ID,
+  so moving the same GPU to a different TDX host cannot satisfy both roles.
+  Crash-left worker claims are conservatively committed, while crash-left
+  canary reservations are released, through an identity-key-authenticated
+  recovery command that records a durable audit event. The external GPU
+  verifier is one root-owned, statically linked x86-64 ELF executable with no
+  arguments, an immutable
+  root-owned artifact path closure, and `/` as its working directory.
 
 The guest instruction is `TDG.MR.REPORT`, not `SEAMREPORT`. An SM-latency GPU
 probe is a fingerprint or scoring heuristic, never attestation: it has no

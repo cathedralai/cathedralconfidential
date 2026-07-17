@@ -20,12 +20,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
 from cathedral.attest import collect_tdx
-from cathedral.common import ChannelBinding, ChannelBindingType, Evidence
+from cathedral.common import (
+    ChannelBinding,
+    ChannelBindingType,
+    Evidence,
+    EvidenceKind,
+    MAX_COMPOSITE_JWT_BYTES,
+    MAX_EVIDENCE_CERTIFICATE_BYTES,
+    MAX_EVIDENCE_CERTIFICATES,
+    MAX_EVIDENCE_COMPONENTS,
+    MAX_EVIDENCE_QUOTE_BYTES,
+    MAX_EVIDENCE_RESPONSE_BODY,
+)
 from cathedral.lanes.sat import _canonical_instance, _compute_challenge_id, solve_sat
 from cathedral.lanes.sat_types import SatInstance
 
 MAX_REQUEST_BODY: int = 64 * 1024
-MAX_RESPONSE_BODY: int = 64 * 1024
+MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
 MAX_CONCURRENT: int = 1
 MAX_HOTKEY_LENGTH: int = 256
 MAX_N_VARS: int = 4096
@@ -45,11 +56,36 @@ _DECIMAL_RE = re.compile(r"[0-9]+")
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 
+def _evidence_fits_transport(evidence: Evidence) -> bool:
+    jwt = evidence.composite_jwt
+    return (
+        isinstance(evidence.quote, bytes)
+        and 0 < len(evidence.quote) <= MAX_EVIDENCE_QUOTE_BYTES
+        and isinstance(evidence.cert_chain, list)
+        and len(evidence.cert_chain) <= MAX_EVIDENCE_CERTIFICATES
+        and all(
+            isinstance(certificate, bytes)
+            and 0 < len(certificate) <= MAX_EVIDENCE_CERTIFICATE_BYTES
+            for certificate in evidence.cert_chain
+        )
+        and (
+            jwt is None
+            or (
+                isinstance(jwt, str)
+                and bool(jwt)
+                and jwt.isascii()
+                and len(jwt) <= MAX_COMPOSITE_JWT_BYTES
+                and all(ord(character) >= 0x20 for character in jwt)
+            )
+        )
+    )
+
+
 def _make_handler(
     semaphore: threading.Semaphore,
     configured_hotkey: str,
     bearer_token: str | None,
-    evidence_collector: Callable[..., Evidence],
+    evidence_collector: Callable[..., Evidence | tuple[Evidence, ...] | list[Evidence]],
     configured_channel_binding: ChannelBinding | None,
     max_body: int,
     max_response_body: int,
@@ -207,44 +243,74 @@ def _make_handler(
 
             try:
                 if report_data_version == 2:
-                    evidence = evidence_collector(
+                    collected = evidence_collector(
                         nonce,
                         configured_hotkey,
                         channel_binding=configured_channel_binding,
                         report_data_version=2,
                     )
                 else:
-                    evidence = evidence_collector(nonce, configured_hotkey)
+                    collected = evidence_collector(nonce, configured_hotkey)
             except Exception:
                 self._send_json(500, {"error": "evidence collection failed"})
                 return
-            if evidence.nonce != nonce or evidence.miner_hotkey != configured_hotkey:
+            if isinstance(collected, Evidence):
+                evidences = (collected,)
+            elif isinstance(collected, (tuple, list)) and all(
+                isinstance(item, Evidence) for item in collected
+            ):
+                evidences = tuple(collected)
+            else:
+                self._send_json(500, {"error": "evidence collection failed"})
+                return
+            if (
+                not 1 <= len(evidences) <= MAX_EVIDENCE_COMPONENTS
+                or any(
+                    evidence.nonce != nonce
+                    or evidence.miner_hotkey != configured_hotkey
+                    or not _evidence_fits_transport(evidence)
+                    for evidence in evidences
+                )
+                or (
+                    len(evidences) == 2
+                    and {evidence.kind for evidence in evidences}
+                    != {EvidenceKind.TDX, EvidenceKind.GPU_CC}
+                )
+            ):
                 self._send_json(500, {"error": "evidence collection failed"})
                 return
 
-            response: dict[str, object] = {
-                "kind": evidence.kind.value,
-                "quote_hex": evidence.quote.hex(),
-                "nonce_hex": nonce.hex(),
-                "assigned_hotkey": configured_hotkey,
-                "cert_chain_hex": [cert.hex() for cert in evidence.cert_chain],
-            }
+            response_items: list[dict[str, object]] = []
+            for evidence in evidences:
+                item: dict[str, object] = {
+                    "kind": evidence.kind.value,
+                    "quote_hex": evidence.quote.hex(),
+                    "nonce_hex": nonce.hex(),
+                    "assigned_hotkey": configured_hotkey,
+                    "cert_chain_hex": [cert.hex() for cert in evidence.cert_chain],
+                }
+                response_items.append(item)
             if report_data_version == 2:
-                if (
+                if any(
                     evidence.report_data_version != 2
                     or evidence.channel_binding != configured_channel_binding
+                    for evidence in evidences
                 ):
                     self._send_json(500, {"error": "evidence collection failed"})
                     return
                 assert configured_channel_binding is not None
-                response.update(
-                    {
+                for evidence, item in zip(evidences, response_items, strict=True):
+                    item.update({
                         "report_data_version": 2,
                         "channel_binding_type": configured_channel_binding.binding_type.value,
                         "channel_binding_digest_hex": configured_channel_binding.digest.hex(),
-                    }
-                )
-            self._send_json(200, response)
+                    })
+                    if len(evidences) > 1:
+                        item["composite_jwt"] = evidence.composite_jwt
+            if len(response_items) == 1:
+                self._send_json(200, response_items[0])
+            else:
+                self._send_json(200, {"evidence": response_items})
 
         def _handle_sat_work(self, body: dict[str, object]) -> None:
             if set(body) != _SAT_REQUEST_KEYS:
@@ -344,7 +410,10 @@ class WorkerServer:
         *,
         configured_hotkey: str,
         bearer_token: str | None = None,
-        evidence_collector: Callable[..., Evidence] | None = None,
+        evidence_collector: Callable[
+            ..., Evidence | tuple[Evidence, ...] | list[Evidence]
+        ]
+        | None = None,
         channel_binding: ChannelBinding | None = None,
         tls_context: ssl.SSLContext | None = None,
         max_body: int = MAX_REQUEST_BODY,

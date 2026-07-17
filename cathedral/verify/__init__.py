@@ -62,7 +62,10 @@ def verify(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
     if evidence.kind is EvidenceKind.TDX:
         return _verify_tdx(evidence, nonce, policy)
     if evidence.kind is EvidenceKind.GPU_CC:
-        raise NotImplementedError("GPU CC verify — Phase 1 (NRAS / nvtrust + composite JWT)")
+        # A GPU component can never produce a standalone admission verdict.
+        # cathedral.gpu.verify_composite_gpu performs configured external
+        # vendor verification together with the bound TDX component.
+        return None
     return None
 
 

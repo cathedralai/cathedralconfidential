@@ -31,13 +31,20 @@ import os
 import re
 import stat
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from cathedral import census as census_mod
 from cathedral.api import WorkQueue
+from cathedral.attest import collect_tdx_gpu
 from cathedral.assurance import AssuranceDimension
-from cathedral.common import ChannelBinding, ChannelBindingType, Policy
+from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
 from cathedral.enroll import RegistryStore
+from cathedral.gpu import (
+    GpuIdentityRegistry,
+    gpu_profile_from_registry,
+    gpu_verifier_from_env,
+)
 from cathedral.lanes.sat import SatLane, _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.ledger import Ledger
@@ -477,19 +484,24 @@ def _read_bounded_receipt_file(path: str, label: str) -> bytes:
     return data
 
 
-def _load_receipt_private_seed(path: str, *, production_mode: bool) -> bytes:
+def _load_private_seed(
+    path: str,
+    *,
+    production_mode: bool,
+    label: str,
+) -> bytes:
     target = Path(path)
     try:
         before = target.lstat()
     except OSError as exc:
-        raise ValueError("unable to load receipt signing key") from exc
+        raise ValueError(f"unable to load {label}") from exc
     if not stat.S_ISREG(before.st_mode) or target.is_symlink():
-        raise ValueError("receipt signing key must be a regular non-symlink file")
+        raise ValueError(f"{label} must be a regular non-symlink file")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(target, flags)
     except OSError as exc:
-        raise ValueError("unable to load receipt signing key") from exc
+        raise ValueError(f"unable to load {label}") from exc
     try:
         try:
             metadata = os.fstat(descriptor)
@@ -499,11 +511,11 @@ def _load_receipt_private_seed(path: str, *, production_mode: bool) -> bytes:
                 != (before.st_dev, before.st_ino)
             ):
                 raise ValueError(
-                    "receipt signing key must be a stable regular non-symlink file"
+                    f"{label} must be a stable regular non-symlink file"
                 )
             if production_mode and metadata.st_mode & 0o077:
                 raise ValueError(
-                    "production receipt signing key must not be group/world accessible"
+                    f"production {label} must not be group/world accessible"
                 )
             if (
                 production_mode
@@ -511,22 +523,38 @@ def _load_receipt_private_seed(path: str, *, production_mode: bool) -> bytes:
                 and metadata.st_uid != os.getuid()
             ):
                 raise ValueError(
-                    "production receipt signing key must be owned by the runtime user"
+                    f"production {label} must be owned by the runtime user"
                 )
             raw = os.read(descriptor, 257)
         except OSError as exc:
-            raise ValueError("unable to load receipt signing key") from exc
+            raise ValueError(f"unable to load {label}") from exc
     finally:
         os.close(descriptor)
     if len(raw) > 256:
-        raise ValueError("receipt signing key must be a 32-byte base64 seed")
+        raise ValueError(f"{label} must be a 32-byte base64 seed")
     try:
         seed = base64.b64decode(raw.strip(), validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ValueError("receipt signing key must be a 32-byte base64 seed") from exc
+        raise ValueError(f"{label} must be a 32-byte base64 seed") from exc
     if len(seed) != 32:
-        raise ValueError("receipt signing key must be a 32-byte base64 seed")
+        raise ValueError(f"{label} must be a 32-byte base64 seed")
     return seed
+
+
+def _load_receipt_private_seed(path: str, *, production_mode: bool) -> bytes:
+    return _load_private_seed(
+        path,
+        production_mode=production_mode,
+        label="receipt signing key",
+    )
+
+
+def _load_gpu_identity_key(path: str, *, production_mode: bool) -> bytes:
+    return _load_private_seed(
+        path,
+        production_mode=production_mode,
+        label="GPU identity key",
+    )
 
 
 def cmd_policy_registry_verify(args: argparse.Namespace) -> int:
@@ -708,6 +736,23 @@ def _build_runtime(
     args: argparse.Namespace, *, require_policy: bool = False
 ) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
     development = getattr(args, "development", False)
+    gpu_profile_id = getattr(args, "gpu_profile_id", None)
+    gpu_identity_db = getattr(args, "gpu_identity_db", None)
+    gpu_identity_key_file = getattr(args, "gpu_identity_key_file", None)
+    gpu_identity_anchor_file = getattr(args, "gpu_identity_anchor_file", None)
+    gpu_values = (
+        gpu_profile_id,
+        gpu_identity_db,
+        gpu_identity_key_file,
+        gpu_identity_anchor_file,
+    )
+    if any(item is not None for item in gpu_values) and any(
+        item is None for item in gpu_values
+    ):
+        raise ValueError(
+            "--gpu-profile-id, --gpu-identity-db, --gpu-identity-key-file, and "
+            "--gpu-identity-anchor-file are required together"
+        )
     config = RuntimeConfig(
         miner_timeout_seconds=getattr(args, "miner_timeout_seconds", 10.0),
         miner_attempts=getattr(args, "miner_attempts", 2),
@@ -726,6 +771,7 @@ def _build_runtime(
         reattestation_retry_jitter_seconds=getattr(
             args, "reattestation_retry_jitter_seconds", 5
         ),
+        expected_tier=Tier.CC_GPU if gpu_profile_id is not None else Tier.CC_CPU_TDX,
     )
     tokens = _load_tokens(
         getattr(args, "tokens_file", None),
@@ -779,6 +825,29 @@ def _build_runtime(
                 production_mode=config.production_mode,
             ),
         )
+    gpu_profile = None
+    gpu_verifier = None
+    gpu_identity_registry = None
+    if gpu_profile_id is not None:
+        if policy_snapshot is None:
+            raise ValueError("GPU runtime requires --policy-registry authority")
+        if config.production_mode and gpu_identity_db == ":memory:":
+            raise ValueError("production GPU identity registry must be durable")
+        gpu_profile = gpu_profile_from_registry(policy_snapshot, gpu_profile_id)
+        if not gpu_profile.production_ready:
+            raise ValueError("GPU profile is not production ready")
+        gpu_verifier = gpu_verifier_from_env(
+            production_mode=config.production_mode
+        )
+        gpu_identity_registry = GpuIdentityRegistry(
+            gpu_identity_db,
+            identity_digest_key=_load_gpu_identity_key(
+                gpu_identity_key_file,
+                production_mode=config.production_mode,
+            ),
+            production_mode=config.production_mode,
+            generation_anchor_path=gpu_identity_anchor_file,
+        )
     ledger = Ledger(args.ledger_db)
     runtime = ConfidentialRuntime(
         RegistryStore(getattr(args, "registry_db", ":memory:")),
@@ -788,6 +857,9 @@ def _build_runtime(
         token_provider=tokens.get,
         config=config,
         receipt_issuer=receipt_issuer,
+        gpu_profile=gpu_profile,
+        gpu_verifier=gpu_verifier,
+        gpu_identity_registry=gpu_identity_registry,
     )
     return runtime, ledger, tokens
 
@@ -804,13 +876,30 @@ def _outcome_json(outcome: MinerOutcome) -> dict[str, object]:
         "hotkey": outcome.hotkey,
         "endpoint_url": outcome.endpoint_url,
         "status": outcome.status,
+        "verified": outcome.status == "attestation_verified" or outcome.admitted,
         "admitted": outcome.admitted,
         "challenge_id": outcome.challenge_id,
         "work_units": outcome.work_units,
         "score": outcome.score,
         "error": _sanitize_error(outcome.error, maxlen=300) if outcome.error else None,
+        "error_category": outcome.error_category,
         "assurance": outcome.assurance.to_dict() if outcome.assurance else None,
+        "component_audit": (
+            _audit_json_value(outcome.component_audit)
+            if outcome.component_audit is not None
+            else None
+        ),
     }
+
+
+def _audit_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _audit_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_audit_json_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise ValueError("component audit contains an unsupported value")
 
 
 def _run_json(run: EpochRun) -> dict[str, object]:
@@ -865,6 +954,9 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         configured_hotkey=args.hotkey,
         bearer_token=token,
         channel_binding=channel_binding,
+        evidence_collector=(
+            collect_tdx_gpu if getattr(args, "gpu_composite", False) else None
+        ),
         allow_non_loopback_for_development=args.development_allow_non_loopback,
     ) as server:
         print(json.dumps({"host": server.host, "port": server.port, "hotkey": args.hotkey}))
@@ -882,6 +974,17 @@ def cmd_runtime_canary(args: argparse.Namespace) -> int:
         print(json.dumps(_outcome_json(outcome), sort_keys=True))
         return 0
     finally:
+        ledger.close()
+
+
+def cmd_runtime_audit_attestation(args: argparse.Namespace) -> int:
+    runtime, ledger, tokens = _build_runtime(args, require_policy=True)
+    try:
+        outcome = runtime.audit_attestation(_target(args, tokens))
+        print(json.dumps(_outcome_json(outcome), sort_keys=True))
+        return 0 if outcome.status == "attestation_verified" else 1
+    finally:
+        runtime.close()
         ledger.close()
 
 
@@ -958,6 +1061,50 @@ def cmd_runtime_abandon_complete(args: argparse.Namespace) -> int:
         return 0
     finally:
         ledger.close()
+
+
+def cmd_runtime_recover_gpu_identities(args: argparse.Namespace) -> int:
+    """Authenticate and audit deterministic recovery of crash-left GPU claims."""
+
+    outcome = GpuIdentityRegistry.recover_interrupted(
+        args.gpu_identity_db,
+        identity_digest_key=_load_gpu_identity_key(
+            args.gpu_identity_key_file,
+            production_mode=not args.development,
+        ),
+        reason=args.reason,
+        production_mode=not args.development,
+        generation_anchor_path=args.gpu_identity_anchor_file,
+    )
+    print(json.dumps(dict(outcome), sort_keys=True))
+    return 0
+
+
+def cmd_runtime_initialize_gpu_identities(args: argparse.Namespace) -> int:
+    """Perform the explicit one-time creation of production GPU identity state."""
+
+    registry = GpuIdentityRegistry(
+        args.gpu_identity_db,
+        identity_digest_key=_load_gpu_identity_key(
+            args.gpu_identity_key_file,
+            production_mode=not args.development,
+        ),
+        production_mode=not args.development,
+        generation_anchor_path=args.gpu_identity_anchor_file,
+        initialize=True,
+    )
+    print(
+        json.dumps(
+            {
+                "generation_anchor": str(args.gpu_identity_anchor_file),
+                "identity_database": str(args.gpu_identity_db),
+                "initialized": True,
+                "production_ready": registry.production_ready,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
 
 
 def cmd_lifecycle_status(args: argparse.Namespace) -> int:
@@ -1059,6 +1206,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--development-no-auth", action="store_true")
     p_serve.add_argument("--development-allow-non-loopback", action="store_true")
     p_serve.add_argument(
+        "--gpu-composite",
+        action="store_true",
+        help=(
+            "collect bound TDX plus confidential-GPU evidence; requires "
+            "CATHEDRAL_GPU_COLLECT_CMD"
+        ),
+    )
+    p_serve.add_argument(
         "--channel-binding-type",
         choices=[binding.value for binding in ChannelBindingType],
     )
@@ -1150,7 +1305,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_lifecycle_retire.set_defaults(func=cmd_lifecycle_retire)
 
-    p_runtime = sub.add_parser("runtime", help="operate confidential TDX report epochs")
+    p_runtime = sub.add_parser(
+        "runtime", help="operate confidential-compute report epochs"
+    )
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
 
     def add_runtime_common(command: argparse.ArgumentParser) -> None:
@@ -1168,6 +1325,22 @@ def build_parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--receipt-signing-key-id")
         command.add_argument("--receipt-signing-key-file")
+        command.add_argument(
+            "--gpu-profile-id",
+            help="active gpu_cc profile id from the verified policy registry",
+        )
+        command.add_argument(
+            "--gpu-identity-db",
+            help="durable pseudonymous GPU identity-claim database",
+        )
+        command.add_argument(
+            "--gpu-identity-key-file",
+            help="owner-only file containing a 32-byte base64 identity key",
+        )
+        command.add_argument(
+            "--gpu-identity-anchor-file",
+            help="external protected monotonic generation anchor",
+        )
         command.add_argument("--tokens-file", default=None)
         command.add_argument("--miner-timeout-seconds", type=float, default=10.0)
         command.add_argument("--miner-attempts", type=int, default=2)
@@ -1195,10 +1368,20 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--canary-hotkey", required=True)
         command.add_argument("--canary-endpoint", required=True)
 
-    p_canary = runtime_sub.add_parser("canary", help="run fresh TDX and canonical SAT canary")
+    p_canary = runtime_sub.add_parser(
+        "canary", help="run fresh requested-tier attestation and SAT canary"
+    )
     add_runtime_common(p_canary)
     add_canary(p_canary)
     p_canary.set_defaults(func=cmd_runtime_canary)
+
+    p_audit = runtime_sub.add_parser(
+        "audit-attestation",
+        help="verify fresh evidence and channel binding without work or scoring",
+    )
+    add_runtime_common(p_audit)
+    add_canary(p_audit)
+    p_audit.set_defaults(func=cmd_runtime_audit_attestation)
 
     p_run = runtime_sub.add_parser("run-epoch", help="freeze one complete report")
     add_runtime_common(p_run)
@@ -1250,6 +1433,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="nonempty operator justification; recorded in the ledger audit trail",
     )
     p_abandon.set_defaults(func=cmd_runtime_abandon_complete)
+
+    p_gpu_recovery = runtime_sub.add_parser(
+        "recover-gpu-identities",
+        help="reconcile interrupted GPU claims and record an authenticated audit event",
+    )
+    p_gpu_recovery.add_argument("--gpu-identity-db", required=True)
+    p_gpu_recovery.add_argument("--gpu-identity-key-file", required=True)
+    p_gpu_recovery.add_argument("--gpu-identity-anchor-file", required=True)
+    p_gpu_recovery.add_argument(
+        "--reason",
+        required=True,
+        help="operator justification recorded in the GPU identity audit trail",
+    )
+    p_gpu_recovery.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production ownership checks for a local recovery exercise",
+    )
+    p_gpu_recovery.set_defaults(func=cmd_runtime_recover_gpu_identities)
+
+    p_gpu_initialize = runtime_sub.add_parser(
+        "initialize-gpu-identities",
+        help="perform one-time creation of the GPU identity database and external anchor",
+    )
+    p_gpu_initialize.add_argument("--gpu-identity-db", required=True)
+    p_gpu_initialize.add_argument("--gpu-identity-key-file", required=True)
+    p_gpu_initialize.add_argument("--gpu-identity-anchor-file", required=True)
+    p_gpu_initialize.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production path separation and ownership checks for a local exercise",
+    )
+    p_gpu_initialize.set_defaults(func=cmd_runtime_initialize_gpu_identities)
 
     return parser
 

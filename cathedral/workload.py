@@ -38,7 +38,9 @@ VERIFIER_PREFLIGHT_RESULT_SCHEMA = "cathedral_workload_verifier_preflight_result
 MAX_REFERENCE_LENGTH = 512
 MAX_REPOSITORY_LENGTH = 255
 MAX_ARTIFACT_DIGESTS = 64
-MAX_VERIFIER_OUTPUT_BYTES = 1024 * 1024
+MAX_VERIFIER_OUTPUT_BYTES = 16 * 1024 * 1024
+DEFAULT_VERIFIER_INPUT_BYTES = 16 * 1024 * 1024
+MAX_VERIFIER_INPUT_BYTES = 32 * 1024 * 1024
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
@@ -166,9 +168,7 @@ class ImageReference:
                 for component in repository.split("/")
             )
         ):
-            raise WorkloadAdmissionError(
-                "invalid_image_reference", "image repository is invalid"
-            )
+            raise WorkloadAdmissionError("invalid_image_reference", "image repository is invalid")
         if _DIGEST_RE.fullmatch(digest) is None:
             raise WorkloadAdmissionError(
                 "invalid_image_reference", "image digest must use canonical SHA-256"
@@ -209,7 +209,9 @@ class WorkloadRequest:
             raise WorkloadAdmissionError(
                 "invalid_manifest", "artifact digests must be a bounded unique tuple"
             )
-        checked = tuple(sorted(_validate_digest(value, "artifact digest") for value in self.artifact_digests))
+        checked = tuple(
+            sorted(_validate_digest(value, "artifact digest") for value in self.artifact_digests)
+        )
         object.__setattr__(self, "artifact_digests", checked)
         if any(
             not isinstance(value, bool)
@@ -345,6 +347,8 @@ class ExternalVerifierConfig:
     command: tuple[str, ...]
     timeout_seconds: float = 10.0
     maximum_output_bytes: int = 64 * 1024
+    maximum_input_bytes: int = DEFAULT_VERIFIER_INPUT_BYTES
+    implementation_artifacts: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -377,6 +381,29 @@ class ExternalVerifierConfig:
             or not 256 <= self.maximum_output_bytes <= MAX_VERIFIER_OUTPUT_BYTES
         ):
             raise ValueError("signature verifier output bound is invalid")
+        if (
+            isinstance(self.maximum_input_bytes, bool)
+            or not isinstance(self.maximum_input_bytes, int)
+            or not 256 <= self.maximum_input_bytes <= MAX_VERIFIER_INPUT_BYTES
+        ):
+            raise ValueError("signature verifier input bound is invalid")
+        if (
+            not isinstance(self.implementation_artifacts, tuple)
+            or len(self.implementation_artifacts) > 32
+            or len(set(self.implementation_artifacts)) != len(self.implementation_artifacts)
+            or any(
+                not isinstance(path, str)
+                or not path
+                or len(path) > 4096
+                or "\x00" in path
+                or "\n" in path
+                or not os.path.isabs(path)
+                for path in self.implementation_artifacts
+            )
+        ):
+            raise ValueError(
+                "signature verifier implementation artifacts must be unique absolute paths"
+            )
 
 
 class ExternalSignatureVerifier:
@@ -384,13 +411,23 @@ class ExternalSignatureVerifier:
 
     production_capable = True
 
-    def __init__(self, config: ExternalVerifierConfig):
+    def __init__(
+        self,
+        config: ExternalVerifierConfig,
+        *,
+        working_directory: str | None = None,
+    ):
         if not isinstance(config, ExternalVerifierConfig):
             raise TypeError("external verifier config is invalid")
+        if working_directory is not None and (
+            not isinstance(working_directory, str) or not os.path.isabs(working_directory)
+        ):
+            raise ValueError("external verifier working directory must be absolute")
         object.__setattr__(self, "_config", config)
+        object.__setattr__(self, "_working_directory", working_directory)
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name in {"config", "_config"} and hasattr(self, "_config"):
+        if name in {"config", "_config", "_working_directory"} and hasattr(self, "_config"):
             raise AttributeError("external verifier configuration is immutable")
         object.__setattr__(self, name, value)
 
@@ -410,6 +447,11 @@ class ExternalSignatureVerifier:
 
     def _invoke(self, request: Mapping[str, object]) -> dict[str, object]:
         payload = _canonical_json(request) + b"\n"
+        if len(payload) > self.config.maximum_input_bytes:
+            raise SignatureVerifierError(
+                "oversized_input", "signature verifier input exceeded its bound"
+            )
+        deadline = time.monotonic() + float(self.config.timeout_seconds)
         try:
             process = subprocess.Popen(
                 self.config.command,
@@ -419,6 +461,8 @@ class ExternalSignatureVerifier:
                 shell=False,
                 close_fds=True,
                 start_new_session=True,
+                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                cwd=self._working_directory,
             )
         except OSError as exc:
             raise SignatureVerifierError(
@@ -428,21 +472,17 @@ class ExternalSignatureVerifier:
         assert process.stdout is not None
         assert process.stderr is not None
         try:
-            try:
-                process.stdin.write(payload)
-                process.stdin.close()
-            except BrokenPipeError:
-                process.stdin.close()
-
             selected = selectors.DefaultSelector()
             output = bytearray()
-            deadline = time.monotonic() + float(self.config.timeout_seconds)
             try:
+                os.set_blocking(process.stdin.fileno(), False)
                 os.set_blocking(process.stdout.fileno(), False)
                 os.set_blocking(process.stderr.fileno(), False)
+                selected.register(process.stdin, selectors.EVENT_WRITE, "stdin")
                 selected.register(process.stdout, selectors.EVENT_READ, "stdout")
                 selected.register(process.stderr, selectors.EVENT_READ, "stderr")
                 total = 0
+                input_offset = 0
                 while selected.get_map():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -452,6 +492,23 @@ class ExternalSignatureVerifier:
                         )
                     events = selected.select(min(remaining, 0.1))
                     for key, _mask in events:
+                        if key.data == "stdin":
+                            try:
+                                written = os.write(
+                                    key.fileobj.fileno(),
+                                    payload[input_offset : input_offset + 65536],
+                                )
+                            except (BlockingIOError, InterruptedError):
+                                continue
+                            except BrokenPipeError:
+                                written = 0
+                                input_offset = len(payload)
+                            else:
+                                input_offset += written
+                            if input_offset >= len(payload) or written == 0:
+                                selected.unregister(key.fileobj)
+                                key.fileobj.close()
+                            continue
                         try:
                             chunk = os.read(key.fileobj.fileno(), 65536)
                         except BlockingIOError:
@@ -473,9 +530,7 @@ class ExternalSignatureVerifier:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._terminate(process)
-                raise SignatureVerifierError(
-                    "timeout", "signature verifier exceeded its timeout"
-                )
+                raise SignatureVerifierError("timeout", "signature verifier exceeded its timeout")
             try:
                 return_code = process.wait(timeout=remaining)
             except subprocess.TimeoutExpired as exc:
@@ -491,6 +546,8 @@ class ExternalSignatureVerifier:
         finally:
             if process.poll() is None:
                 self._terminate(process)
+            if not process.stdin.closed:
+                process.stdin.close()
             process.stdout.close()
             process.stderr.close()
 
@@ -515,9 +572,7 @@ class ExternalSignatureVerifier:
             or len(set(roots)) != len(roots)
             or set(roots) != set(trusted_root_ids)
         ):
-            raise SignatureVerifierError(
-                "preflight_failed", "signature verifier preflight failed"
-            )
+            raise SignatureVerifierError("preflight_failed", "signature verifier preflight failed")
 
     def verify(
         self,
@@ -547,9 +602,7 @@ class ExternalSignatureVerifier:
             or document.get("schema") != VERIFIER_RESULT_SCHEMA
             or document.get("status") != "verified"
         ):
-            raise SignatureVerifierError(
-                "invalid_verdict", "signature verifier verdict is invalid"
-            )
+            raise SignatureVerifierError("invalid_verdict", "signature verifier verdict is invalid")
         try:
             return SignatureVerdict(
                 image_reference=document["image_reference"],  # type: ignore[arg-type]
@@ -692,8 +745,7 @@ class AdmittedWorkload:
             or self.admission_mode not in {"enforced", "development_bypass"}
             or not isinstance(self.production_admission, bool)
             or not isinstance(self._capability, str)
-            or re.fullmatch(r"admission-hmac-sha256:[0-9a-f]{64}", self._capability)
-            is None
+            or re.fullmatch(r"admission-hmac-sha256:[0-9a-f]{64}", self._capability) is None
         ):
             raise WorkloadAdmissionError(
                 "invalid_admission", "admitted workload capability is malformed"
@@ -757,19 +809,15 @@ class WorkloadAdmissionController:
     """Evaluate policy and mint short-lived in-process execution capabilities."""
 
     def __setattr__(self, name: str, value: object) -> None:
-        if (
-            self.__dict__.get("_configuration_locked", False)
-            and name
-            in {
-                "_LOCKED_SECURITY_CONFIGURATION",
-                "_capability_key",
-                "_configuration_locked",
-                "_preflight_complete",
-                "policy",
-                "production_mode",
-                "verifier",
-            }
-        ):
+        if self.__dict__.get("_configuration_locked", False) and name in {
+            "_LOCKED_SECURITY_CONFIGURATION",
+            "_capability_key",
+            "_configuration_locked",
+            "_preflight_complete",
+            "policy",
+            "production_mode",
+            "verifier",
+        }:
             raise AttributeError("workload admission security configuration is immutable")
         object.__setattr__(self, name, value)
 
@@ -959,9 +1007,7 @@ class WorkloadAdmissionController:
         self._audit(decision.status, None, manifest.digest)
         return decision
 
-    def development_bypass(
-        self, request: WorkloadRequest, *, reason: str
-    ) -> AdmittedWorkload:
+    def development_bypass(self, request: WorkloadRequest, *, reason: str) -> AdmittedWorkload:
         if self.production_mode:
             raise WorkloadAdmissionError(
                 "bypass_denied", "development bypass is unavailable in production"
