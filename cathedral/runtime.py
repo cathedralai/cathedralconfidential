@@ -405,6 +405,7 @@ class ConfidentialRuntime:
                 tee_type="TDX",
                 workload="CPU",
                 evidence_digest=result.evidence_digest,
+                policy_mode=result.attested.policy_mode or "compatibility",
             )
             self.registry.record_verdict(result.target.hotkey, result.attested)
             outcomes[result.target.hotkey] = MinerOutcome(

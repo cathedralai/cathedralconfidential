@@ -8,6 +8,7 @@ GPU composite path remains fail-closed (no GPU verifier wired in).
 from __future__ import annotations
 
 import base64
+import argparse
 import json
 import threading
 import time
@@ -15,7 +16,35 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from cathedral.common import Attested, EvidenceKind, Policy, Tier
 from cathedral.enroll import RegistryStore
-from cathedral.prober import probe_once
+from cathedral.prober import policy_from_args, probe_once
+
+
+def test_policy_from_args_supports_strict_tdx_flags():
+    args = argparse.Namespace(
+        allow_measurement=["m"],
+        allow_measurements_file=None,
+        min_tcb=0,
+        tdx_strict=True,
+        allow_tdx_tcb_status=["UpToDate", "SWHardeningNeeded"],
+        allow_tdx_advisory=["INTEL-SA-01234"],
+    )
+
+    policy = policy_from_args(args)
+
+    assert policy.tdx_strict is True
+    assert policy.tdx_allowed_tcb_statuses == {"UpToDate", "SWHardeningNeeded"}
+    assert policy.tdx_allowed_advisories == {"INTEL-SA-01234"}
+
+
+def test_policy_from_legacy_args_defaults_to_visible_compatibility_mode():
+    args = argparse.Namespace(
+        allow_measurement=["m"], allow_measurements_file=None, min_tcb=0
+    )
+
+    policy = policy_from_args(args)
+
+    assert policy.tdx_strict is False
+    assert policy.tdx_allowed_tcb_statuses == {"UpToDate"}
 
 
 # ---------------------------------------------------------------------------

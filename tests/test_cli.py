@@ -14,6 +14,7 @@ from cathedral.cli import (
     DEFAULT_WORKER_BEARER_ENV,
     _dict_to_item,
     _item_to_dict,
+    _load_policy,
     _load_tokens,
     build_parser,
     cmd_work_submit,
@@ -25,6 +26,46 @@ from cathedral.lanes.sat import _compute_challenge_id
 from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.ledger import Ledger
 from cathedral.worker import WorkerServer
+
+
+def test_load_policy_supports_strict_tdx_claim_policy(tmp_path: Path):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps(
+            {
+                "allowed_measurements": ["tdx-measurement-1"],
+                "min_tcb": 0,
+                "tdx_strict": True,
+                "tdx_allowed_tcb_statuses": ["UpToDate", "SWHardeningNeeded"],
+                "tdx_allowed_advisories": ["INTEL-SA-01234"],
+            }
+        )
+    )
+
+    policy = _load_policy(str(policy_file))
+
+    assert policy.tdx_strict is True
+    assert policy.tdx_allowed_tcb_statuses == {"UpToDate", "SWHardeningNeeded"}
+    assert policy.tdx_allowed_advisories == {"INTEL-SA-01234"}
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"tdx_strict": "true"},
+        {"tdx_allowed_tcb_statuses": ["FutureStatus"]},
+        {"tdx_allowed_tcb_statuses": ["Revoked"]},
+        {"tdx_allowed_advisories": ["bad advisory with spaces"]},
+    ],
+)
+def test_load_policy_rejects_unsafe_tdx_configuration(tmp_path: Path, override):
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(
+        json.dumps({"allowed_measurements": ["m"], "tdx_strict": True, **override})
+    )
+
+    with pytest.raises(ValueError):
+        _load_policy(str(policy_file))
 
 
 # ---------------------------------------------------------------------------

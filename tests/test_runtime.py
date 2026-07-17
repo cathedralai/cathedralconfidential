@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -235,6 +236,30 @@ def test_two_unique_tdx_miners_complete_normalized(tmp_path: Path) -> None:
     assert dict(run.scores) == {"miner-a": 1.0, "miner-b": 1.0}
     assert {outcome.status for outcome in run.outcomes} == {"verified"}
     assert all(outcome.work_units == 20 for outcome in run.outcomes)
+
+
+def test_runtime_persists_strict_attestation_policy_mode(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a")})
+    runtime, ledger, _ = make_runtime(
+        tmp_path, [("miner-a", "http://127.0.0.1:9001")], specs
+    )
+
+    def strict_verifier(evidence: Evidence, nonce: bytes, _policy: Policy) -> Attested:
+        assert evidence.nonce == nonce
+        chip = evidence.quote.decode().removeprefix("chip:")
+        return Attested(
+            Tier.CC_CPU_TDX,
+            chip,
+            "measurement",
+            1,
+            policy_mode="strict",
+        )
+
+    runtime.verifier = strict_verifier
+    run = runtime.run_epoch(7, CANARY)
+    payload = json.loads(ledger.report_bytes(run.epoch_id))
+
+    assert payload["metadata"]["attestation_policy_modes"] == ["strict"]
 
 
 def test_duplicate_endpoint_excludes_all_claimants(tmp_path: Path) -> None:

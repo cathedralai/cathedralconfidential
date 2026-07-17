@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import json
 import os
 import select
@@ -25,8 +26,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-from cathedral.common import Attested, Evidence, EvidenceKind, Policy, Tier, report_data
+from cathedral.common import (
+    TDX_TCB_STATUSES,
+    Attested,
+    Evidence,
+    EvidenceKind,
+    Policy,
+    Tier,
+    report_data,
+)
 from cathedral.verify.snp import verify_snp
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def verify(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | None:
@@ -84,28 +96,92 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
     if actual_report_data != expected_report_data:
         return None
 
-    measurement = _claim_str(claims, "measurement", "mrtd", "td_measurement")
+    measurement = (
+        _claim_exact_str(claims, "measurement")
+        if policy.tdx_strict
+        else _claim_str(claims, "measurement", "mrtd", "td_measurement")
+    )
     if not measurement or measurement not in policy.allowed_measurements:
         return None
 
-    if policy.min_tcb > 0 and _claim_str(claims, "tcb_svn") and not _claim_str(
-        claims, "tcb_status", "tdx_tcb_status"
-    ):
-        return None
-
+    tcb_svn = _claim_exact_str(claims, "tcb_svn") or None
     tcb = _claim_int(claims, "tcb", "tcb_svn", default=-1)
-    if tcb < policy.min_tcb:
-        return None
+    tcb_status = (
+        _claim_exact_str(claims, "tcb_status")
+        if policy.tdx_strict
+        else _claim_exact_str(claims, "tcb_status", "tdx_tcb_status")
+    ) or None
+    advisory_ids = _claim_str_list(claims, "advisory_ids")
+    debug_enabled = _claim_exact_bool(claims, "debug_enabled")
+    collateral_current = _claim_exact_bool(claims, "collateral_current")
+    platform_identity_kind = _claim_exact_str(claims, "platform_identity_kind") or None
 
-    chip_id = _claim_str(claims, "chip_id", "platform_id", "tdx_platform_id")
-    if not chip_id:
-        return None
+    if policy.tdx_strict:
+        if tcb_status not in TDX_TCB_STATUSES or tcb_status == "Revoked":
+            return None
+        if tcb_status not in policy.tdx_allowed_tcb_statuses:
+            return None
+        if advisory_ids is None:
+            return None
+        if tcb_status != "UpToDate" and not advisory_ids:
+            return None
+        if any(advisory not in policy.tdx_allowed_advisories for advisory in advisory_ids):
+            return None
+        if debug_enabled is not False:
+            return None
+        if collateral_current is not True:
+            return None
+        if platform_identity_kind != "stable":
+            return None
+        if _claim_exact_bool(claims, "platform_identity_verified") is not True:
+            return None
+        if _claim_exact_bool(claims, "claims_bound_to_quote") is not True:
+            return None
+        chip_id = _claim_digest_id(claims, "stable_platform_id", "tdx-platform-sha256:")
+        if not chip_id or _claim_exact_str(claims, "platform_id") != chip_id:
+            return None
+        pck_cert_id = _claim_digest_id(claims, "tdx_pck_cert_id", "tdx-pck-cert-sha256:")
+        attestation_key_id = _claim_digest_id(
+            claims, "tdx_attestation_key_id", "tdx-ak-sha256:"
+        )
+        if not pck_cert_id or not attestation_key_id:
+            return None
+        if not _exact_tcb_svn(tcb_svn):
+            return None
+        # Raw tee_tcb_svn remains an audit claim. Strict admission is based on
+        # the DCAP status/advisory result, never scalar ordering of that byte string.
+        tcb = int(tcb_svn, 16)
+    else:
+        if policy.min_tcb > 0 and tcb_svn and not tcb_status:
+            return None
+        if tcb < policy.min_tcb:
+            return None
+        chip_id = _bounded_identity(
+            _claim_str(claims, "chip_id", "platform_id", "tdx_platform_id")
+        )
+        if not chip_id:
+            return None
+        pck_cert_id = _claim_exact_str(claims, "tdx_pck_cert_id") or None
+        attestation_key_id = _claim_exact_str(claims, "tdx_attestation_key_id") or None
+        LOGGER.warning(
+            "accepted TDX evidence in compatibility policy mode; strict typed claims "
+            "and stable platform identity were not enforced"
+        )
 
     return Attested(
         tier=Tier.CC_CPU_TDX,
         chip_id=chip_id,
         measurement=measurement,
         tcb=tcb,
+        tcb_status=tcb_status,
+        advisory_ids=advisory_ids or (),
+        debug_enabled=debug_enabled,
+        collateral_current=collateral_current,
+        platform_identity_kind=platform_identity_kind,
+        tcb_svn=tcb_svn,
+        pck_cert_id=pck_cert_id,
+        attestation_key_id=attestation_key_id,
+        policy_mode="strict" if policy.tdx_strict else "compatibility",
     )
 
 
@@ -194,12 +270,70 @@ def _claim_str(claims: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _claim_exact_str(claims: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = claims.get(key)
+        if isinstance(value, str):
+            return value
+        if value is not None:
+            return ""
+    return ""
+
+
+def _claim_str_list(claims: dict[str, Any], key: str) -> tuple[str, ...] | None:
+    value = claims.get(key)
+    if not isinstance(value, list) or len(value) > 64:
+        return None
+    if any(
+        not isinstance(item, str)
+        or not item
+        or len(item) > 128
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in item)
+        for item in value
+    ):
+        return None
+    if len(set(value)) != len(value):
+        return None
+    return tuple(sorted(value))
+
+
+def _claim_exact_bool(claims: dict[str, Any], key: str) -> bool | None:
+    value = claims.get(key)
+    return value if isinstance(value, bool) else None
+
+
+def _bounded_identity(value: str) -> str:
+    if not value or len(value) > 512 or any(
+        ord(char) < 0x21 or ord(char) == 0x7F for char in value
+    ):
+        return ""
+    return value
+
+
+def _claim_digest_id(claims: dict[str, Any], key: str, prefix: str) -> str:
+    value = _claim_exact_str(claims, key)
+    digest = value.removeprefix(prefix)
+    if not value.startswith(prefix) or len(digest) != 64:
+        return ""
+    if digest != digest.lower():
+        return ""
+    if any(character not in "0123456789abcdef" for character in digest):
+        return ""
+    return value
+
+
+def _exact_tcb_svn(value: str | None) -> bool:
+    if value is None or len(value) != 32:
+        return False
+    return all(character in "0123456789abcdef" for character in value)
+
+
 def _claim_int(claims: dict[str, Any], *keys: str, default: int) -> int:
     for key in keys:
         value = claims.get(key)
         if value is None:
             continue
-        if isinstance(value, int):
+        if isinstance(value, int) and not isinstance(value, bool):
             return value
         if isinstance(value, str):
             try:

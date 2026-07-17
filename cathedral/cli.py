@@ -319,9 +319,15 @@ def _load_policy(path: str) -> Policy:
     if isinstance(raw, list):
         measurements = raw
         min_tcb = 0
+        tdx_strict = False
+        tdx_allowed_tcb_statuses = ["UpToDate"]
+        tdx_allowed_advisories: list[str] = []
     elif isinstance(raw, dict):
         measurements = raw.get("allowed_measurements")
         min_tcb = raw.get("min_tcb", 0)
+        tdx_strict = raw.get("tdx_strict", False)
+        tdx_allowed_tcb_statuses = raw.get("tdx_allowed_tcb_statuses", ["UpToDate"])
+        tdx_allowed_advisories = raw.get("tdx_allowed_advisories", [])
     else:
         raise ValueError("measurements file must be a JSON array or object")
     if not isinstance(measurements, list) or any(
@@ -330,7 +336,23 @@ def _load_policy(path: str) -> Policy:
         raise ValueError("allowed_measurements must be a list of nonempty strings")
     if isinstance(min_tcb, bool) or not isinstance(min_tcb, int) or min_tcb < 0:
         raise ValueError("min_tcb must be a nonnegative integer")
-    return Policy(allowed_measurements=set(measurements), min_tcb=min_tcb)
+    if not isinstance(tdx_strict, bool):
+        raise ValueError("tdx_strict must be a boolean")
+    for name, values in (
+        ("tdx_allowed_tcb_statuses", tdx_allowed_tcb_statuses),
+        ("tdx_allowed_advisories", tdx_allowed_advisories),
+    ):
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            raise ValueError(f"{name} must be a list of nonempty strings")
+    return Policy(
+        allowed_measurements=set(measurements),
+        min_tcb=min_tcb,
+        tdx_strict=tdx_strict,
+        tdx_allowed_tcb_statuses=set(tdx_allowed_tcb_statuses),
+        tdx_allowed_advisories=set(tdx_allowed_advisories),
+    )
 
 
 def _load_tokens(path: str | None, *, production_mode: bool = False) -> dict[str, str]:

@@ -9,7 +9,22 @@ from __future__ import annotations
 import enum
 import hashlib
 import os
+import re
 from dataclasses import dataclass, field
+
+
+TDX_TCB_STATUSES = frozenset(
+    {
+        "UpToDate",
+        "OutOfDate",
+        "ConfigurationNeeded",
+        "OutOfDateConfigurationNeeded",
+        "SWHardeningNeeded",
+        "ConfigurationAndSWHardeningNeeded",
+        "Revoked",
+    }
+)
+_TDX_POLICY_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class Tier(str, enum.Enum):
@@ -52,6 +67,15 @@ class Attested:
     tcb: int              # trusted computing base version
     verification_status: str = "VERIFIED"
     chain_verified: bool = True
+    tcb_status: str | None = None
+    advisory_ids: tuple[str, ...] = ()
+    debug_enabled: bool | None = None
+    collateral_current: bool | None = None
+    platform_identity_kind: str | None = None
+    tcb_svn: str | None = None
+    pck_cert_id: str | None = None
+    attestation_key_id: str | None = None
+    policy_mode: str | None = None
 
 
 def issue_nonce() -> bytes:
@@ -82,3 +106,26 @@ class Policy:
     allowed_measurements: set[str] = field(default_factory=set)
     min_tcb: int = 0
     allowed_firmware: set[str] = field(default_factory=set)
+    tdx_strict: bool = False
+    tdx_allowed_tcb_statuses: set[str] = field(default_factory=lambda: {"UpToDate"})
+    tdx_allowed_advisories: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tdx_strict, bool):
+            raise ValueError("tdx_strict must be a boolean")
+        for name, values in (
+            ("tdx_allowed_tcb_statuses", self.tdx_allowed_tcb_statuses),
+            ("tdx_allowed_advisories", self.tdx_allowed_advisories),
+        ):
+            if not isinstance(values, set) or any(
+                not isinstance(value, str) or _TDX_POLICY_TOKEN.fullmatch(value) is None
+                for value in values
+            ):
+                raise ValueError(f"{name} must be a set of bounded policy tokens")
+        unknown = self.tdx_allowed_tcb_statuses - TDX_TCB_STATUSES
+        if unknown:
+            raise ValueError("tdx_allowed_tcb_statuses contains an unknown TCB status")
+        if "Revoked" in self.tdx_allowed_tcb_statuses:
+            raise ValueError("Revoked TDX platforms cannot be allowlisted")
+        if self.tdx_strict and not self.tdx_allowed_tcb_statuses:
+            raise ValueError("strict TDX policy requires at least one allowed TCB status")

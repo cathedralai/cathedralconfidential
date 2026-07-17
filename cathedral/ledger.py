@@ -81,6 +81,8 @@ CREATE TABLE IF NOT EXISTS epoch_attestations (
     tee_type TEXT NOT NULL CHECK (tee_type = 'TDX'),
     workload TEXT NOT NULL CHECK (workload = 'CPU'),
     evidence_digest TEXT NOT NULL,
+    policy_mode TEXT NOT NULL DEFAULT 'compatibility'
+        CHECK (policy_mode IN ('strict', 'compatibility')),
     attested_at TEXT NOT NULL,
     PRIMARY KEY (epoch_id, hotkey)
 );
@@ -162,6 +164,24 @@ class Ledger:
             self._connection.execute("PRAGMA synchronous = FULL")
         self._connection.executescript(_SCHEMA)
         self._migrate_epochs_table_if_needed()
+        self._migrate_attestation_policy_mode_if_needed()
+
+    def _migrate_attestation_policy_mode_if_needed(self) -> None:
+        """Mark historical attestation rows as compatibility-mode evidence."""
+
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(epoch_attestations)")
+        }
+        if "policy_mode" in columns:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE epoch_attestations ADD COLUMN policy_mode TEXT NOT NULL "
+                "DEFAULT 'compatibility' CHECK (policy_mode IN ('strict', 'compatibility'))"
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerError("failed to add attestation policy-mode audit field") from exc
 
     def _migrate_epochs_table_if_needed(self) -> None:
         """Widen a pre-existing on-disk ``epochs`` table to support 'abandoned'.
@@ -487,28 +507,35 @@ class Ledger:
         tee_type: str,
         workload: str,
         evidence_digest: str,
+        policy_mode: str = "compatibility",
     ) -> None:
         """Add exact VERIFIED TDX CPU evidence to a running epoch."""
         if (verdict, tee_type, workload) != ("VERIFIED", "TDX", "CPU"):
             raise LedgerError("attestation must be exact VERIFIED TDX CPU evidence")
         if not hotkey or not evidence_digest:
             raise LedgerError("hotkey and evidence_digest are required")
+        if policy_mode not in {"strict", "compatibility"}:
+            raise LedgerError("attestation policy_mode must be strict or compatibility")
         with self._transaction() as cx:
             self._require_running(cx, epoch_id, "add attestations")
             existing = cx.execute(
-                "SELECT evidence_digest FROM epoch_attestations "
+                "SELECT evidence_digest, policy_mode FROM epoch_attestations "
                 "WHERE epoch_id = ? AND hotkey = ?",
                 (epoch_id, hotkey),
             ).fetchone()
             if existing:
-                if existing["evidence_digest"] != evidence_digest:
+                if (
+                    existing["evidence_digest"] != evidence_digest
+                    or existing["policy_mode"] != policy_mode
+                ):
                     raise LedgerError("attestation evidence is immutable within an epoch")
                 return
             cx.execute(
                 "INSERT INTO epoch_attestations "
-                "(epoch_id, hotkey, verdict, tee_type, workload, evidence_digest, attested_at) "
-                "VALUES (?, ?, 'VERIFIED', 'TDX', 'CPU', ?, ?)",
-                (epoch_id, hotkey, evidence_digest, _now()),
+                "(epoch_id, hotkey, verdict, tee_type, workload, evidence_digest, "
+                "policy_mode, attested_at) "
+                "VALUES (?, ?, 'VERIFIED', 'TDX', 'CPU', ?, ?, ?)",
+                (epoch_id, hotkey, evidence_digest, policy_mode, _now()),
             )
 
     def complete_epoch(
@@ -583,6 +610,15 @@ class Ledger:
                     "SELECT hotkey FROM epoch_attestations WHERE epoch_id = ?", (epoch_id,)
                 )
             }
+            policy_modes = sorted(
+                {
+                    row["policy_mode"]
+                    for row in cx.execute(
+                        "SELECT policy_mode FROM epoch_attestations WHERE epoch_id = ?",
+                        (epoch_id,),
+                    )
+                }
+            )
             gated = {hotkey: units if hotkey in attested else 0.0 for hotkey, units in totals.items()}
             current_gated = {
                 hotkey: units if hotkey in attested else 0.0
@@ -600,6 +636,7 @@ class Ledger:
                 "mechanism": "cathedral_confidential_tdx",
                 "metadata": {
                     "normalization": "max",
+                    "attestation_policy_modes": policy_modes,
                     "published_window_epochs": sorted(row["source_epoch"] for row in previous),
                     "published_window_size": self.window_size,
                 },

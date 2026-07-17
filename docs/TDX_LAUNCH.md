@@ -26,9 +26,9 @@ The validator-side subprocess verifier is governed by three environment variable
 | `CATHEDRAL_TDX_VERIFY_TIMEOUT` | `30` | Seconds before the subprocess is killed. Timeout causes the miner to be rejected without hanging the epoch. |
 | `CATHEDRAL_TDX_VERIFY_MAX_OUTPUT` | `1048576` (1 MiB) | Maximum bytes of stdout (or stderr) accepted. Output exceeding this limit is rejected without parsing. |
 
-Acceptance requires both `intel_verified` and `report_data_match` to be the
-exact JSON boolean `true`. Missing fields, JSON strings (`"true"`), integers
-(`1`), `null`, or `false` all reject.
+All modes require both `intel_verified` and `report_data_match` to be the exact
+JSON boolean `true`. Missing fields, JSON strings (`"true"`), integers (`1`),
+`null`, or `false` all reject.
 
 The subprocess itself is rejected (returns no claims) if:
 - it exceeds `CATHEDRAL_TDX_VERIFY_TIMEOUT` seconds
@@ -58,23 +58,61 @@ attested = verify(evidence, nonce, policy)
 
 Python does not verify Intel quote crypto. Set `CATHEDRAL_TDX_VERIFY_CMD` to a
 DCAP or Intel Trust Authority verifier that validates the quote and prints JSON
-claims:
+claims. The strict contract is:
 
 ```json
 {
   "report_data": "<hex or base64>",
   "measurement": "<MRTD or policy measurement>",
-  "tcb": 1,
-  "platform_id": "<sybil-dedup platform key>"
+  "tcb_svn": "<32 lowercase hex characters>",
+  "tcb_status": "UpToDate",
+  "advisory_ids": [],
+  "debug_enabled": false,
+  "collateral_current": true,
+  "stable_platform_id": "tdx-platform-sha256:<64 lowercase hex characters>",
+  "platform_id": "tdx-platform-sha256:<same 64 lowercase hex characters>",
+  "platform_identity_kind": "stable",
+  "platform_identity_verified": true,
+  "claims_bound_to_quote": true,
+  "tdx_pck_cert_id": "tdx-pck-cert-sha256:<64 lowercase hex characters>",
+  "tdx_attestation_key_id": "tdx-ak-sha256:<64 lowercase hex characters>",
+  "intel_verified": true,
+  "report_data_match": true
 }
 ```
 
-Cathedral then enforces:
+In strict mode Cathedral enforces:
 
 - `REPORTDATA == report_data(nonce, hotkey, ssh_host_key?)`
 - `measurement in policy.allowed_measurements`
-- `tcb >= policy.min_tcb`
-- `platform_id` is present and becomes the Phase 1 sybil-dedup key
+- a recognized, explicitly allowed DCAP TCB status
+- an exact advisory allowlist; every non-`UpToDate` exception must name at
+  least one advisory
+- `Revoked` is never configurable as an allowed state
+- debug is disabled and collateral is current
+- the status and package-stable identity claims are bound to the same verified
+  quote evaluation
+- the stable identity is canonical and differs from the rotating PCK and
+  attestation-key audit fingerprints
+
+Raw `tee_tcb_svn` remains in the audit verdict but is not numerically ordered
+for strict admission. Unknown future status strings and absent, malformed, or
+contradictory typed claims fail closed.
+
+A production policy file looks like:
+
+```json
+{
+  "allowed_measurements": ["tdx-measurement-sha256:<approved digest>"],
+  "tdx_strict": true,
+  "tdx_allowed_tcb_statuses": ["UpToDate"],
+  "tdx_allowed_advisories": []
+}
+```
+
+Add a non-current status and its advisory only as a narrow, reviewed exception.
+For example, allowing `SWHardeningNeeded` does not admit an unlisted advisory.
+`Revoked` and unknown statuses cannot be configured.
 
 Use the adapter in `scripts/tdx_verify_json.py` with an `attestor-verify`
 DCAP binary:
@@ -85,19 +123,22 @@ export CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py'
 ```
 
 The adapter fails closed unless `attestor-verify` returns both
-`intel_verified=true` and `report_data_match=true`. It then parses policy
-claims from the same verified quote bytes: a canonical Cathedral TDX
-measurement over TD identity fields, `tee_tcb_svn`, REPORTDATA, MRTD, RTMRs,
-TD attributes, XFAM, the TDX attestation-key fingerprint, and a
-`tdx-pck-cert-sha256:*` PCK leaf certificate fingerprint used as the Phase 1
-`platform_id`. Package-stable platform identity and richer DCAP TCB status
-semantics remain post-launch hardening.
+`intel_verified=true` and `report_data_match=true`. It parses the debug bit,
+measurement, raw SVN, PCK fingerprint, and attestation-key fingerprint from the
+same verified quote bytes. If the external verifier also returns a bounded
+package-stable identity with `platform_identity_verified=true` and
+`claims_bound_to_quote=true`, the adapter domain-separates and hashes that value
+before emitting it; raw platform identifiers are never printed.
 
-Keep `CATHEDRAL_TDX_MIN_TCB=0` for this adapter until DCAP TCB status is
-plumbed through. The adapter exports raw `tee_tcb_svn` for auditability, but
-Cathedral rejects positive TCB floors when only raw `tcb_svn` is available.
-The PCK certificate fingerprint is also certificate-specific; it is a Phase 1
-dedup key, not a package-stable identity guarantee.
+Compatibility mode exists only for controlled migration. It preserves the
+legacy scalar-TCB and certificate-specific identity behavior and marks every
+successful verdict with `policy_mode="compatibility"`; the verifier also emits
+a warning. Strict verdicts carry `policy_mode="strict"`. Production receipts
+must retain this mode so downstream auditors can distinguish the two. Do not
+describe compatibility-mode evidence as package-stable or current under the
+strict TDX policy. Compatibility mode also rejects empty, control-containing,
+or excessively long identity strings; this fail-closed input bound is stricter
+than the original launch adapter.
 
 ## Hardware Test
 
@@ -125,7 +166,7 @@ sudo env \
   python -m pytest tests/test_tdx_sat_e2e_hw.py -q
 ```
 
-Phase 1 defaults:
+Compatibility-only defaults:
 
 ```bash
 export CATHEDRAL_TDX_MIN_TCB=0
@@ -171,6 +212,10 @@ uses the sole-input `confidential_primary_v1` policy merged in
 ## Definition Of Done
 
 - Hardware-free suite stays green.
+- Strict policy rejects every missing or malformed typed claim and every
+  unapproved status/advisory combination.
+- Repeated quotes across PCK rotation retain one package-stable identity while
+  preserving the rotating PCK and attestation-key fingerprints for audit.
 - `tests/test_attest_tdx_hw.py` passes on the live TDX CVM.
 - `tests/test_tdx_sat_e2e_hw.py` passes on the live TDX CVM.
 - `tests/test_attest_tdx_negative.py` fails closed on a non-TDX CPU host.
@@ -182,7 +227,7 @@ uses the sole-input `confidential_primary_v1` policy merged in
   revocation after a miner disappears or fails work.
 - SNP remains a second CPU platform port, not a launch blocker.
 
-Live evidence recorded July 8, 2026:
+Compatibility-mode live evidence recorded July 8, 2026:
 
 - Hardware-free local suite passed; hardware-gated cases were skipped in that
   environment.
@@ -198,3 +243,8 @@ Live evidence recorded July 8, 2026:
   `/sys/module/tdx_guest`, `/dev/tdx_guest`, and
   `/sys/kernel/config/tsm/report` were absent;
   the enabled non-TDX negative-control test module passed.
+
+This historical run predates the strict typed-claim contract. It remains valid
+evidence for quote collection, signature verification, nonce binding, and the
+SAT lane, but it is not evidence that strict platform-identity or TCB-status
+policy passed. A fresh strict-mode canary is required before making that claim.

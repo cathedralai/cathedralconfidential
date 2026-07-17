@@ -8,6 +8,7 @@ This adapter then parses policy claims from the same verified raw quote bytes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -53,6 +54,45 @@ def _require_true(verifier: dict[str, Any], key: str, failure: str) -> None:
         raise SystemExit(failure)
 
 
+def _exact_optional_bool(verifier: dict[str, Any], key: str) -> bool | None:
+    value = verifier.get(key)
+    return value if isinstance(value, bool) else None
+
+
+def _exact_optional_str(verifier: dict[str, Any], key: str) -> str | None:
+    value = verifier.get(key)
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        return None
+    return value
+
+
+def _exact_optional_str_list(verifier: dict[str, Any], key: str) -> list[str] | None:
+    value = verifier.get(key)
+    if not isinstance(value, list) or len(value) > 64 or any(
+        not isinstance(item, str)
+        or not item
+        or len(item) > 128
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in item)
+        for item in value
+    ):
+        return None
+    if len(set(value)) != len(value):
+        return None
+    return value
+
+
+def _canonical_platform_id(stable_platform_id: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"cathedral-tdx-platform-v1\0")
+    digest.update(stable_platform_id.encode("utf-8"))
+    return "tdx-platform-sha256:" + digest.hexdigest()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("quote", type=Path, help="raw TDX quote file")
@@ -78,6 +118,18 @@ def main(argv: list[str] | None = None) -> int:
     _require_true(verifier, "intel_verified", "attestor-verify did not verify Intel TDX silicon")
     _require_true(verifier, "report_data_match", "attestor-verify reported a report_data mismatch")
 
+    stable_platform_id = _exact_optional_str(verifier, "stable_platform_id")
+    platform_identity_verified = _exact_optional_bool(verifier, "platform_identity_verified")
+    claims_bound_to_quote = _exact_optional_bool(verifier, "claims_bound_to_quote")
+    stable_identity = (
+        stable_platform_id is not None
+        and platform_identity_verified is True
+        and claims_bound_to_quote is True
+    )
+    canonical_platform_id = (
+        _canonical_platform_id(stable_platform_id) if stable_identity else None
+    )
+
     print(
         json.dumps(
             {
@@ -85,7 +137,11 @@ def main(argv: list[str] | None = None) -> int:
                 "measurement": parsed_quote.measurement,
                 "tcb": parsed_quote.tcb,
                 "tcb_svn": parsed_quote.tcb_svn,
-                "platform_id": parsed_quote.platform_id,
+                "platform_id": canonical_platform_id or parsed_quote.platform_id,
+                "stable_platform_id": canonical_platform_id,
+                "platform_identity_kind": "stable" if stable_identity else "pck_certificate",
+                "platform_identity_verified": platform_identity_verified,
+                "claims_bound_to_quote": claims_bound_to_quote,
                 "tdx_pck_cert_id": parsed_quote.platform_id,
                 "tdx_attestation_key_id": parsed_quote.attestation_key_id,
                 "tdx_certification_data_type": parsed_quote.certification_data_type,
@@ -95,7 +151,11 @@ def main(argv: list[str] | None = None) -> int:
                 "mr_owner": parsed_quote.body.mr_owner.hex(),
                 "mr_owner_config": parsed_quote.body.mr_owner_config.hex(),
                 "td_attributes": parsed_quote.body.td_attributes.hex(),
+                "debug_enabled": parsed_quote.debug_enabled,
                 "xfam": parsed_quote.body.xfam.hex(),
+                "tcb_status": _exact_optional_str(verifier, "tcb_status"),
+                "advisory_ids": _exact_optional_str_list(verifier, "advisory_ids"),
+                "collateral_current": _exact_optional_bool(verifier, "collateral_current"),
                 "intel_verified": True,
                 "report_data_match": True,
                 "collateral_urls": verifier.get("collateral_urls", []),

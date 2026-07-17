@@ -31,6 +31,14 @@ def test_parse_tdx_quote_extracts_body_claims():
     assert parsed.attestation_key_id.startswith("tdx-ak-sha256:")
     assert parsed.platform_id.startswith("tdx-pck-cert-sha256:")
     assert parsed.certification_data_type == 6
+    assert parsed.debug_enabled is False
+
+
+def test_parse_tdx_quote_extracts_debug_attribute():
+    rd = report_data(b"n" * 32, "hotkey-tdx")
+    quote = synthetic_tdx_quote(report_data=rd, td_attributes=(1).to_bytes(8, "little"))
+
+    assert parse_tdx_quote(quote).debug_enabled is True
 
 
 def test_parse_tdx_quote_rejects_truncated_quote():

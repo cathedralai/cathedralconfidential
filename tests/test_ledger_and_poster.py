@@ -16,7 +16,9 @@ from cathedral.ledger import _EPOCHS_MIGRATION_TEMP_PREFIX, Ledger, LedgerError
 from cathedral.poster import Poster, PosterError
 
 
-def attest(ledger: Ledger, epoch_id: int, hotkey: str) -> None:
+def attest(
+    ledger: Ledger, epoch_id: int, hotkey: str, *, policy_mode: str = "compatibility"
+) -> None:
     ledger.add_attestation(
         epoch_id,
         hotkey,
@@ -24,6 +26,7 @@ def attest(ledger: Ledger, epoch_id: int, hotkey: str) -> None:
         tee_type="TDX",
         workload="CPU",
         evidence_digest=f"evidence-{hotkey}",
+        policy_mode=policy_mode,
     )
 
 
@@ -198,6 +201,27 @@ class TestEvidenceAndResolution:
         ledger.complete_epoch(epoch_id, {"hk"})
         with pytest.raises(LedgerError, match="cannot add attestations"):
             attest(ledger, epoch_id, "other")
+
+    def test_attestation_policy_mode_is_immutable_and_visible_in_report(self) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        attest(ledger, epoch_id, "hk", policy_mode="strict")
+        with pytest.raises(LedgerError, match="immutable"):
+            ledger.add_attestation(
+                epoch_id,
+                "hk",
+                verdict="VERIFIED",
+                tee_type="TDX",
+                workload="CPU",
+                evidence_digest="evidence-hk",
+                policy_mode="compatibility",
+            )
+
+        ledger.complete_epoch(epoch_id, {"hk"})
+
+        assert report(ledger, epoch_id)["metadata"]["attestation_policy_modes"] == [
+            "strict"
+        ]
 
     @pytest.mark.parametrize("units", [-1, float("nan"), float("inf"), float("-inf")])
     def test_verified_work_must_be_finite_nonnegative(self, units: float) -> None:
@@ -839,9 +863,9 @@ class TestEpochsTableMigration:
                 "SELECT epoch_id, hotkey, status FROM challenges WHERE challenge_id = 'legacy-challenge'"
             ).fetchone() == (1, "hk", "verified")
             assert raw.execute(
-                "SELECT epoch_id, hotkey, evidence_digest FROM epoch_attestations "
+                "SELECT epoch_id, hotkey, evidence_digest, policy_mode FROM epoch_attestations "
                 "WHERE epoch_id = 1 AND hotkey = 'hk'"
-            ).fetchone() == (1, "hk", "evidence-hk")
+            ).fetchone() == (1, "hk", "evidence-hk", "compatibility")
             assert raw.execute(
                 "SELECT epoch_id, hotkey, score FROM epoch_scores WHERE epoch_id = 1 AND hotkey = 'hk'"
             ).fetchone() == (1, "hk", 1.0)

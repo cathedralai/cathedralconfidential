@@ -114,6 +114,12 @@ class ParsedTdxQuote:
         return self.body.tee_tcb_svn.hex()
 
     @property
+    def debug_enabled(self) -> bool:
+        """Whether the TDX TD_ATTRIBUTES.DEBUG bit is set."""
+
+        return bool(int.from_bytes(self.body.td_attributes, "little") & 0x1)
+
+    @property
     def attestation_key_id(self) -> str:
         return "tdx-ak-sha256:" + hashlib.sha256(self.attestation_key).hexdigest()
 

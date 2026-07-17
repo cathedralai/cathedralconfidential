@@ -299,7 +299,15 @@ def policy_from_args(args: argparse.Namespace) -> Policy:
     if args.allow_measurements_file:
         with open(args.allow_measurements_file) as fh:
             measurements.update(line.strip() for line in fh if line.strip())
-    return Policy(allowed_measurements=measurements, min_tcb=args.min_tcb)
+    return Policy(
+        allowed_measurements=measurements,
+        min_tcb=args.min_tcb,
+        tdx_strict=getattr(args, "tdx_strict", False),
+        tdx_allowed_tcb_statuses=set(
+            getattr(args, "allow_tdx_tcb_status", None) or ["UpToDate"]
+        ),
+        tdx_allowed_advisories=set(getattr(args, "allow_tdx_advisory", None) or []),
+    )
 
 
 def _verify_tdx_evidence(
@@ -449,6 +457,9 @@ def main() -> None:
     parser.add_argument("--allow-measurement", action="append", default=[])
     parser.add_argument("--allow-measurements-file")
     parser.add_argument("--min-tcb", type=int, default=0)
+    parser.add_argument("--tdx-strict", action="store_true")
+    parser.add_argument("--allow-tdx-tcb-status", action="append", default=[])
+    parser.add_argument("--allow-tdx-advisory", action="append", default=[])
     parser.add_argument(
         "--workers",
         type=int,
