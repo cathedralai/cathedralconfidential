@@ -44,6 +44,7 @@ from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.ledger import Ledger
 from cathedral.poster import Poster
 from cathedral.remote import RemoteMiner
+from cathedral.receipt import ReceiptIssuer
 from cathedral.verify import verify
 
 MAX_BEARER_TOKEN_LENGTH = 4096
@@ -169,6 +170,7 @@ class ConfidentialRuntime:
         nonce_factory: NonceFactory = issue_nonce,
         remote_factory: RemoteFactory = RemoteMiner,
         config: RuntimeConfig | None = None,
+        receipt_issuer: ReceiptIssuer | None = None,
     ) -> None:
         self.registry = registry
         self.ledger = ledger
@@ -179,6 +181,7 @@ class ConfidentialRuntime:
         self.nonce_factory = nonce_factory
         self.remote_factory = remote_factory
         self.config = config or RuntimeConfig()
+        self.receipt_issuer = receipt_issuer
 
     def check_canary(self, canary: MinerTarget) -> MinerOutcome:
         return self._check_canary_result(canary).outcome
@@ -490,9 +493,17 @@ class ConfidentialRuntime:
                 certificate, error = future.result()
                 accepted = lane.verify(item, certificate) if certificate is not None else None
                 if accepted is None:
-                    self.ledger.resolve_challenge(item.challenge_id, "failed")
                     assurance = _work_assurance(
                         result.attested, item, certificate, passed=False
+                    )
+                    self._resolve_work(
+                        epoch_id,
+                        source_epoch,
+                        result,
+                        item,
+                        assurance,
+                        status="failed",
+                        work_units=0.0,
                     )
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
@@ -508,7 +519,15 @@ class ConfidentialRuntime:
                     result.attested, item, certificate, passed=True
                 )
                 if not SCORE_ELIGIBILITY_POLICY.allows(assurance):
-                    self.ledger.resolve_challenge(item.challenge_id, "failed")
+                    self._resolve_work(
+                        epoch_id,
+                        source_epoch,
+                        result,
+                        item,
+                        assurance,
+                        status="failed",
+                        work_units=0.0,
+                    )
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
                         result.endpoint,
@@ -520,11 +539,14 @@ class ConfidentialRuntime:
                     )
                     continue
                 units = lane.score(result.target.hotkey, [accepted])
-                self.ledger.resolve_challenge(
-                    item.challenge_id,
-                    "verified",
-                    units,
-                    validator_derived=True,
+                self._resolve_work(
+                    epoch_id,
+                    source_epoch,
+                    result,
+                    item,
+                    assurance,
+                    status="verified",
+                    work_units=units,
                 )
                 outcomes[result.target.hotkey] = MinerOutcome(
                     result.target.hotkey,
@@ -535,6 +557,51 @@ class ConfidentialRuntime:
                     work_units=units,
                     assurance=assurance,
                 )
+
+    def _resolve_work(
+        self,
+        epoch_id: int,
+        source_epoch: int,
+        result: _AttestationResult,
+        item: SatWorkItem,
+        assurance: AssuranceClaims,
+        *,
+        status: str,
+        work_units: float,
+    ) -> None:
+        if self.receipt_issuer is None:
+            self.ledger.resolve_challenge(
+                item.challenge_id,
+                status,
+                work_units,
+                validator_derived=status == "verified",
+            )
+            return
+        attested = result.attested
+        assert attested is not None
+        receipt = self.receipt_issuer.issue(
+            epoch_id=epoch_id,
+            source_epoch=source_epoch,
+            subject_hotkey=result.target.hotkey,
+            attested=attested,
+            policy=self.policy,
+            assurance=assurance,
+            challenge_id=item.challenge_id,
+            manifest_digest=_sat_manifest_digest(item),
+            work_units=work_units,
+        )
+        issued_at = receipt.document["issued_at"]
+        assert isinstance(issued_at, str)
+        self.ledger.resolve_challenge_with_receipt(
+            item.challenge_id,
+            status,
+            work_units,
+            validator_derived=status == "verified",
+            receipt_id=receipt.receipt_id,
+            receipt_body=receipt.receipt_bytes,
+            receipt_digest=receipt.receipt_digest,
+            issued_at=issued_at,
+        )
 
     def _collect_attestation(self, target: MinerTarget, endpoint: str) -> _AttestationResult:
         try:
@@ -681,6 +748,26 @@ def _work_assurance(
         reason=None if passed else ReasonCategory.WORK_INVALID,
     )
     return claims.with_claim(AssuranceDimension.WORK, work)
+
+
+def _sat_manifest_digest(item: SatWorkItem) -> str:
+    manifest = {
+        "schema": "cathedral_sat_manifest_v1",
+        "challenge_id": item.challenge_id,
+        "seed": item.seed,
+        "instance": {
+            "n_vars": item.instance.n_vars,
+            "clauses": item.instance.clauses,
+        },
+    }
+    encoded = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return sha256_digest(encoded)
 
 
 def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:

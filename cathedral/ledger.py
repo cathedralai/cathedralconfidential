@@ -14,6 +14,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol
 
+from cathedral.receipt import ReceiptError, parse_receipt_json
+
 
 class LedgerError(Exception):
     """Raised when a ledger invariant would be violated."""
@@ -97,6 +99,18 @@ CREATE TABLE IF NOT EXISTS epoch_scores (
     work_units REAL NOT NULL CHECK (work_units >= 0),
     score REAL NOT NULL CHECK (score >= 0 AND score <= 1),
     PRIMARY KEY (epoch_id, hotkey)
+);
+
+CREATE TABLE IF NOT EXISTS assurance_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
+    hotkey TEXT NOT NULL,
+    challenge_id TEXT NOT NULL UNIQUE REFERENCES challenges(challenge_id),
+    work_status TEXT NOT NULL CHECK (work_status IN ('verified', 'failed', 'abandoned')),
+    receipt_body BLOB NOT NULL,
+    receipt_digest TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    UNIQUE (epoch_id, hotkey)
 );
 """
 
@@ -365,7 +379,12 @@ class Ledger:
                 f"migration table {temp_name!r} in {[row['name'] for row in stray]!r}; "
                 "the ledger file needs manual inspection"
             )
-        for child_table in ("challenges", "epoch_attestations", "epoch_scores"):
+        for child_table in (
+            "challenges",
+            "epoch_attestations",
+            "epoch_scores",
+            "assurance_receipts",
+        ):
             row = cx.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
                 (child_table,),
@@ -511,6 +530,21 @@ class Ledger:
         *,
         validator_derived: bool = False,
     ) -> None:
+        units = self._validated_resolution_units(
+            status, work_units, validator_derived=validator_derived
+        )
+        with self._transaction() as cx:
+            self._resolve_challenge_in_transaction(
+                cx, challenge_id, status, units
+            )
+
+    @staticmethod
+    def _validated_resolution_units(
+        status: str,
+        work_units: float,
+        *,
+        validator_derived: bool,
+    ) -> float:
         if status not in {"verified", "failed", "abandoned"}:
             raise LedgerError(f"invalid resolve status {status!r}")
         try:
@@ -521,26 +555,118 @@ class Ledger:
             raise LedgerError("work_units must be finite and nonnegative")
         if status == "verified" and not validator_derived:
             raise LedgerError("verified work_units must be validator-derived")
-        if status != "verified":
-            units = 0.0
+        return units if status == "verified" else 0.0
 
+    @staticmethod
+    def _resolve_challenge_in_transaction(
+        cx: sqlite3.Connection,
+        challenge_id: str,
+        status: str,
+        units: float,
+    ) -> sqlite3.Row:
+        row = cx.execute(
+            "SELECT c.status, c.epoch_id, c.hotkey, e.status AS epoch_status "
+            "FROM challenges c JOIN epochs e USING(epoch_id) WHERE challenge_id = ?",
+            (challenge_id,),
+        ).fetchone()
+        if row is None:
+            raise LedgerError(f"challenge {challenge_id!r} not found")
+        if row["epoch_status"] != "running":
+            raise LedgerError("challenge can only be resolved while its epoch is running")
+        if row["status"] != "issued":
+            raise LedgerError(f"challenge {challenge_id!r} is already {row['status']}")
+        cx.execute(
+            "UPDATE challenges SET status = ?, work_units = ?, resolved_at = ? "
+            "WHERE challenge_id = ?",
+            (status, units, _now(), challenge_id),
+        )
+        return row
+
+    def resolve_challenge_with_receipt(
+        self,
+        challenge_id: str,
+        status: str,
+        work_units: float,
+        *,
+        validator_derived: bool,
+        receipt_id: str,
+        receipt_body: bytes,
+        receipt_digest: str,
+        issued_at: str,
+    ) -> None:
+        """Atomically resolve work and freeze its exact signed receipt bytes."""
+
+        units = self._validated_resolution_units(
+            status, work_units, validator_derived=validator_derived
+        )
+        if not isinstance(receipt_id, str) or re.fullmatch(
+            r"receipt-sha256:[0-9a-f]{64}", receipt_id
+        ) is None:
+            raise LedgerError("receipt_id is invalid")
+        if not isinstance(receipt_body, bytes) or not receipt_body:
+            raise LedgerError("receipt_body must be nonempty bytes")
+        if not isinstance(receipt_digest, str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", receipt_digest
+        ) is None:
+            raise LedgerError("receipt_digest is invalid")
+        if "sha256:" + hashlib.sha256(receipt_body).hexdigest() != receipt_digest:
+            raise LedgerError("receipt digest does not match receipt bytes")
+        if not isinstance(issued_at, str) or not issued_at:
+            raise LedgerError("receipt issued_at is required")
+        try:
+            receipt = parse_receipt_json(receipt_body)
+        except ReceiptError as exc:
+            raise LedgerError("receipt body is invalid") from exc
+        work = receipt.get("work")
+        allowed_claim_statuses = (
+            {"passed"}
+            if status == "verified"
+            else {"passed", "failed", "stale", "revoked"}
+        )
+        if (
+            _canonical_json(receipt) != receipt_body
+            or receipt.get("receipt_id") != receipt_id
+            or receipt.get("issued_at") != issued_at
+            or not isinstance(work, dict)
+            or work.get("challenge_id") != challenge_id
+            or work.get("status") not in allowed_claim_statuses
+        ):
+            raise LedgerError("receipt body does not match its work resolution")
+        receipt_units = work.get("work_units")
+        try:
+            parsed_units = float(receipt_units)
+        except (TypeError, ValueError) as exc:
+            raise LedgerError("receipt work units are invalid") from exc
+        if not math.isfinite(parsed_units) or parsed_units != units:
+            raise LedgerError("receipt work units do not match their resolution")
         with self._transaction() as cx:
-            row = cx.execute(
-                "SELECT c.status, c.epoch_id, e.status AS epoch_status "
-                "FROM challenges c JOIN epochs e USING(epoch_id) WHERE challenge_id = ?",
-                (challenge_id,),
-            ).fetchone()
-            if row is None:
-                raise LedgerError(f"challenge {challenge_id!r} not found")
-            if row["epoch_status"] != "running":
-                raise LedgerError("challenge can only be resolved while its epoch is running")
-            if row["status"] != "issued":
-                raise LedgerError(f"challenge {challenge_id!r} is already {row['status']}")
-            cx.execute(
-                "UPDATE challenges SET status = ?, work_units = ?, resolved_at = ? "
-                "WHERE challenge_id = ?",
-                (status, units, _now(), challenge_id),
+            row = self._resolve_challenge_in_transaction(
+                cx, challenge_id, status, units
             )
+            if (
+                receipt.get("epoch_id") != row["epoch_id"]
+                or receipt.get("subject_hotkey") != row["hotkey"]
+            ):
+                raise LedgerError("receipt subject does not match its issued challenge")
+            try:
+                cx.execute(
+                    "INSERT INTO assurance_receipts("
+                    "receipt_id, epoch_id, hotkey, challenge_id, work_status, "
+                    "receipt_body, receipt_digest, issued_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        receipt_id,
+                        row["epoch_id"],
+                        row["hotkey"],
+                        challenge_id,
+                        status,
+                        receipt_body,
+                        receipt_digest,
+                        issued_at,
+                    ),
+                )
+            except sqlite3.DatabaseError as exc:
+                raise LedgerError("failed to persist receipt atomically") from exc
 
     def add_attestation(
         self,
@@ -782,6 +908,16 @@ class Ledger:
                 "SELECT * FROM epochs WHERE epoch_id = ?", (epoch_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def receipt_for_challenge(self, challenge_id: str) -> Mapping[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT receipt_id, epoch_id, hotkey, challenge_id, work_status, "
+                "receipt_body, receipt_digest, issued_at FROM assurance_receipts "
+                "WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()
+        return MappingProxyType(dict(row)) if row is not None else None
 
     def attested_hotkeys(self, epoch_id: int) -> frozenset[str]:
         with self._lock:

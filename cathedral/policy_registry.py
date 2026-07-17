@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -45,6 +45,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "valid_from",
         "valid_until",
         "signing_key_id",
+        "receipt_signing_keys",
         "profiles",
         "metadata",
         "signature",
@@ -69,12 +70,33 @@ _PROFILE_KEYS = frozenset(
     }
 )
 _SIGNATURE_KEYS = frozenset({"algorithm", "value_base64"})
+_RECEIPT_KEY_KEYS = frozenset(
+    {
+        "id",
+        "algorithm",
+        "public_key_base64",
+        "purpose",
+        "status",
+        "status_changed_at",
+        "valid_from",
+        "valid_until",
+        "revoked_at",
+        "replacement_key_id",
+        "metadata",
+    }
+)
 _PROFILE_KINDS = frozenset({"cpu_tdx", "cpu_snp", "gpu_cc"})
 _PROFILE_STATUSES = frozenset({"active", "retiring", "retired", "revoked"})
 _TRANSITIONS = {
     "active": frozenset({"active", "retiring", "revoked"}),
     "retiring": frozenset({"retiring", "retired", "revoked"}),
     "retired": frozenset({"retired"}),
+    "revoked": frozenset({"revoked"}),
+}
+_RECEIPT_KEY_STATUSES = frozenset({"active", "retired", "revoked"})
+_RECEIPT_KEY_TRANSITIONS = {
+    "active": frozenset({"active", "retired", "revoked"}),
+    "retired": frozenset({"retired", "revoked"}),
     "revoked": frozenset({"revoked"}),
 }
 
@@ -228,6 +250,31 @@ class PolicyProfile:
 
 
 @dataclass(frozen=True)
+class ReceiptVerificationKey:
+    key_id: str
+    public_key: bytes
+    status: str
+    status_changed_at: datetime
+    valid_from: datetime
+    valid_until: datetime
+    revoked_at: datetime | None
+    replacement_key_id: str | None
+    metadata: Mapping[str, object]
+
+    def can_sign_at(self, when: datetime) -> bool:
+        return (
+            self.status == "active"
+            and self.valid_from <= self.status_changed_at <= when < self.valid_until
+        )
+
+    def can_verify_at(self, when: datetime) -> bool:
+        if self.status == "revoked":
+            return False
+        cutoff = self.status_changed_at if self.status == "retired" else self.valid_until
+        return self.valid_from <= when < min(cutoff, self.valid_until)
+
+
+@dataclass(frozen=True)
 class PolicyRegistrySnapshot:
     release: int
     generated_at: datetime
@@ -236,8 +283,15 @@ class PolicyRegistrySnapshot:
     signing_key_id: str
     digest: str
     profiles: tuple[PolicyProfile, ...]
+    receipt_signing_keys: tuple[ReceiptVerificationKey, ...]
     metadata: Mapping[str, object]
     canonical_document: bytes
+
+    def receipt_key(self, key_id: str) -> ReceiptVerificationKey | None:
+        return next(
+            (key for key in self.receipt_signing_keys if key.key_id == key_id),
+            None,
+        )
 
     def profile_states(self) -> Mapping[str, str]:
         return MappingProxyType(
@@ -357,6 +411,71 @@ def _profile(raw: object, registry_from: datetime, registry_until: datetime) -> 
     )
 
 
+def _receipt_key(
+    raw: object, registry_from: datetime, registry_until: datetime
+) -> ReceiptVerificationKey:
+    if not isinstance(raw, dict) or frozenset(raw) != _RECEIPT_KEY_KEYS:
+        raise PolicyRegistryError(
+            "receipt signing key contains missing or unknown critical fields"
+        )
+    key_id = raw["id"]
+    if not isinstance(key_id, str) or _ID_RE.fullmatch(key_id) is None:
+        raise PolicyRegistryError("receipt signing key id is invalid")
+    if raw["algorithm"] != "ed25519" or raw["purpose"] != "assurance_receipt":
+        raise PolicyRegistryError("receipt signing key algorithm or purpose is unsupported")
+    try:
+        public_key = base64.b64decode(raw["public_key_base64"], validate=True)
+    except (TypeError, binascii.Error, ValueError) as exc:
+        raise PolicyRegistryError("receipt signing key is not canonical base64") from exc
+    if (
+        len(public_key) != 32
+        or base64.b64encode(public_key).decode("ascii")
+        != raw["public_key_base64"]
+    ):
+        raise PolicyRegistryError("receipt signing key must be 32 bytes")
+    status = raw["status"]
+    if status not in _RECEIPT_KEY_STATUSES:
+        raise PolicyRegistryError("receipt signing key status is unsupported")
+    changed = _timestamp(raw["status_changed_at"], "receipt key status_changed_at")
+    valid_from = _timestamp(raw["valid_from"], "receipt key valid_from")
+    valid_until = _timestamp(raw["valid_until"], "receipt key valid_until")
+    if not registry_from <= valid_from < valid_until <= registry_until:
+        raise PolicyRegistryError("receipt key validity must fit inside registry validity")
+    if not valid_from <= changed < valid_until:
+        raise PolicyRegistryError("receipt key status change must fall inside its validity")
+    revoked_raw = raw["revoked_at"]
+    revoked_at = (
+        None
+        if revoked_raw is None
+        else _timestamp(revoked_raw, "receipt key revoked_at")
+    )
+    if status == "revoked":
+        if revoked_at != changed:
+            raise PolicyRegistryError(
+                "revoked receipt key time must equal its status transition time"
+            )
+    elif revoked_at is not None:
+        raise PolicyRegistryError("non-revoked receipt key cannot set revoked_at")
+    replacement = raw["replacement_key_id"]
+    if replacement is not None and (
+        not isinstance(replacement, str)
+        or _ID_RE.fullmatch(replacement) is None
+        or replacement == key_id
+    ):
+        raise PolicyRegistryError("receipt key replacement id is invalid")
+    return ReceiptVerificationKey(
+        key_id=key_id,
+        public_key=public_key,
+        status=status,
+        status_changed_at=changed,
+        valid_from=valid_from,
+        valid_until=valid_until,
+        revoked_at=revoked_at,
+        replacement_key_id=replacement,
+        metadata=_validate_metadata(raw["metadata"], "receipt key metadata"),
+    )
+
+
 def verify_registry(
     data: bytes | str,
     trusted_keys: Mapping[str, bytes],
@@ -392,7 +511,11 @@ def verify_registry(
         signature_bytes = base64.b64decode(signature["value_base64"], validate=True)
     except (TypeError, binascii.Error, ValueError) as exc:
         raise PolicyRegistryError("registry signature is not canonical base64") from exc
-    if len(signature_bytes) != 64:
+    if (
+        len(signature_bytes) != 64
+        or base64.b64encode(signature_bytes).decode("ascii")
+        != signature["value_base64"]
+    ):
         raise PolicyRegistryError("registry signature must be 64 bytes")
     signed = canonical_signed_bytes(document)
     try:
@@ -442,6 +565,33 @@ def verify_registry(
     ids = [profile.profile_id for profile in profiles]
     if len(set(ids)) != len(ids):
         raise PolicyRegistryError("registry profile ids must be unique")
+    keys_raw = document["receipt_signing_keys"]
+    if not isinstance(keys_raw, list) or len(keys_raw) > 128:
+        raise PolicyRegistryError("receipt signing keys must be a bounded list")
+    receipt_keys = tuple(
+        _receipt_key(raw, valid_from, valid_until) for raw in keys_raw
+    )
+    if any(
+        key.status_changed_at > check_time
+        and not (
+            key.status == "active"
+            and key.status_changed_at == key.valid_from
+        )
+        for key in receipt_keys
+    ):
+        raise PolicyRegistryError(
+            "receipt signing key status transition is not yet effective"
+        )
+    key_ids = [key.key_id for key in receipt_keys]
+    if len(set(key_ids)) != len(key_ids):
+        raise PolicyRegistryError("receipt signing key ids must be unique")
+    known_key_ids = set(key_ids)
+    if any(
+        key.replacement_key_id is not None
+        and key.replacement_key_id not in known_key_ids
+        for key in receipt_keys
+    ):
+        raise PolicyRegistryError("receipt replacement key must exist in the registry")
     canonical_document = canonical_json(document)
     return PolicyRegistrySnapshot(
         release=release,
@@ -451,6 +601,7 @@ def verify_registry(
         signing_key_id=key_id,
         digest="sha256:" + hashlib.sha256(canonical_document).hexdigest(),
         profiles=profiles,
+        receipt_signing_keys=receipt_keys,
         metadata=_validate_metadata(document["metadata"], "registry metadata"),
         canonical_document=canonical_document,
     )
@@ -520,10 +671,22 @@ class PolicyRegistryState:
                         release INTEGER NOT NULL,
                         digest TEXT NOT NULL,
                         profile_states_json TEXT NOT NULL,
+                        receipt_key_states_json TEXT NOT NULL DEFAULT '{}',
                         accepted_at TEXT NOT NULL
                     )
                     """
                 )
+                columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(policy_registry_state)"
+                    )
+                }
+                if "receipt_key_states_json" not in columns:
+                    connection.execute(
+                        "ALTER TABLE policy_registry_state ADD COLUMN "
+                        "receipt_key_states_json TEXT NOT NULL DEFAULT '{}'"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
@@ -535,7 +698,8 @@ class PolicyRegistryState:
     def current(self) -> Mapping[str, object] | None:
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT release, digest, profile_states_json, accepted_at "
+                "SELECT release, digest, profile_states_json, "
+                "receipt_key_states_json, accepted_at "
                 "FROM policy_registry_state WHERE singleton = 1"
             ).fetchone()
         return MappingProxyType(dict(row)) if row is not None else None
@@ -566,6 +730,61 @@ class PolicyRegistryState:
             )
         return states
 
+    @staticmethod
+    def _decode_receipt_key_states(encoded: object) -> dict[str, dict[str, str]]:
+        if not isinstance(encoded, str) or len(encoded.encode("utf-8")) > MAX_REGISTRY_BYTES:
+            raise PolicyRegistryError("persisted receipt key state is invalid")
+        try:
+            states = json.loads(encoded, object_pairs_hook=_reject_duplicate_keys)
+        except (PolicyRegistryError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PolicyRegistryError("persisted receipt key state is invalid") from exc
+        if not isinstance(states, dict):
+            raise PolicyRegistryError("persisted receipt key state is invalid")
+        for key_id, state in states.items():
+            if (
+                not isinstance(key_id, str)
+                or _ID_RE.fullmatch(key_id) is None
+                or not isinstance(state, dict)
+                or frozenset(state)
+                != {
+                    "status",
+                    "status_changed_at",
+                    "public_key_base64",
+                    "valid_from",
+                    "valid_until",
+                }
+                or not isinstance(state["status"], str)
+                or state["status"] not in _RECEIPT_KEY_STATUSES
+            ):
+                raise PolicyRegistryError("persisted receipt key state is invalid")
+            try:
+                public_key = base64.b64decode(
+                    state["public_key_base64"], validate=True
+                )
+            except (TypeError, binascii.Error, ValueError) as exc:
+                raise PolicyRegistryError("persisted receipt key state is invalid") from exc
+            if (
+                len(public_key) != 32
+                or base64.b64encode(public_key).decode("ascii")
+                != state["public_key_base64"]
+            ):
+                raise PolicyRegistryError("persisted receipt key state is invalid")
+            _timestamp(
+                state["status_changed_at"],
+                "persisted receipt key status_changed_at",
+            )
+            valid_from = _timestamp(
+                state["valid_from"],
+                "persisted receipt key valid_from",
+            )
+            valid_until = _timestamp(
+                state["valid_until"],
+                "persisted receipt key valid_until",
+            )
+            if valid_from >= valid_until:
+                raise PolicyRegistryError("persisted receipt key state is invalid")
+        return states
+
     def accept(self, snapshot: PolicyRegistrySnapshot) -> None:
         if self.minimum_release is not None and snapshot.release < self.minimum_release:
             raise PolicyRegistryError("registry release is below the configured minimum")
@@ -578,11 +797,24 @@ class PolicyRegistryState:
             }
             for profile in snapshot.profiles
         }
+        key_states = {
+            key.key_id: {
+                "status": key.status,
+                "status_changed_at": key.status_changed_at.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "public_key_base64": base64.b64encode(key.public_key).decode("ascii"),
+                "valid_from": key.valid_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "valid_until": key.valid_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            for key in snapshot.receipt_signing_keys
+        }
         with self._lock, closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    "SELECT release, digest, profile_states_json "
+                    "SELECT release, digest, profile_states_json, "
+                    "receipt_key_states_json "
                     "FROM policy_registry_state WHERE singleton = 1"
                 ).fetchone()
                 if row is None:
@@ -596,6 +828,12 @@ class PolicyRegistryState:
                             )
                 else:
                     prior_release = int(row["release"])
+                    prior_states = self._decode_profile_states(
+                        row["profile_states_json"]
+                    )
+                    prior_key_states = self._decode_receipt_key_states(
+                        row["receipt_key_states_json"]
+                    )
                     if snapshot.release == prior_release:
                         if snapshot.digest == row["digest"]:
                             connection.execute("COMMIT")
@@ -603,9 +841,6 @@ class PolicyRegistryState:
                         raise PolicyRegistryError("registry release was equivocated")
                     if snapshot.release < prior_release:
                         raise PolicyRegistryError("registry rollback rejected")
-                    prior_states = self._decode_profile_states(
-                        row["profile_states_json"]
-                    )
                     for profile_id, prior_state in prior_states.items():
                         current_state = states.get(profile_id)
                         if current_state is None:
@@ -633,21 +868,66 @@ class PolicyRegistryState:
                             raise PolicyRegistryError(
                                 "new registry profile must begin active"
                             )
+                    for key_id, prior_state in prior_key_states.items():
+                        current_state = key_states.get(key_id)
+                        if current_state is None:
+                            raise PolicyRegistryError(
+                                "registry cannot remove a historical receipt key"
+                            )
+                        prior_status = prior_state["status"]
+                        current_status = current_state["status"]
+                        if (
+                            current_state["public_key_base64"]
+                            != prior_state["public_key_base64"]
+                        ):
+                            raise PolicyRegistryError(
+                                f"receipt key material changed for {key_id}"
+                            )
+                        if (
+                            current_state["valid_from"] != prior_state["valid_from"]
+                            or current_state["valid_until"]
+                            != prior_state["valid_until"]
+                        ):
+                            raise PolicyRegistryError(
+                                f"receipt key validity window changed for {key_id}"
+                            )
+                        if current_status not in _RECEIPT_KEY_TRANSITIONS[prior_status]:
+                            raise PolicyRegistryError(
+                                f"invalid receipt key transition for {key_id}"
+                            )
+                        prior_changed = prior_state["status_changed_at"]
+                        current_changed = current_state["status_changed_at"]
+                        if current_status == prior_status and current_changed != prior_changed:
+                            raise PolicyRegistryError(
+                                f"unchanged receipt key rewrote transition time for {key_id}"
+                            )
+                        if current_status != prior_status and current_changed <= prior_changed:
+                            raise PolicyRegistryError(
+                                f"receipt key transition time did not advance for {key_id}"
+                            )
+                    for key_id in key_states.keys() - prior_key_states.keys():
+                        if key_states[key_id]["status"] != "active":
+                            raise PolicyRegistryError(
+                                "new receipt signing key must begin active"
+                            )
                 connection.execute(
                     """
                     INSERT INTO policy_registry_state(
-                        singleton, release, digest, profile_states_json, accepted_at
-                    ) VALUES (1, ?, ?, ?, ?)
+                        singleton, release, digest, profile_states_json,
+                        receipt_key_states_json, accepted_at
+                    ) VALUES (1, ?, ?, ?, ?, ?)
                     ON CONFLICT(singleton) DO UPDATE SET
                         release=excluded.release,
                         digest=excluded.digest,
                         profile_states_json=excluded.profile_states_json,
+                        receipt_key_states_json=excluded.receipt_key_states_json,
                         accepted_at=excluded.accepted_at
                     """,
                     (
                         snapshot.release,
                         snapshot.digest,
                         canonical_json(states).decode("ascii"),
+                        canonical_json(key_states).decode("ascii"),
                         datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     ),
                 )

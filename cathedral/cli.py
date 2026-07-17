@@ -44,9 +44,18 @@ from cathedral.ledger import Ledger
 from cathedral.poster import Poster
 from cathedral.policy_registry import (
     MAX_REGISTRY_BYTES,
+    PolicyRegistryError,
+    PolicyRegistrySnapshot,
     PolicyRegistryState,
     parse_registry_json,
     verify_registry,
+)
+from cathedral.receipt import (
+    MAX_RECEIPT_BYTES,
+    ReceiptError,
+    ReceiptIssuer,
+    parse_receipt_json,
+    verify_receipt,
 )
 from cathedral.runtime import (
     ConfidentialRuntime,
@@ -413,6 +422,30 @@ def _verified_registry_policy(
     pinned_release: int | None = None,
     pinned_digest: str | None = None,
 ) -> Policy:
+    policy, _snapshot = _verified_registry_snapshot_and_policy(
+        registry_path,
+        keys_path,
+        state_path=state_path,
+        minimum_release=minimum_release,
+        max_age_seconds=max_age_seconds,
+        production_mode=production_mode,
+        pinned_release=pinned_release,
+        pinned_digest=pinned_digest,
+    )
+    return policy
+
+
+def _verified_registry_snapshot_and_policy(
+    registry_path: str,
+    keys_path: str,
+    *,
+    state_path: str,
+    minimum_release: int | None,
+    max_age_seconds: int,
+    production_mode: bool,
+    pinned_release: int | None = None,
+    pinned_digest: str | None = None,
+) -> tuple[Policy, PolicyRegistrySnapshot]:
     data = _read_bounded_registry_file(registry_path, "policy registry")
     snapshot = verify_registry(
         data,
@@ -430,7 +463,70 @@ def _verified_registry_policy(
         pinned_digest=pinned_digest,
     )
     state.accept(snapshot)
-    return policy
+    return policy, snapshot
+
+
+def _read_bounded_receipt_file(path: str, label: str) -> bytes:
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(MAX_RECEIPT_BYTES + 1)
+    except OSError as exc:
+        raise ReceiptError("schema", f"unable to load {label}") from exc
+    if len(data) > MAX_RECEIPT_BYTES:
+        raise ReceiptError("schema", f"{label} exceeds the maximum encoded size")
+    return data
+
+
+def _load_receipt_private_seed(path: str, *, production_mode: bool) -> bytes:
+    target = Path(path)
+    try:
+        before = target.lstat()
+    except OSError as exc:
+        raise ValueError("unable to load receipt signing key") from exc
+    if not stat.S_ISREG(before.st_mode) or target.is_symlink():
+        raise ValueError("receipt signing key must be a regular non-symlink file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as exc:
+        raise ValueError("unable to load receipt signing key") from exc
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise ValueError(
+                    "receipt signing key must be a stable regular non-symlink file"
+                )
+            if production_mode and metadata.st_mode & 0o077:
+                raise ValueError(
+                    "production receipt signing key must not be group/world accessible"
+                )
+            if (
+                production_mode
+                and hasattr(os, "getuid")
+                and metadata.st_uid != os.getuid()
+            ):
+                raise ValueError(
+                    "production receipt signing key must be owned by the runtime user"
+                )
+            raw = os.read(descriptor, 257)
+        except OSError as exc:
+            raise ValueError("unable to load receipt signing key") from exc
+    finally:
+        os.close(descriptor)
+    if len(raw) > 256:
+        raise ValueError("receipt signing key must be a 32-byte base64 seed")
+    try:
+        seed = base64.b64decode(raw.strip(), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("receipt signing key must be a 32-byte base64 seed") from exc
+    if len(seed) != 32:
+        raise ValueError("receipt signing key must be a 32-byte base64 seed")
+    return seed
 
 
 def cmd_policy_registry_verify(args: argparse.Namespace) -> int:
@@ -467,6 +563,73 @@ def cmd_policy_registry_verify(args: argparse.Namespace) -> int:
                     {"id": profile.profile_id, "kind": profile.kind, "status": profile.status}
                     for profile in snapshot.profiles
                 ],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_receipt_verify(args: argparse.Namespace) -> int:
+    try:
+        receipt_bytes = _read_bounded_receipt_file(args.receipt, "assurance receipt")
+        preview = parse_receipt_json(receipt_bytes)
+        issued_raw = preview.get("issued_at")
+        if (
+            not isinstance(issued_raw, str)
+            or re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", issued_raw
+            )
+            is None
+        ):
+            raise ReceiptError("schema", "receipt issued_at is invalid")
+        try:
+            issued_at = datetime.datetime.strptime(
+                issued_raw, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=datetime.UTC)
+        except ValueError as exc:
+            raise ReceiptError("schema", "receipt issued_at is invalid") from exc
+        policy_registry = verify_registry(
+            _read_bounded_registry_file(args.policy_registry, "policy registry"),
+            _load_registry_keys(args.trusted_keys),
+            historical_at=issued_at,
+        )
+        key_registry = policy_registry
+        if getattr(args, "key_registry", None) is not None:
+            key_registry = verify_registry(
+                _read_bounded_registry_file(args.key_registry, "receipt key registry"),
+                _load_registry_keys(args.key_registry_trusted_keys or args.trusted_keys),
+                max_age_seconds=args.key_registry_max_age_seconds,
+            )
+        verified = verify_receipt(
+            receipt_bytes,
+            policy_registry,
+            key_registry=key_registry,
+        )
+    except ReceiptError as exc:
+        print(
+            json.dumps(
+                {"valid": False, "category": exc.category, "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    except (PolicyRegistryError, ValueError) as exc:
+        print(
+            json.dumps(
+                {"valid": False, "category": "policy_registry", "error": str(exc)},
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(
+        json.dumps(
+            {
+                "valid": True,
+                "receipt_id": verified.receipt_id,
+                "receipt_digest": verified.receipt_digest,
+                "policy_registry_release": policy_registry.release,
+                "key_registry_release": key_registry.release,
             },
             sort_keys=True,
         )
@@ -558,6 +721,7 @@ def _build_runtime(
     )
     measurements_file = getattr(args, "measurements_file", None)
     policy_registry = getattr(args, "policy_registry", None)
+    policy_snapshot: PolicyRegistrySnapshot | None = None
     if measurements_file and policy_registry:
         raise ValueError(
             "--measurements-file and --policy-registry are mutually exclusive"
@@ -566,7 +730,7 @@ def _build_runtime(
         for name in ("policy_registry_keys", "policy_registry_state"):
             if not getattr(args, name, None):
                 raise ValueError(f"--{name.replace('_', '-')} is required with --policy-registry")
-        policy = _verified_registry_policy(
+        policy, policy_snapshot = _verified_registry_snapshot_and_policy(
             policy_registry,
             args.policy_registry_keys,
             state_path=args.policy_registry_state,
@@ -585,6 +749,24 @@ def _build_runtime(
         # runtime methods operate only on already-frozen ledger state, so they
         # intentionally need no current admission policy.
         policy = Policy()
+    receipt_key_id = getattr(args, "receipt_signing_key_id", None)
+    receipt_key_file = getattr(args, "receipt_signing_key_file", None)
+    if (receipt_key_id is None) != (receipt_key_file is None):
+        raise ValueError(
+            "--receipt-signing-key-id and --receipt-signing-key-file are required together"
+        )
+    receipt_issuer = None
+    if receipt_key_id is not None:
+        if policy_snapshot is None:
+            raise ValueError("receipt issuance requires --policy-registry authority")
+        receipt_issuer = ReceiptIssuer(
+            policy_snapshot,
+            receipt_key_id,
+            _load_receipt_private_seed(
+                receipt_key_file,
+                production_mode=config.production_mode,
+            ),
+        )
     ledger = Ledger(args.ledger_db)
     runtime = ConfidentialRuntime(
         RegistryStore(getattr(args, "registry_db", ":memory:")),
@@ -593,6 +775,7 @@ def _build_runtime(
         _publisher_from_args(args),
         token_provider=tokens.get,
         config=config,
+        receipt_issuer=receipt_issuer,
     )
     return runtime, ledger, tokens
 
@@ -844,6 +1027,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_policy_verify.set_defaults(func=cmd_policy_registry_verify)
 
+    p_receipt = sub.add_parser("receipt", help="verify assurance receipts")
+    receipt_sub = p_receipt.add_subparsers(dest="receipt_command", required=True)
+    p_receipt_verify = receipt_sub.add_parser(
+        "verify", help="offline verification of exact signed receipt bytes"
+    )
+    p_receipt_verify.add_argument("--receipt", required=True)
+    p_receipt_verify.add_argument("--policy-registry", required=True)
+    p_receipt_verify.add_argument("--trusted-keys", required=True)
+    p_receipt_verify.add_argument(
+        "--key-registry",
+        help="newer registry used to enforce receipt-key retirement or revocation",
+    )
+    p_receipt_verify.add_argument("--key-registry-trusted-keys")
+    p_receipt_verify.add_argument(
+        "--key-registry-max-age-seconds", type=int, default=86400
+    )
+    p_receipt_verify.set_defaults(func=cmd_receipt_verify)
+
     p_runtime = sub.add_parser("runtime", help="operate confidential TDX report epochs")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
 
@@ -860,6 +1061,8 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--policy-registry-max-age-seconds", type=int, default=86400
         )
+        command.add_argument("--receipt-signing-key-id")
+        command.add_argument("--receipt-signing-key-file")
         command.add_argument("--tokens-file", default=None)
         command.add_argument("--miner-timeout-seconds", type=float, default=10.0)
         command.add_argument("--miner-attempts", type=int, default=2)

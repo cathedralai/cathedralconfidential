@@ -35,6 +35,15 @@ key that authorizes itself. Rotation uses a bounded overlap in which operators
 pin the new key before a release signed by it is accepted, then remove the old
 key after all validators have crossed the announced checkpoint.
 
+Receipt-verification keys are different: their public keys are signed registry
+content under `receipt_signing_keys`, while their authority still derives from
+the locally pinned registry-signing root. Each receipt key fixes its ID,
+Ed25519 public key, `assurance_receipt` purpose, active window, lifecycle state,
+transition time, and optional replacement. Receipt key material is immutable
+across releases and published keys cannot be removed. Active keys may sign;
+retired keys verify only receipts predating retirement; revoked keys verify no
+receipts. See [`RECEIPTS.md`](RECEIPTS.md) for rotation and compromise behavior.
+
 Run the customer-safe verifier:
 
 ```bash

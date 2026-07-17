@@ -25,6 +25,7 @@ from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane, solve_sat
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 from cathedral.ledger import Ledger, LedgerError
+from cathedral.receipt import ReceiptIssuer, verify_receipt
 from cathedral.runtime import (
     ConfidentialRuntime,
     MinerTarget,
@@ -138,6 +139,8 @@ def make_runtime(
     poster: object | None = None,
     attempts: int = 2,
     nonce_factory=None,
+    policy: Policy | None = None,
+    receipt_issuer: ReceiptIssuer | None = None,
 ) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
     registry = RegistryStore(str(tmp_path / "registry.sqlite"))
     for hotkey, endpoint in enrollments:
@@ -147,7 +150,7 @@ def make_runtime(
     runtime = ConfidentialRuntime(
         registry,
         actual_ledger,
-        Policy(allowed_measurements={"measurement"}),
+        policy or Policy(allowed_measurements={"measurement"}),
         poster,  # type: ignore[arg-type]
         verifier=verifier,
         nonce_factory=nonce_factory or issue_nonce,
@@ -158,6 +161,7 @@ def make_runtime(
             production_mode=False,
             allow_insecure_http_for_tests=True,
         ),
+        receipt_issuer=receipt_issuer,
     )
     return runtime, actual_ledger, factory
 
@@ -279,6 +283,79 @@ def test_two_unique_tdx_miners_complete_normalized(tmp_path: Path) -> None:
     assert dict(run.scores) == {"miner-a": 1.0, "miner-b": 1.0}
     assert {outcome.status for outcome in run.outcomes} == {"verified"}
     assert all(outcome.work_units == 20 for outcome in run.outcomes)
+
+
+@pytest.mark.parametrize(
+    ("invalid_sat", "expected_outcome", "expected_claim", "expected_units"),
+    [
+        (False, "verified", "passed", "20"),
+        (True, "sat_failed", "failed", "0"),
+    ],
+)
+def test_runtime_atomically_persists_offline_verifiable_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_sat: bool,
+    expected_outcome: str,
+    expected_claim: str,
+    expected_units: str,
+) -> None:
+    from tests.test_receipt import ISSUED, ISSUED_TEXT, RECEIPT_SEED_1, _snapshot
+
+    snapshot = _snapshot()
+    policy = snapshot.to_policy(at=ISSUED)
+    issuer = ReceiptIssuer(
+        snapshot,
+        "receipt-test-1",
+        RECEIPT_SEED_1,
+        clock=lambda: ISSUED,
+    )
+    monkeypatch.setattr("cathedral.assurance.verified_at_now", lambda: ISSUED_TEXT)
+    specs = default_specs(**{"9001": MinerSpec("a", invalid_sat=invalid_sat)})
+    runtime, ledger, _ = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        specs,
+        policy=policy,
+        receipt_issuer=issuer,
+    )
+
+    def registry_verifier(evidence: Evidence, nonce: bytes, active: Policy) -> Attested:
+        assert evidence.nonce == nonce
+        return Attested(
+            Tier.CC_CPU_TDX,
+            evidence.quote.decode().removeprefix("chip:"),
+            "tdx-measurement-sha256:sample-v1",
+            1,
+            tcb_status="UpToDate",
+            advisory_ids=(),
+            debug_enabled=False,
+            collateral_current=True,
+            tcb_svn="01" * 16,
+            policy_mode="strict",
+            assurance=attestation_claims(
+                evidence.quote,
+                active,
+                verified_at=ISSUED_TEXT,
+            ),
+        )
+
+    runtime.verifier = registry_verifier
+    run = runtime.run_epoch(11, CANARY)
+    outcome = next(item for item in run.outcomes if item.hotkey == "miner")
+    stored = ledger.receipt_for_challenge(outcome.challenge_id or "")
+
+    assert stored is not None
+    verified = verify_receipt(stored["receipt_body"], snapshot)
+    assert stored["receipt_id"] == verified.receipt_id
+    assert stored["receipt_digest"] == verified.receipt_digest
+    assert verified.document["epoch_id"] == run.epoch_id
+    assert verified.document["source_epoch"] == 11
+    assert verified.document["subject_hotkey"] == "miner"
+    assert verified.document["work"]["challenge_id"] == outcome.challenge_id
+    assert outcome.status == expected_outcome
+    assert verified.document["work"]["status"] == expected_claim
+    assert verified.document["work"]["work_units"] == expected_units
 
 
 def test_hardware_pass_with_work_failure_is_explicit_zero(tmp_path: Path) -> None:

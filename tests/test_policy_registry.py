@@ -35,6 +35,13 @@ PUBLIC_KEY = PRIVATE_KEY.public_key().public_bytes(
     serialization.PublicFormat.Raw,
 )
 TRUSTED = {"cathedral-policy-test-1": PUBLIC_KEY}
+RECEIPT_PRIVATE_SEED = bytes(range(32, 64))
+RECEIPT_PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(
+    RECEIPT_PRIVATE_SEED
+).public_key().public_bytes(
+    serialization.Encoding.Raw,
+    serialization.PublicFormat.Raw,
+)
 NOW = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
 
 
@@ -81,6 +88,23 @@ def _unsigned(
         "valid_from": valid_from,
         "valid_until": valid_until,
         "signing_key_id": "cathedral-policy-test-1",
+        "receipt_signing_keys": [
+            {
+                "id": "cathedral-receipt-test-1",
+                "algorithm": "ed25519",
+                "public_key_base64": base64.b64encode(RECEIPT_PUBLIC_KEY).decode(
+                    "ascii"
+                ),
+                "purpose": "assurance_receipt",
+                "status": "active",
+                "status_changed_at": valid_from,
+                "valid_from": valid_from,
+                "valid_until": valid_until,
+                "revoked_at": None,
+                "replacement_key_id": None,
+                "metadata": {"environment": "test-only"},
+            }
+        ],
         "profiles": profiles or [_profile(valid_from=valid_from, valid_until=valid_until)],
         "metadata": {"purpose": "public test policy", "critical": True},
     }
@@ -114,6 +138,7 @@ def test_golden_canonicalization_and_ed25519_signature():
         lambda doc: doc.update(valid_until="2026-07-21T00:00:00Z"),
         lambda doc: doc["profiles"][0]["measurements"].append("other"),
         lambda doc: doc["profiles"][0].update(min_tcb=1),
+        lambda doc: doc["receipt_signing_keys"][0].update(status="retired"),
         lambda doc: doc["metadata"].update(critical=False),
     ],
 )

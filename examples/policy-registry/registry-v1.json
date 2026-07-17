@@ -5,6 +5,23 @@
   "valid_from": "2026-07-17T01:00:00Z",
   "valid_until": "2026-07-20T00:00:00Z",
   "signing_key_id": "cathedral-policy-test-1",
+  "receipt_signing_keys": [
+    {
+      "id": "cathedral-receipt-test-1",
+      "algorithm": "ed25519",
+      "public_key_base64": "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=",
+      "purpose": "assurance_receipt",
+      "status": "active",
+      "status_changed_at": "2026-07-17T01:00:00Z",
+      "valid_from": "2026-07-17T01:00:00Z",
+      "valid_until": "2026-07-20T00:00:00Z",
+      "revoked_at": null,
+      "replacement_key_id": null,
+      "metadata": {
+        "environment": "public-test-only"
+      }
+    }
+  ],
   "profiles": [
     {
       "id": "cpu-tdx-sample-v1",
@@ -37,6 +54,6 @@
   },
   "signature": {
     "algorithm": "ed25519",
-    "value_base64": "oOwMX4hYvJ/uyrslo1hAcOu5YcV+gQiYCThw2oyd5d+YP5H3tu/lqr25/mIv6blERGx/2wb/ID2SeOJmdhqgCg=="
+    "value_base64": "vfdEfg25MxEw8jHOSuxMpG9a1caGi6VK6hWVYNdUBKQ9bj5UbkF0QhUgWX2DQ7JNfYer79jbgLmVtG30u1ifDA=="
   }
 }
