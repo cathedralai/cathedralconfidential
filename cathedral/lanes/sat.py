@@ -2,15 +2,12 @@
 
 Certificate checking is the star: a satisfiable claim is checked by scanning
 the instance once (O(#literals), no solving); it cannot be forged because a
-wrong assignment simply fails a clause. An UNSAT claim is checked in the
-testable core by re-running the DPLL solver below and confirming it also
-finds no assignment (Phase-2 replaces this re-solve with a DRAT proof carried
-in the certificate).
+wrong assignment simply fails a clause. The launch verifier rejects every
+UNSAT claim without search. Phase 2 adds proof-carrying UNSAT certificates.
 
 ``solve_sat`` is a small, deterministic DPLL solver: unit propagation, then
-branch on the first unassigned variable (try True then False). It is used to
-*produce* assignments for canonical work and to check UNSAT claims -- never on
-the satisfiable-accept path.
+branch on the first unassigned variable (try True then False). It is used only
+to produce assignments, never on the certificate-accept path.
 """
 
 from __future__ import annotations
@@ -27,6 +24,16 @@ from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
 _QUALIFIED_TIERS = {Tier.CC_CPU_SNP, Tier.CC_CPU_TDX}
 _MAX_NONNEGATIVE_SIGNED_I64 = (1 << 63) - 1
+# The bundled DPLL solver is recursive. Keep accepted customer work comfortably
+# below Python's default recursion limit until an iterative solver replaces it.
+MAX_N_VARS = 512
+MAX_CLAUSES = 8192
+MAX_LITERALS = 65_536
+MAX_LITERALS_PER_CLAUSE = 1024
+MIN_SEED = -(2**63)
+MAX_SEED = 2**63 - 1
+MAX_CUSTOMER_WORK_BYTES = 60 * 1024
+CUSTOMER_SAT_WORK_UNITS = 20.0
 
 
 def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
@@ -42,6 +49,76 @@ def _compute_challenge_id(instance: SatInstance, seed: int) -> str:
     }
     h = hashlib.sha256(json.dumps(payload, sort_keys=True).encode())
     return h.hexdigest()
+
+
+def validate_sat_instance(instance: SatInstance) -> None:
+    """Reject malformed or resource-unbounded SAT input."""
+
+    if not isinstance(instance, SatInstance):
+        raise ValueError("invalid SAT instance")
+    n_vars = instance.n_vars
+    clauses = instance.clauses
+    if (
+        isinstance(n_vars, bool)
+        or not isinstance(n_vars, int)
+        or not 1 <= n_vars <= MAX_N_VARS
+    ):
+        raise ValueError("invalid SAT n_vars")
+    if not isinstance(clauses, list) or len(clauses) > MAX_CLAUSES:
+        raise ValueError("invalid SAT clauses")
+    literal_count = 0
+    for clause in clauses:
+        if not isinstance(clause, list) or len(clause) > MAX_LITERALS_PER_CLAUSE:
+            raise ValueError("invalid SAT clause")
+        literal_count += len(clause)
+        if literal_count > MAX_LITERALS:
+            raise ValueError("SAT instance exceeds literal limit")
+        for literal in clause:
+            if (
+                isinstance(literal, bool)
+                or not isinstance(literal, int)
+                or literal == 0
+                or abs(literal) > n_vars
+            ):
+                raise ValueError("invalid SAT literal")
+
+
+def validate_sat_work_item(item: SatWorkItem) -> None:
+    """Validate a work item at every durable or network trust boundary."""
+
+    if not isinstance(item, SatWorkItem):
+        raise ValueError("invalid SAT work item")
+    if (
+        not isinstance(item.challenge_id, str)
+        or len(item.challenge_id) != 64
+        or any(character not in "0123456789abcdef" for character in item.challenge_id)
+    ):
+        raise ValueError("invalid SAT challenge_id")
+    if (
+        isinstance(item.seed, bool)
+        or not isinstance(item.seed, int)
+        or not MIN_SEED <= item.seed <= MAX_SEED
+    ):
+        raise ValueError("invalid SAT seed")
+    validate_sat_instance(item.instance)
+    if _compute_challenge_id(item.instance, item.seed) != item.challenge_id:
+        raise ValueError("challenge_id mismatch")
+    encoded = json.dumps(
+        {
+            "challenge_id": item.challenge_id,
+            "assigned_hotkey": "x" * 256,
+            "seed": item.seed,
+            "instance": {
+                "n_vars": item.instance.n_vars,
+                "clauses": item.instance.clauses,
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded) > MAX_CUSTOMER_WORK_BYTES:
+        raise ValueError("SAT work item exceeds request size limit")
 
 
 def _derive_canonical_seed(namespace: str, counter: int) -> int:
@@ -172,8 +249,7 @@ def _canonical_instance(seed: int) -> SatInstance:
 
 
 class SatLane(Lane):
-    """SAT-benchmark lane: dispatches CNF-SAT jobs, verifies self-certifying
-    assignments, and re-solves to check UNSAT claims (docs/DESIGN.md §4)."""
+    """Dispatch CNF-SAT jobs and verify assignment-bearing certificates."""
 
     name = "sat_benchmark"
 
@@ -191,6 +267,7 @@ class SatLane(Lane):
         self._namespace = namespace or hashlib.sha256(random.randbytes(16)).hexdigest()[:8]
         self._seed_counter = 0
         self._issued_ids: set[str] = set()
+        self._customer_ids: set[str] = set()
         # Map challenge_id -> owner miner (tracked at dispatch time).
         self._challenge_owner: dict[str, str] = {}
         # Map challenge_id -> work_units for verified certificates only.
@@ -219,14 +296,11 @@ class SatLane(Lane):
         instance, seed). This prevents duplicate crediting and internal consistency
         errors across epochs.
         """
-        if not item.challenge_id:
-            raise ValueError("enqueue: item.challenge_id must be non-empty")
-        computed_id = _compute_challenge_id(item.instance, item.seed)
-        if item.challenge_id != computed_id:
-            raise ValueError(
-                f"enqueue: challenge_id mismatch: provided {item.challenge_id}, "
-                f"computed {computed_id} from instance + seed"
-            )
+        try:
+            validate_sat_work_item(item)
+        except ValueError as exc:
+            raise ValueError(f"enqueue: {exc}") from exc
+        self._customer_ids.add(item.challenge_id)
         self._queue.append(item)
 
     def dispatch(self, miner: str, budget: int) -> WorkItem:
@@ -249,6 +323,8 @@ class SatLane(Lane):
         return SatWorkItem(instance=instance, seed=seed, challenge_id=challenge_id)
 
     def verify(self, item: WorkItem, result: object) -> Certificate | None:
+        """Verify a witness-bearing result without performing SAT search."""
+
         assert isinstance(item, SatWorkItem)
         if not isinstance(result, SatCertificate):
             return None
@@ -272,7 +348,11 @@ class SatLane(Lane):
         # work_units. The returned certificate always carries the validator's
         # value so score() never touches a miner-supplied number. Defending
         # against 1e300, NaN, Infinity, negative, or any forged claim.
-        validator_work_units = float(len(instance.clauses))
+        validator_work_units = (
+            CUSTOMER_SAT_WORK_UNITS
+            if item.challenge_id in self._customer_ids
+            else float(len(instance.clauses))
+        )
         if not math.isfinite(validator_work_units) or validator_work_units < 0:
             return None  # defense-in-depth (should never happen)
 
@@ -301,18 +381,9 @@ class SatLane(Lane):
                 assigned_hotkey=result.assigned_hotkey,
             )
 
-        # UNSAT claim: testable core re-solves to confirm (Phase-2: DRAT proof).
-        if solve_sat(instance) is not None:
-            return None
-        # Record verified credit only after full validation passes.
-        self._verified_credits[result.challenge_id] = validator_work_units
-        return SatCertificate(
-            satisfiable=False,
-            assignment=None,
-            work_units=validator_work_units,
-            challenge_id=result.challenge_id,
-            assigned_hotkey=result.assigned_hotkey,
-        )
+        # Negative claims carry no bounded proof in the launch schema. Reject
+        # them immediately instead of solving attacker-controlled input.
+        return None
 
     def score(self, miner: str, certs: list[Certificate]) -> float:
         """Sum validator-derived work_units for verified certificates only.

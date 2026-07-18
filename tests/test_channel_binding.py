@@ -918,9 +918,15 @@ def test_failed_fresh_evidence_attempt_clears_previously_trusted_binding(
         channel_binding=binding,
         tls_context=server_context,
         allow_noncanonical_sat=True,
+        bearer_token="protected-token",
     ) as server:
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        remote = RemoteMiner(server.base_url, HOTKEY, ssl_context=client_context)
+        remote = RemoteMiner(
+            server.base_url,
+            HOTKEY,
+            bearer_token="protected-token",
+            ssl_context=client_context,
+        )
         evidence = remote.fetch_evidence(os.urandom(32))
         remote.confirm_channel_binding(evidence)
         with pytest.raises(RemoteError, match="HTTP 500"):

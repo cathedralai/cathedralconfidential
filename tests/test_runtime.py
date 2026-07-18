@@ -27,8 +27,8 @@ from cathedral.common import (
     issue_nonce,
 )
 from cathedral.enroll import RegistryStore
-from cathedral.lanes.sat import SatLane, solve_sat
-from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
+from cathedral.lanes.sat import SatLane, _compute_challenge_id, solve_sat
+from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.receipt import ReceiptIssuer, verify_receipt
 from cathedral.runtime import (
@@ -51,6 +51,8 @@ class MinerSpec:
     evidence_failures: int = 0
     sat_failures: int = 0
     invalid_sat: bool = False
+    negative_sat: bool = False
+    customer_sat: bool = True
     evidence_kind: EvidenceKind = EvidenceKind.TDX
     channel_mismatch: bool = False
     legacy_evidence: bool = False
@@ -91,11 +93,24 @@ class FakeClient:
             return ChannelBinding(ChannelBindingType.APPLICATION_KEY_SHA256, b"x" * 32)
         return self.binding
 
+    def supports_customer_sat(self) -> bool:
+        self.log.setdefault(f"customer-sat:{self.hotkey}", []).append(self.spec.customer_sat)
+        return self.spec.customer_sat
+
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate:
         self.log.setdefault(f"sat:{self.hotkey}", []).append(item.challenge_id)
+        self.log.setdefault(f"sat-item:{self.hotkey}", []).append(item)
         self.sat_calls += 1
         if self.sat_calls <= self.spec.sat_failures:
             raise OSError("SAT unavailable")
+        if self.spec.negative_sat:
+            return SatCertificate(
+                satisfiable=False,
+                assignment=None,
+                work_units=0.0,
+                challenge_id=item.challenge_id,
+                assigned_hotkey=self.hotkey,
+            )
         assignment = solve_sat(item.instance)
         assert assignment is not None
         owner = "wrong-owner" if self.spec.invalid_sat else self.hotkey
@@ -162,6 +177,7 @@ def make_runtime(
     policy: Policy | None = None,
     receipt_issuer: ReceiptIssuer | None = None,
     registry_clock: Callable[[], datetime] | None = None,
+    max_workers: int = 4,
 ) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
     if registry_clock is None:
         registry = RegistryStore(str(tmp_path / "registry.sqlite"))
@@ -184,7 +200,7 @@ def make_runtime(
         remote_factory=factory,
         config=RuntimeConfig(
             miner_attempts=attempts,
-            max_workers=4,
+            max_workers=max_workers,
             production_mode=False,
             allow_insecure_http_for_tests=True,
         ),
@@ -476,6 +492,13 @@ def test_runtime_atomically_persists_offline_verifiable_receipt(
         )
 
     runtime.verifier = registry_verifier
+    customer_instance = SatInstance(n_vars=2, clauses=[[1], [2]])
+    customer_item = SatWorkItem(
+        customer_instance,
+        9,
+        _compute_challenge_id(customer_instance, 9),
+    )
+    customer_job = ledger.enqueue_customer_job(customer_item)
     run = runtime.run_epoch(11, CANARY)
     outcome = next(item for item in run.outcomes if item.hotkey == "miner")
     stored = ledger.receipt_for_challenge(outcome.challenge_id or "")
@@ -491,6 +514,10 @@ def test_runtime_atomically_persists_offline_verifiable_receipt(
     assert outcome.status == expected_outcome
     assert verified.document["work"]["status"] == expected_claim
     assert verified.document["work"]["work_units"] == expected_units
+    customer_snapshot = ledger.customer_job(customer_job.job_id)
+    assert customer_snapshot.status == ("queued" if invalid_sat else "succeeded")
+    assert customer_snapshot.attempt_count == 1
+    assert (customer_snapshot.result is not None) is (not invalid_sat)
 
 
 def test_hardware_pass_with_work_failure_is_explicit_zero(tmp_path: Path) -> None:
@@ -506,6 +533,129 @@ def test_hardware_pass_with_work_failure_is_explicit_zero(tmp_path: Path) -> Non
     assert outcome.assurance.software.status is ClaimStatus.PASSED
     assert outcome.assurance.channel.status is ClaimStatus.PASSED
     assert outcome.assurance.work.status is ClaimStatus.FAILED
+
+
+def test_customer_job_is_claimed_by_admitted_cpu_and_result_is_durable(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a")})
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        specs,
+    )
+    instance = SatInstance(n_vars=3, clauses=[[1], [-2], [3]])
+    submitted_item = SatWorkItem(
+        instance,
+        77,
+        _compute_challenge_id(instance, 77),
+    )
+    submitted = ledger.enqueue_customer_job(
+        submitted_item,
+        idempotency_key="customer-run-1",
+    )
+
+    run = runtime.run_epoch(1, CANARY)
+
+    snapshot = ledger.customer_job(submitted.job_id)
+    assert run.outcomes[0].status == "verified"
+    assert snapshot.status == "succeeded"
+    assert snapshot.attempt_count == 1
+    dispatched = factory.log["sat-item:miner"][0]
+    assert dispatched.instance == instance
+    assert dispatched.seed != submitted_item.seed
+    assert snapshot.result is not None
+    assert snapshot.result["challenge_id"] == dispatched.challenge_id
+    assert snapshot.result["assigned_hotkey"] == "miner"
+
+
+def test_customer_job_remains_queued_when_cpu_admission_fails(tmp_path: Path) -> None:
+    specs = default_specs(**{"9001": MinerSpec("a", evidence_failures=2)})
+    runtime, ledger, _factory = make_runtime(
+        tmp_path,
+        [("miner", "http://127.0.0.1:9001")],
+        specs,
+    )
+    instance = SatInstance(n_vars=1, clauses=[[1]])
+    submitted = ledger.enqueue_customer_job(
+        SatWorkItem(instance, 1, _compute_challenge_id(instance, 1))
+    )
+
+    runtime.run_epoch(1, CANARY)
+
+    snapshot = ledger.customer_job(submitted.job_id)
+    assert snapshot.status == "queued"
+    assert snapshot.attempt_count == 0
+
+
+def test_customer_job_routes_only_to_negotiated_capable_cpu(tmp_path: Path) -> None:
+    specs = default_specs(
+        **{
+            "9001": MinerSpec("a", customer_sat=False),
+            "9002": MinerSpec("b", customer_sat=True),
+        }
+    )
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [
+            ("worker-a", "http://127.0.0.1:9001"),
+            ("worker-b", "http://127.0.0.1:9002"),
+        ],
+        specs,
+    )
+    instance = SatInstance(n_vars=1, clauses=[[1]])
+    submitted = ledger.enqueue_customer_job(
+        SatWorkItem(instance, 1, _compute_challenge_id(instance, 1))
+    )
+
+    runtime.run_epoch(1, CANARY)
+
+    snapshot = ledger.customer_job(submitted.job_id)
+    assert snapshot.status == "succeeded"
+    assert snapshot.attempt_count == 1
+    assert factory.log["sat-item:worker-b"][0].instance == instance
+    assert factory.log["sat-item:worker-a"][0].instance != instance
+
+
+def test_negative_customer_result_reaches_exact_attempt_cap_without_validator_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs = default_specs(
+        **{
+            "9001": MinerSpec("a", negative_sat=True),
+            "9002": MinerSpec("b", negative_sat=True),
+            "9003": MinerSpec("c", negative_sat=True),
+        }
+    )
+    runtime, ledger, factory = make_runtime(
+        tmp_path,
+        [
+            ("worker-a", "http://127.0.0.1:9001"),
+            ("worker-b", "http://127.0.0.1:9002"),
+            ("worker-c", "http://127.0.0.1:9003"),
+        ],
+        specs,
+        max_workers=1,
+    )
+    instance = SatInstance(n_vars=1, clauses=[[1]])
+    submitted = ledger.enqueue_customer_job(
+        SatWorkItem(instance, 1, _compute_challenge_id(instance, 1))
+    )
+
+    def unexpected_validator_search(_instance):
+        raise AssertionError("validator must not search to verify a negative result")
+
+    monkeypatch.setattr("cathedral.lanes.sat.solve_sat", unexpected_validator_search)
+    run = runtime.run_epoch(1, CANARY)
+
+    snapshot = ledger.customer_job(submitted.job_id)
+    challenges = [
+        factory.log[f"sat:{hotkey}"][0]
+        for hotkey in ("worker-a", "worker-b", "worker-c")
+    ]
+    assert snapshot.status == "failed"
+    assert snapshot.attempt_count == 3
+    assert len(set(challenges)) == 3
+    assert {outcome.status for outcome in run.outcomes} == {"sat_failed"}
 
 
 def test_runtime_rejects_legacy_verified_flag_without_typed_claims(tmp_path: Path) -> None:

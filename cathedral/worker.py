@@ -12,9 +12,11 @@ import hmac
 import ipaddress
 import json
 import math
+import multiprocessing
 import re
 import socket
 import ssl
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
@@ -32,28 +34,112 @@ from cathedral.common import (
     MAX_EVIDENCE_QUOTE_BYTES,
     MAX_EVIDENCE_RESPONSE_BODY,
 )
-from cathedral.lanes.sat import _canonical_instance, _compute_challenge_id, solve_sat
+from cathedral.lanes.sat import (
+    MAX_SEED,
+    MIN_SEED,
+    _canonical_instance,
+    _compute_challenge_id,
+    solve_sat,
+    validate_sat_instance,
+)
 from cathedral.lanes.sat_types import SatInstance
 
 MAX_REQUEST_BODY: int = 64 * 1024
 MAX_RESPONSE_BODY: int = MAX_EVIDENCE_RESPONSE_BODY
 MAX_CONCURRENT: int = 1
 MAX_HOTKEY_LENGTH: int = 256
-MAX_N_VARS: int = 4096
-MAX_CLAUSES: int = 8192
-MAX_LITERALS: int = 65_536
-MAX_LITERALS_PER_CLAUSE: int = 1024
-MIN_SEED: int = -(2**63)
-MAX_SEED: int = 2**63 - 1
+MAX_BEARER_TOKEN_LENGTH: int = 4096
+MAX_CUSTOMER_SAT_SOLVE_SECONDS: float = 30.0
+MAX_CUSTOMER_SAT_MEMORY_BYTES: int = 256 * 1024 * 1024
 
 _EVIDENCE_REQUEST_KEYS = frozenset({"nonce_hex", "assigned_hotkey"})
 _EVIDENCE_V2_REQUEST_KEYS = _EVIDENCE_REQUEST_KEYS | frozenset(
     {"report_data_version", "channel_binding_type", "channel_binding_digest_hex"}
 )
 _SAT_REQUEST_KEYS = frozenset({"challenge_id", "assigned_hotkey", "instance", "seed"})
+_CAPABILITIES_REQUEST_KEYS: frozenset[str] = frozenset()
 _INSTANCE_KEYS = frozenset({"n_vars", "clauses"})
 _DECIMAL_RE = re.compile(r"[0-9]+")
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _customer_sat_solve_child(connection, instance: SatInstance, cpu_seconds: int) -> None:
+    """Solve one untrusted instance inside a resource-capped child process."""
+
+    try:
+        if sys.platform.startswith("linux"):
+            import resource
+
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+            resource.setrlimit(
+                resource.RLIMIT_AS,
+                (MAX_CUSTOMER_SAT_MEMORY_BYTES, MAX_CUSTOMER_SAT_MEMORY_BYTES),
+            )
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+        connection.send(("ok", solve_sat(instance)))
+    except BaseException:
+        try:
+            connection.send(("error", None))
+        except BaseException:
+            pass
+    finally:
+        connection.close()
+
+
+def _solve_customer_sat_bounded(
+    instance: SatInstance,
+    timeout_seconds: float,
+) -> tuple[bool, list[int] | None]:
+    """Return ``(completed, assignment)`` and kill work that exceeds its budget."""
+
+    budget = min(float(timeout_seconds), MAX_CUSTOMER_SAT_SOLVE_SECONDS)
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_customer_sat_solve_child,
+        args=(child, instance, max(1, math.ceil(budget))),
+        daemon=True,
+    )
+    started = False
+    try:
+        process.start()
+        started = True
+        child.close()
+        process.join(budget)
+        if process.is_alive():
+            process.terminate()
+            process.join(1.0)
+        if process.is_alive():
+            process.kill()
+            process.join(1.0)
+        if process.exitcode != 0 or not parent.poll():
+            return False, None
+        status, assignment = parent.recv()
+        if status != "ok" or (
+            assignment is not None
+            and (
+                not isinstance(assignment, list)
+                or len(assignment) != instance.n_vars
+                or any(isinstance(item, bool) or not isinstance(item, int) for item in assignment)
+            )
+        ):
+            return False, None
+        return True, assignment
+    except (OSError, EOFError, RuntimeError):
+        return False, None
+    finally:
+        try:
+            child.close()
+        except OSError:
+            pass
+        try:
+            parent.close()
+        except OSError:
+            pass
+        if started and process.is_alive():
+            process.kill()
+            process.join(1.0)
 
 
 def _evidence_fits_transport(evidence: Evidence) -> bool:
@@ -186,6 +272,11 @@ def _make_handler(
             path = self.path.partition("?")[0]
             if path == "/v1/evidence":
                 self._handle_evidence(body)
+            elif path == "/v1/capabilities":
+                if set(body) != _CAPABILITIES_REQUEST_KEYS:
+                    self._send_json(400, {"error": "invalid capabilities schema"})
+                else:
+                    self._send_json(200, {"customer_sat": allow_noncanonical_sat})
             elif path == "/v1/sat-work":
                 self._handle_sat_work(body)
             else:
@@ -341,14 +432,24 @@ def _make_handler(
             if instance is None:
                 self._send_json(400, {"error": "invalid instance"})
                 return
-            if not allow_noncanonical_sat and instance != _canonical_instance(seed):
+            canonical = instance == _canonical_instance(seed)
+            if not allow_noncanonical_sat and not canonical:
                 self._send_json(400, {"error": "noncanonical SAT instance"})
                 return
             if _compute_challenge_id(instance, seed) != challenge_id:
                 self._send_json(400, {"error": "challenge_id mismatch"})
                 return
 
-            assignment = solve_sat(instance)
+            if canonical:
+                assignment = solve_sat(instance)
+            else:
+                completed, assignment = _solve_customer_sat_bounded(
+                    instance,
+                    request_timeout,
+                )
+                if not completed:
+                    self._send_json(503, {"error": "customer SAT solve exceeded resource limits"})
+                    return
             self._send_json(
                 200,
                 {
@@ -368,31 +469,12 @@ def _parse_instance(raw: object) -> SatInstance | None:
         return None
     n_vars = raw["n_vars"]
     clauses = raw["clauses"]
-    if (
-        isinstance(n_vars, bool)
-        or not isinstance(n_vars, int)
-        or not 1 <= n_vars <= MAX_N_VARS
-        or not isinstance(clauses, list)
-        or len(clauses) > MAX_CLAUSES
-    ):
+    instance = SatInstance(n_vars=n_vars, clauses=clauses)
+    try:
+        validate_sat_instance(instance)
+    except ValueError:
         return None
-
-    literal_count = 0
-    for clause in clauses:
-        if not isinstance(clause, list) or len(clause) > MAX_LITERALS_PER_CLAUSE:
-            return None
-        literal_count += len(clause)
-        if literal_count > MAX_LITERALS:
-            return None
-        for literal in clause:
-            if (
-                isinstance(literal, bool)
-                or not isinstance(literal, int)
-                or literal == 0
-                or abs(literal) > n_vars
-            ):
-                return None
-    return SatInstance(n_vars=n_vars, clauses=clauses)
+    return instance
 
 
 class WorkerServer:
@@ -400,7 +482,7 @@ class WorkerServer:
 
     Production deployments must keep this server on loopback behind an HTTPS terminator.
     SAT work is restricted to deterministic ``SatLane`` canonical backfill by
-    default; ``allow_noncanonical_sat`` exists only for tests and development.
+    default. Customer-submitted SAT is an explicit authenticated deployment mode.
     """
 
     def __init__(
@@ -437,6 +519,13 @@ class WorkerServer:
             or len(configured_hotkey) > MAX_HOTKEY_LENGTH
         ):
             raise ValueError("configured_hotkey must be a non-empty bounded string")
+        if bearer_token is not None and (
+            not isinstance(bearer_token, str)
+            or not bearer_token
+            or len(bearer_token) > MAX_BEARER_TOKEN_LENGTH
+            or any(ord(character) < 0x21 or ord(character) > 0x7E for character in bearer_token)
+        ):
+            raise ValueError("bearer_token must be a nonempty bounded ASCII string")
         for name, value in (
             ("max_body", max_body),
             ("max_concurrent", max_concurrent),
@@ -457,6 +546,12 @@ class WorkerServer:
             channel_binding, ChannelBinding
         ):
             raise ValueError("channel_binding must be a ChannelBinding")
+        if allow_noncanonical_sat and (bearer_token is None or channel_binding is None):
+            raise ValueError(
+                "customer SAT requires bearer authentication and a configured channel binding"
+            )
+        if allow_noncanonical_sat and allow_non_loopback_for_development:
+            raise ValueError("customer SAT cannot use the development non-loopback HTTP bind")
         if tls_context is not None and not isinstance(tls_context, ssl.SSLContext):
             raise ValueError("tls_context must be an SSLContext")
         if tls_context is not None and channel_binding is None:

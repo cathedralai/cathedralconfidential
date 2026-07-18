@@ -144,6 +144,87 @@ certificate by itself does not prove confidential execution. Plain HTTP is
 limited to the explicit development loopback flag and cannot satisfy the
 production channel claim.
 
+## Customer CPU job routing
+
+The first rentable CPU workload is bounded, satisfiable CNF-SAT. Submit it to
+the exact ledger database consumed by `runtime run-epoch`:
+
+```bash
+cathedral work submit \
+  --ledger-db /var/lib/cathedral/runtime.sqlite \
+  --customer-id public-account-123 \
+  --idempotency-key customer-request-123 \
+  --n-vars 3 \
+  --clauses '[[1,-2,3],[-1,2]]' \
+  --seed 7
+
+cathedral work status \
+  --ledger-db /var/lib/cathedral/runtime.sqlite
+
+cathedral work status \
+  --ledger-db /var/lib/cathedral/runtime.sqlite \
+  --job-id job-<32-lowercase-hex-characters>
+```
+
+The CPU runtime prefers queued customer work and uses canonical audit work only
+when the durable queue is empty. Claim and challenge issuance share one SQLite
+transaction. Completion and result persistence share another. A worker,
+epoch, challenge, attempt, and opaque lease token must all match; expired or
+aborted work cannot commit late. Transport failures, invalid certificates, and
+negative results receive a bounded retry with a new challenge; no worker can
+terminally fail a customer job before the ledger's attempt cap.
+
+The runtime negotiates customer-SAT support over the authenticated, attested
+worker channel before claiming. A default-off or mixed-fleet worker receives
+canonical audit work and consumes no customer attempt. Customer-selected clause
+count never controls emissions: every verified customer job receives the same
+20 validator-derived work units as canonical audit work.
+
+Customer SAT is disabled on workers by default. Enable it only on a bearer-
+authenticated, channel-bound production worker:
+
+```bash
+cathedral worker serve \
+  --hotkey "$MINER_HOTKEY" \
+  --channel-binding-type tls_spki_sha256 \
+  --channel-binding-digest "$TLS_SPKI_SHA256" \
+  --allow-customer-sat
+```
+
+Noncanonical customer solves run in a separate killed-on-timeout process. On
+Linux that child also has CPU, address-space, file-size, and descriptor limits.
+Payload, response, variable, clause, and literal counts are bounded before
+durable admission and again at both network ends.
+
+The launch verifier accepts only satisfiable results carrying a complete
+assignment witness, which it checks in linear time. An UNSAT claim is rejected
+without re-solving attacker-controlled input on the validator. Proof-carrying
+UNSAT jobs remain disabled until the result format and verifier support a
+bounded, machine-checkable proof.
+
+Durable admission is transactionally capped at 1,024 active jobs globally and
+64 per public customer identifier, with a 256 MiB ledger payload/result budget.
+Idempotency keys are scoped to the customer identifier. Operators can reclaim
+terminal history after their audit/retention window; active jobs are never
+pruned:
+
+```bash
+cathedral work prune \
+  --ledger-db /var/lib/cathedral/runtime.sqlite \
+  --resolved-before 2026-06-01T00:00:00Z \
+  --limit 1000 \
+  --confirm
+```
+
+Pruning frees SQLite pages for reuse. Run a separately scheduled `VACUUM` only
+during an operator-approved maintenance window if the filesystem itself must
+shrink.
+
+This is a verified SAT rental path, not yet a general shell, VM, container, or
+arbitrary-code rental API. General CPU rental still requires a measured
+workload format, customer isolation, billing, and the external rental-lifecycle
+integration.
+
 A development-only compatibility or strict policy file can look like:
 
 ```json

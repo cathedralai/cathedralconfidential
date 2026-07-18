@@ -50,9 +50,8 @@ class SatCertificate(Certificate):
     """A miner's claimed result for a SatWorkItem.
 
     - satisfiable=True  => ``assignment`` must satisfy every clause (checked).
-    - satisfiable=False => ``assignment`` is None; the claim is that no
-      assignment exists (verified by DRAT proof in production; by re-solving in
-      the testable core).
+    - satisfiable=False => ``assignment`` is None; the launch verifier rejects
+      this until the schema carries a bounded, machine-checkable UNSAT proof.
 
     ``work_units`` is the difficulty-weighted credit for the solve; the lane's
     score() sums it across a miner's accepted certificates.

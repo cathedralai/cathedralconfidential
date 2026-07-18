@@ -24,18 +24,12 @@ from cathedral.common import (
     MAX_EVIDENCE_CERTIFICATES,
     MAX_EVIDENCE_QUOTE_BYTES,
 )
-from cathedral.lanes.sat import _compute_challenge_id
-from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
+from cathedral.lanes.sat import validate_sat_work_item
+from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
 
 MAX_RESPONSE_BODY: int = MAX_CPU_EVIDENCE_RESPONSE_BODY
 MAX_SAT_RESPONSE_BODY: int = 64 * 1024
 MAX_HOTKEY_LENGTH: int = 256
-MAX_N_VARS: int = 4096
-MAX_CLAUSES: int = 8192
-MAX_LITERALS: int = 65_536
-MAX_LITERALS_PER_CLAUSE: int = 1024
-MIN_SEED: int = -(2**63)
-MAX_SEED: int = 2**63 - 1
 
 _EVIDENCE_RESPONSE_KEYS = frozenset(
     {"kind", "quote_hex", "nonce_hex", "assigned_hotkey", "cert_chain_hex"}
@@ -50,6 +44,7 @@ _EVIDENCE_BUNDLE_ITEM_KEYS = _EVIDENCE_V2_RESPONSE_KEYS | frozenset(
 _SAT_RESPONSE_KEYS = frozenset(
     {"satisfiable", "assignment", "work_units", "challenge_id", "assigned_hotkey"}
 )
+_CAPABILITIES_RESPONSE_KEYS = frozenset({"customer_sat"})
 _HEX_DIGITS = frozenset(string.hexdigits)
 
 
@@ -293,6 +288,32 @@ class RemoteMiner:
             assigned_hotkey=self._hotkey,
         )
 
+    def supports_customer_sat(self) -> bool:
+        """Negotiate customer-work capability over the attested worker channel."""
+
+        if self._scheme == "https":
+            if self._trusted_binding is None:
+                raise RemoteError("attested channel binding is required before capability checks")
+            response, _ = self._post_tls(
+                "/v1/capabilities",
+                lambda _binding: {},
+                expected_binding=self._trusted_binding,
+                include_auth=True,
+                response_body_limit=1024,
+            )
+        else:
+            response = self._post_http(
+                "/v1/capabilities",
+                {},
+                include_auth=True,
+                response_body_limit=1024,
+            )
+        _check_exact_keys(response, _CAPABILITIES_RESPONSE_KEYS, "capabilities response")
+        supported = response["customer_sat"]
+        if not isinstance(supported, bool):
+            raise RemoteError("capabilities response has invalid customer_sat flag")
+        return supported
+
     def _post_http(
         self,
         path: str,
@@ -526,46 +547,10 @@ def _evidence_from_response(
 
 
 def _validate_work_item(item: SatWorkItem) -> None:
-    if not isinstance(item, SatWorkItem):
-        raise RemoteError("invalid SAT work item")
-    if not _is_sha256(item.challenge_id):
-        raise RemoteError("invalid SAT challenge_id")
-    if (
-        isinstance(item.seed, bool)
-        or not isinstance(item.seed, int)
-        or not MIN_SEED <= item.seed <= MAX_SEED
-    ):
-        raise RemoteError("invalid SAT seed")
-    _validate_instance(item.instance)
-    if _compute_challenge_id(item.instance, item.seed) != item.challenge_id:
-        raise RemoteError("invalid SAT challenge_id")
-
-
-def _validate_instance(instance: SatInstance) -> None:
-    if not isinstance(instance, SatInstance):
-        raise RemoteError("invalid SAT instance")
-    n_vars = instance.n_vars
-    clauses = instance.clauses
-    if isinstance(n_vars, bool) or not isinstance(n_vars, int) or not 1 <= n_vars <= MAX_N_VARS:
-        raise RemoteError("invalid SAT n_vars")
-    if not isinstance(clauses, list) or len(clauses) > MAX_CLAUSES:
-        raise RemoteError("invalid SAT clauses")
-
-    literal_count = 0
-    for clause in clauses:
-        if not isinstance(clause, list) or len(clause) > MAX_LITERALS_PER_CLAUSE:
-            raise RemoteError("invalid SAT clause")
-        literal_count += len(clause)
-        if literal_count > MAX_LITERALS:
-            raise RemoteError("SAT instance exceeds literal limit")
-        for literal in clause:
-            if (
-                isinstance(literal, bool)
-                or not isinstance(literal, int)
-                or literal == 0
-                or abs(literal) > n_vars
-            ):
-                raise RemoteError("invalid SAT literal")
+    try:
+        validate_sat_work_item(item)
+    except ValueError as exc:
+        raise RemoteError(str(exc)) from exc
 
 
 def _validate_assignment(assignment: Any, n_vars: int) -> None:
