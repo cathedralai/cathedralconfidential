@@ -203,6 +203,8 @@ def make_runtime(
             max_workers=max_workers,
             production_mode=False,
             allow_insecure_http_for_tests=True,
+            score_network="finney",
+            score_netuid=39,
         ),
         receipt_issuer=receipt_issuer,
     )
@@ -284,7 +286,11 @@ def _production_runtime(
         policy_refresher=lambda: policy,
         verifier=verifier,
         remote_factory=factory,
-        config=RuntimeConfig(production_mode=True),
+        config=RuntimeConfig(
+            production_mode=True,
+            score_network="finney",
+            score_netuid=39,
+        ),
     )
     return runtime, ledger, factory
 
@@ -297,6 +303,36 @@ def test_production_missing_canary_token_fails_before_network_or_epoch(
     )
     canary = MinerTarget("canary", "https://8.8.8.8:9000")
     with pytest.raises(ValueError, match="bearer token"):
+        runtime.run_epoch(1, canary)
+    assert factory.log == {}
+    assert ledger.blocking_epoch() is None
+
+
+def test_direct_production_epoch_requires_audience_before_network_or_epoch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    registry = RegistryStore(str(tmp_path / "registry.sqlite"))
+    registry.enroll("miner", "https://1.1.1.1:9001")
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    specs = {
+        "https://8.8.8.8:9000": MinerSpec("canary-chip"),
+        "https://1.1.1.1:9001": MinerSpec("miner-chip"),
+    }
+    factory = FakeFactory(specs)
+    policy = production_policy()
+    monkeypatch.setattr(runtime_module, "preflight_tdx_verifier", lambda _policy: None)
+    runtime = ConfidentialRuntime(
+        registry,
+        ledger,
+        policy,
+        token_provider=lambda _hotkey: "token",
+        policy_refresher=lambda: policy,
+        remote_factory=factory,
+        config=RuntimeConfig(production_mode=True),
+    )
+
+    canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
+    with pytest.raises(RuntimeError, match="explicit score network and netuid"):
         runtime.run_epoch(1, canary)
     assert factory.log == {}
     assert ledger.blocking_epoch() is None
@@ -836,6 +872,8 @@ def test_chip_rotation_to_new_hotkey_is_blocked_within_ttl(tmp_path: Path) -> No
             max_workers=4,
             production_mode=False,
             allow_insecure_http_for_tests=True,
+            score_network="finney",
+            score_netuid=39,
         ),
     )
 

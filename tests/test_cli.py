@@ -321,6 +321,33 @@ def test_runtime_run_epoch_is_dry_by_default_and_publish_is_explicit():
     assert parser.parse_args([*common, "--publish"]).publish is True
 
 
+def test_production_run_epoch_requires_explicit_score_audience_before_io():
+    args = build_parser().parse_args(
+        [
+            "runtime",
+            "run-epoch",
+            "--registry-db",
+            "registry.sqlite",
+            "--ledger-db",
+            "ledger.sqlite",
+            "--policy-registry",
+            "policy.json",
+            "--canary-hotkey",
+            "canary",
+            "--canary-endpoint",
+            "https://8.8.8.8",
+            "--source-epoch",
+            "9",
+        ]
+    )
+    with pytest.raises(ValueError, match="score reports require"):
+        _build_runtime(
+            args,
+            require_policy=True,
+            require_report_audience=True,
+        )
+
+
 def test_runtime_restart_commands_only_require_ledger_path():
     args = build_parser().parse_args(["runtime", "status", "--ledger-db", "ledger.sqlite"])
     assert args.runtime_command == "status"

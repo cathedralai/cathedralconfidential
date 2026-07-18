@@ -28,6 +28,7 @@ from cathedral.lifecycle import (
     canonical_utc,
 )
 from cathedral.receipt import ReceiptError, parse_receipt_json
+from cathedral.score_audience import validate_score_audience
 
 
 class LedgerError(Exception):
@@ -1635,9 +1636,17 @@ class Ledger:
         *,
         generated_at: str | None = None,
         score_authority_valid_until: datetime | None = None,
+        score_network: str | None = None,
+        score_netuid: int | None = None,
     ) -> dict[str, float]:
         """Freeze scores and canonical report bytes in one durable transaction."""
         stable_generated_at = _validated_generated_at(generated_at)
+        audience: tuple[str, int] | None = None
+        if score_network is not None or score_netuid is not None:
+            try:
+                audience = validate_score_audience(score_network, score_netuid)
+            except ValueError as exc:
+                raise LedgerError(str(exc)) from exc
         if score_authority_valid_until is not None and (
             not isinstance(score_authority_valid_until, datetime)
             or score_authority_valid_until.tzinfo is None
@@ -1796,6 +1805,8 @@ class Ledger:
                 ],
                 "source": "cathedral_confidential_tdx",
             }
+            if audience is not None:
+                report["network"], report["netuid"] = audience
             body = _canonical_json(report)
             digest = hashlib.sha256(body).hexdigest()
             completion_time = datetime.now(timezone.utc)
@@ -1874,14 +1885,26 @@ class Ledger:
     def post_and_mark_published(self, epoch_id: int, poster: ReportPoster) -> dict[str, Any]:
         """Post frozen bytes, then mark published after an accepted response.
 
-        The network call occurs after ``report_bytes`` releases the ledger lock
+        The persisted body is hashed and compared with its frozen digest while
+        the ledger lock is held. The network call occurs only after that check
         and before ``mark_published`` opens its short database transaction.
         """
-        body = self.report_bytes(epoch_id)
+        with self._lock:
+            row = self._epoch(self._connection, epoch_id)
+            if (
+                row["status"] not in {"complete", "published"}
+                or row["report_body"] is None
+                or row["report_digest"] is None
+            ):
+                raise LedgerError(f"epoch {epoch_id} has no publishable report")
+            body = bytes(row["report_body"])
+            digest = hashlib.sha256(body).hexdigest()
+            if digest != str(row["report_digest"]):
+                raise LedgerError("persisted report bytes do not match their frozen digest")
         acknowledgement = poster.post(body)
         if acknowledgement.get("status") != "accepted":
             raise LedgerError("publication acknowledgement status must be 'accepted'")
-        self.mark_published(epoch_id, hashlib.sha256(body).hexdigest())
+        self.mark_published(epoch_id, digest)
         return acknowledgement
 
     def get_epoch(self, epoch_id: int) -> dict[str, Any] | None:

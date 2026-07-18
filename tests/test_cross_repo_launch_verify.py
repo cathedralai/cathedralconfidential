@@ -106,6 +106,14 @@ def test_ledger_helpers_freeze_positive_then_complete_zero(tmp_path: Path) -> No
     assert positive[gate.CONFIDENTIAL_ONLY] > 0.0
     assert positive_report["complete"] is True
     assert zero_report["complete"] is True
+    assert (positive_report["network"], positive_report["netuid"]) == (
+        gate.NETWORK,
+        gate.NETUID,
+    )
+    assert (zero_report["network"], zero_report["netuid"]) == (
+        gate.NETWORK,
+        gate.NETUID,
+    )
     assert set(zero) == set(gate.ALL_HOTKEYS)
     assert set(row["score"] for row in zero_report["scores"]) == {0.0}
 

@@ -701,6 +701,10 @@ _RETRY_PUBLISH_ARGV = [
     "l.sqlite",
     "--publisher-endpoint",
     "https://example.com/v1/external-scores/violet",
+    "--score-network",
+    "finney",
+    "--score-netuid",
+    "39",
     "--epoch-id",
     "1",
 ]

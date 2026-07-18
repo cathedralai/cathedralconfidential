@@ -415,6 +415,8 @@ sudo env \
     --worker-certificate worker-cert.pem \
     --measurement tdx-measurement-sha256:<approved digest> \
     --source-epoch 1 \
+    --score-network finney \
+    --score-netuid 39 \
     --evidence-dir /var/tmp/cathedral-cpu-launch-evidence
 ```
 
@@ -422,7 +424,9 @@ The runner creates fresh ephemeral Ed25519 policy and receipt keys, pins the
 trusted-key digest, advances a durable policy high-water mark, submits one
 bounded noncanonical customer SAT job, verifies two fresh TDX quotes and their
 live TLS keys, freezes the epoch, reopens the SQLite ledger, and verifies the
-exact stored receipt offline. Each certificate argument must contain exactly
+exact stored receipt offline. The frozen report binds its intended network and
+subnet UID, and the publisher refuses to sign or send it when that audience
+does not exactly match its independent configuration. Each certificate argument must contain exactly
 one certificate. The runner gives each endpoint a separate trust context and
 requires the live peer SPKI to equal that endpoint's designated certificate
 SPKI; a different leaf signed by the supplied certificate is rejected. It
@@ -439,6 +443,28 @@ Compatibility-only defaults:
 export CATHEDRAL_TDX_MIN_TCB=0
 export CATHEDRAL_TDX_TSM_REPORT_ROOT=/sys/kernel/config/tsm/report
 ```
+
+### Audience-binding upgrade preflight
+
+Before deploying the audience-enforcing publisher, stop new epoch starts and
+inspect `runtime status`. A completed report produced by an older build may not
+contain `network` and `netuid`. Its frozen bytes must never be rewritten, and
+the new publisher intentionally refuses to sign or send it.
+
+Deploy only when there is no blocking completed epoch or the frozen report
+already carries the exact configured audience. If a legacy unbound report is
+still blocking the ledger, record the decision and abandon it explicitly:
+
+```bash
+python -m cathedral.cli runtime abandon-complete \
+  --ledger-db <ledger.sqlite> \
+  --epoch-id <legacy-epoch-id> \
+  --reason 'pre-audience report cannot be safely published'
+```
+
+Abandonment is audited, one-way, and nonpayable. After it succeeds, start a new
+epoch with explicit `--score-network` and `--score-netuid`; do not attempt to
+migrate the old report by editing its stored JSON or digest.
 
 Run the negative control on a plain Linux CPU host. This should fail before
 quote collection because the host does not expose the TDX configfs-tsm report

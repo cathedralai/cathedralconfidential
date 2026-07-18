@@ -500,7 +500,13 @@ class TestReportSnapshot:
         epoch_id = ledger.begin_epoch(7)
         verified_work(ledger, epoch_id, "challenge", "hk", 3)
         attest(ledger, epoch_id, "hk")
-        first_scores = ledger.complete_epoch(epoch_id, {"hk"}, generated_at="2026-01-07T12:00:00Z")
+        first_scores = ledger.complete_epoch(
+            epoch_id,
+            {"hk"},
+            generated_at="2026-01-07T12:00:00Z",
+            score_network="finney",
+            score_netuid=39,
+        )
         first_body = ledger.report_bytes(epoch_id)
         first_digest = ledger.report_digest(epoch_id)
 
@@ -517,12 +523,39 @@ class TestReportSnapshot:
         assert payload["source"] == payload["mechanism"] == "cathedral_confidential_tdx"
         assert payload["epoch"] == 7
         assert payload["complete"] is True
+        assert payload["network"] == "finney"
+        assert payload["netuid"] == 39
         assert payload["generated_at"] == "2026-01-07T12:00:00Z"
         assert payload["scores"] == [{"miner_hotkey": "hk", "score": 1.0}]
         assert (
             first_body
             == json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
         )
+
+    @pytest.mark.parametrize(
+        ("network", "netuid"),
+        [
+            (None, 39),
+            ("finney", None),
+            (" finney", 39),
+            ("finney", True),
+            ("finney", -1),
+            ("finney", 65536),
+        ],
+    )
+    def test_report_audience_is_exact_bounded_and_paired(
+        self, network: str | None, netuid: int | None
+    ) -> None:
+        ledger = Ledger()
+        epoch_id = ledger.begin_epoch(1)
+        with pytest.raises(LedgerError, match="score (network|netuid)"):
+            ledger.complete_epoch(
+                epoch_id,
+                set(),
+                score_network=network,
+                score_netuid=netuid,
+            )
+        assert ledger.get_epoch(epoch_id)["status"] == "running"
 
     def test_publish_requires_persisted_digest(self) -> None:
         ledger = Ledger()
@@ -1079,7 +1112,12 @@ class FakeResponse:
         pass
 
 
+VALID_REPORT = b'{"network":"finney","netuid":39}'
+
+
 def make_poster(**kwargs) -> Poster:
+    kwargs.setdefault("network", "finney")
+    kwargs.setdefault("netuid", 39)
     return Poster(
         "https://publisher.example/v1/external-scores/violet",
         "bearer-token",
@@ -1095,15 +1133,25 @@ class TestPoster:
                 "http://publisher.example/v1/external-scores/violet",
                 "token",
                 "secret",
+                network="finney",
+                netuid=39,
             )
         Poster(
             "http://localhost/v1/external-scores/violet",
             "token",
             "secret",
+            network="finney",
+            netuid=39,
             allow_http_for_tests=True,
         )
         with pytest.raises(PosterError, match="endpoint path"):
-            Poster("https://publisher.example/other", "token", "secret")
+            Poster(
+                "https://publisher.example/other",
+                "token",
+                "secret",
+                network="finney",
+                netuid=39,
+            )
 
     @pytest.mark.parametrize("secret", ["", b""])
     def test_requires_nonempty_hmac_secret(self, secret: str | bytes) -> None:
@@ -1112,11 +1160,13 @@ class TestPoster:
                 "https://publisher.example/v1/external-scores/violet",
                 "token",
                 secret,
+                network="finney",
+                netuid=39,
             )
 
     def test_posts_exact_body_with_required_headers_and_signature(self) -> None:
         poster = make_poster()
-        body = b'{"complete":true,"epoch":1}'
+        body = b'{"complete":true,"epoch":1,"network":"finney","netuid":39}'
         response = FakeResponse([b'{"status":"accepted"}', b""])
         captured = {}
 
@@ -1139,7 +1189,10 @@ class TestPoster:
 
     def test_retry_posts_same_bytes_without_mutation(self) -> None:
         poster = make_poster()
-        body = b'{"scores":[{"miner_hotkey":"hk","score":1.0}]}'
+        body = (
+            b'{"network":"finney","netuid":39,'
+            b'"scores":[{"miner_hotkey":"hk","score":1.0}]}'
+        )
         seen: list[bytes] = []
 
         def open_request(request, *, timeout):
@@ -1161,7 +1214,7 @@ class TestPoster:
 
         poster._opener.open = redirect
         with pytest.raises(PosterError, match="redirect refused"):
-            poster.post(b"{}")
+            poster.post(VALID_REPORT)
 
     def test_connect_and_read_timeout_fail_closed(self) -> None:
         poster = make_poster(connect_timeout=1, read_timeout=2, total_timeout=3)
@@ -1169,13 +1222,13 @@ class TestPoster:
             urllib.error.URLError(socket.timeout("connect timed out"))
         )
         with pytest.raises(PosterError, match="timed out"):
-            poster.post(b"{}")
+            poster.post(VALID_REPORT)
 
         poster._opener.open = lambda *args, **kwargs: FakeResponse(
             [socket.timeout("read timed out")]
         )
         with pytest.raises(PosterError, match="timed out"):
-            poster.post(b"{}")
+            poster.post(VALID_REPORT)
 
     def test_total_deadline_is_enforced(self) -> None:
         poster = make_poster(total_timeout=1)
@@ -1183,18 +1236,18 @@ class TestPoster:
         poster._opener.open = lambda *args, **kwargs: response
         with patch("cathedral.poster.time.monotonic", side_effect=[10.0, 10.1, 11.1]):
             with pytest.raises(PosterError, match="total request deadline"):
-                poster.post(b"{}")
+                poster.post(VALID_REPORT)
 
     def test_bounded_response_and_json_object_required(self) -> None:
         poster = make_poster(response_cap_bytes=4)
         poster._opener.open = lambda *args, **kwargs: FakeResponse([b"12345"])
         with pytest.raises(PosterError, match="exceeds configured cap"):
-            poster.post(b"{}")
+            poster.post(VALID_REPORT)
 
         poster = make_poster()
         poster._opener.open = lambda *args, **kwargs: FakeResponse([b"[]", b""])
         with pytest.raises(PosterError, match="JSON must be an object"):
-            poster.post(b"{}")
+            poster.post(VALID_REPORT)
 
     @pytest.mark.parametrize(
         "body",
@@ -1204,17 +1257,42 @@ class TestPoster:
         poster = make_poster()
         poster._opener.open = lambda *args, **kwargs: FakeResponse([body, b""])
         with pytest.raises(PosterError, match="acknowledgement status"):
-            poster.post(b"{}")
+            poster.post(VALID_REPORT)
 
     def test_non_2xx_is_rejected(self) -> None:
         poster = make_poster()
         poster._opener.open = lambda *args, **kwargs: FakeResponse(
             [b'{"status":"accepted"}'], status=299
         )
-        assert poster.post(b"{}") == {"status": "accepted"}
+        assert poster.post(VALID_REPORT) == {"status": "accepted"}
         poster._opener.open = lambda *args, **kwargs: FakeResponse([b"{}"], status=300)
         with pytest.raises(PosterError, match="unexpected HTTP status 300"):
-            poster.post(b"{}")
+            poster.post(VALID_REPORT)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b'{"network":"finney"}',
+            b'{"network":"finney","netuid":true}',
+            b'{"network":"test","netuid":39}',
+            b'{"network":"finney","netuid":40}',
+        ],
+    )
+    def test_rejects_missing_malformed_or_mismatched_audience_before_network(
+        self, body: bytes
+    ) -> None:
+        poster = make_poster()
+        called = False
+
+        def open_request(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("network must not be called")
+
+        poster._opener.open = open_request
+        with pytest.raises(PosterError, match="score audience"):
+            poster.post(body)
+        assert called is False
 
     def test_only_bytes_are_accepted(self) -> None:
         poster = make_poster()
@@ -1227,7 +1305,7 @@ def test_ledger_report_is_posted_byte_for_byte_and_then_marked() -> None:
     epoch_id = ledger.begin_epoch(1)
     verified_work(ledger, epoch_id, "challenge", "hk", 1)
     attest(ledger, epoch_id, "hk")
-    ledger.complete_epoch(epoch_id, {"hk"})
+    ledger.complete_epoch(epoch_id, {"hk"}, score_network="finney", score_netuid=39)
     body = ledger.report_bytes(epoch_id)
 
     poster = make_poster()
@@ -1241,6 +1319,82 @@ def test_ledger_report_is_posted_byte_for_byte_and_then_marked() -> None:
     assert ledger.post_and_mark_published(epoch_id, poster) == {"status": "accepted"}
     assert seen == [body]
     assert ledger.get_epoch(epoch_id)["status"] == "published"
+
+
+def test_retry_with_wrong_audience_never_opens_network_or_marks_published() -> None:
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(
+        epoch_id,
+        set(),
+        score_network="finney",
+        score_netuid=39,
+    )
+    poster = make_poster(netuid=40)
+    called = False
+
+    def open_request(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("network must not be called")
+
+    poster._opener.open = open_request
+    with pytest.raises(PosterError, match="does not match configured"):
+        ledger.post_and_mark_published(epoch_id, poster)
+    assert called is False
+    assert ledger.get_epoch(epoch_id)["status"] == "complete"
+
+
+def test_corrupt_frozen_body_is_rejected_before_publication_network() -> None:
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(
+        epoch_id,
+        set(),
+        score_network="finney",
+        score_netuid=39,
+    )
+    tampered = b'{"complete":true,"network":"finney","netuid":39}'
+    ledger._connection.execute(
+        "UPDATE epochs SET report_body = ? WHERE epoch_id = ?",
+        (tampered, epoch_id),
+    )
+    poster = make_poster()
+    called = False
+
+    def open_request(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("network must not be called")
+
+    poster._opener.open = open_request
+    with pytest.raises(LedgerError, match="frozen digest"):
+        ledger.post_and_mark_published(epoch_id, poster)
+    assert called is False
+    assert ledger.get_epoch(epoch_id)["status"] == "complete"
+
+
+def test_legacy_unbound_report_requires_audited_abandon_before_next_epoch() -> None:
+    ledger = Ledger()
+    epoch_id = ledger.begin_epoch(1)
+    ledger.complete_epoch(epoch_id, set())
+    poster = make_poster()
+    called = False
+
+    def open_request(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("network must not be called")
+
+    poster._opener.open = open_request
+    with pytest.raises(PosterError, match="invalid score audience"):
+        ledger.post_and_mark_published(epoch_id, poster)
+    assert called is False
+    assert ledger.blocking_epoch()["epoch_id"] == epoch_id
+
+    ledger.abandon_completed_epoch(epoch_id, "pre-audience report cannot publish")
+    assert ledger.get_epoch(epoch_id)["status"] == "abandoned"
+    assert ledger.begin_epoch(2) > epoch_id
 
 
 def test_post_and_mark_leaves_epoch_complete_without_accepted_ack() -> None:

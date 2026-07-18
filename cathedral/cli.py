@@ -728,11 +728,20 @@ def _publisher_from_args(args: argparse.Namespace) -> Poster | None:
     secret = os.environ.get(hmac_env)
     if not bearer or not secret:
         raise ValueError(f"publisher credentials must be set in {bearer_env} and {hmac_env}")
-    return Poster(endpoint, bearer, secret)
+    return Poster(
+        endpoint,
+        bearer,
+        secret,
+        network=getattr(args, "score_network", None),
+        netuid=getattr(args, "score_netuid", None),
+    )
 
 
 def _build_runtime(
-    args: argparse.Namespace, *, require_policy: bool = False
+    args: argparse.Namespace,
+    *,
+    require_policy: bool = False,
+    require_report_audience: bool = False,
 ) -> tuple[ConfidentialRuntime, Ledger, dict[str, str]]:
     development = getattr(args, "development", False)
     gpu_profile_id = getattr(args, "gpu_profile_id", None)
@@ -768,7 +777,11 @@ def _build_runtime(
         customer_job_max_attempts=getattr(args, "customer_job_max_attempts", 3),
         expected_tier=Tier.CC_GPU if gpu_profile_id is not None else Tier.CC_CPU_TDX,
         admission_enabled=require_policy,
+        score_network=getattr(args, "score_network", None),
+        score_netuid=getattr(args, "score_netuid", None),
     )
+    if require_report_audience and config.production_mode and config.score_network is None:
+        raise ValueError("production score reports require --score-network and --score-netuid")
     tokens = _load_tokens(
         getattr(args, "tokens_file", None),
         production_mode=config.production_mode,
@@ -1012,7 +1025,11 @@ def cmd_runtime_audit_attestation(args: argparse.Namespace) -> int:
 
 
 def cmd_runtime_run_epoch(args: argparse.Namespace) -> int:
-    runtime, ledger, tokens = _build_runtime(args, require_policy=True)
+    runtime, ledger, tokens = _build_runtime(
+        args,
+        require_policy=True,
+        require_report_audience=True,
+    )
     try:
         run = runtime.run_epoch(
             args.source_epoch,
@@ -1389,6 +1406,15 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--publisher-endpoint", default=None)
         command.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
         command.add_argument("--publisher-hmac-env", default=DEFAULT_PUBLISHER_HMAC_ENV)
+        command.add_argument(
+            "--score-network",
+            help="exact network audience embedded in each frozen score report",
+        )
+        command.add_argument(
+            "--score-netuid",
+            type=int,
+            help="subnet UID audience embedded in each frozen score report",
+        )
 
     def add_canary(command: argparse.ArgumentParser) -> None:
         command.add_argument("--canary-hotkey", required=True)
@@ -1430,6 +1456,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_retry.add_argument("--publisher-endpoint", required=True)
     p_retry.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
     p_retry.add_argument("--publisher-hmac-env", default=DEFAULT_PUBLISHER_HMAC_ENV)
+    p_retry.add_argument("--score-network", required=True)
+    p_retry.add_argument("--score-netuid", type=int, required=True)
     p_retry.add_argument("--epoch-id", type=int, required=True)
     p_retry.add_argument(
         "--pretty",
