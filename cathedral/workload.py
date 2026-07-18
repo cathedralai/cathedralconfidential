@@ -19,9 +19,15 @@ import re
 import secrets
 import selectors
 import signal
+import socket
+import sqlite3
+import stat
+import struct
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, Sequence
 
@@ -34,6 +40,11 @@ VERIFIER_REQUEST_SCHEMA = "cathedral_workload_signature_request_v1"
 VERIFIER_RESULT_SCHEMA = "cathedral_workload_signature_result_v1"
 VERIFIER_PREFLIGHT_SCHEMA = "cathedral_workload_verifier_preflight_v1"
 VERIFIER_PREFLIGHT_RESULT_SCHEMA = "cathedral_workload_verifier_preflight_result_v1"
+EXECUTION_PREFLIGHT_SCHEMA = "cathedral_workload_execution_preflight_v1"
+EXECUTION_PREFLIGHT_RESULT_SCHEMA = "cathedral_workload_execution_preflight_result_v1"
+EXECUTION_AUTHORIZATION_SCHEMA = "cathedral_workload_execution_authorization_v1"
+EXECUTION_REQUEST_SCHEMA = "cathedral_workload_execution_request_v1"
+EXECUTION_RESULT_SCHEMA = "cathedral_workload_execution_result_v1"
 
 MAX_REFERENCE_LENGTH = 512
 MAX_REPOSITORY_LENGTH = 255
@@ -44,13 +55,14 @@ MAX_VERIFIER_INPUT_BYTES = 32 * 1024 * 1024
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_EXECUTION_ID_RE = re.compile(r"(?:assignment|execution)-[0-9a-f]{64}")
+_PROVIDER_JOB_ID_RE = re.compile(r"provider-job-[0-9a-f]{64}")
+_EXECUTION_AUTHORIZATION_RE = re.compile(r"execution-hmac-sha256:[0-9a-f]{64}")
 _REGISTRY_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _REPOSITORY_COMPONENT_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
 _SENSITIVE_ARGUMENT_RE = re.compile(
     r"(?i)(?:^--?)?(?:password|passwd|token|secret|api[_-]?key|credential)(?:=|$)"
 )
-
-
 class WorkloadAdmissionError(ValueError):
     """A workload failed a stable, customer-safe admission category."""
 
@@ -61,6 +73,14 @@ class WorkloadAdmissionError(ValueError):
 
 class SignatureVerifierError(RuntimeError):
     """The external signature-verification boundary failed closed."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
+
+
+class ExecutionAdapterError(RuntimeError):
+    """A production execution-provider boundary failed closed."""
 
     def __init__(self, category: str, message: str):
         super().__init__(message)
@@ -759,31 +779,1006 @@ class AdmittedWorkload:
 @dataclass(frozen=True)
 class WorkloadExecutionResult:
     manifest_digest: str
+    execution_id: str
     status: str
+    provider_job_id: str
+    provider_receipt_digest: str
 
     def __post_init__(self) -> None:
         _validate_digest(self.manifest_digest, "execution manifest digest")
+        if (
+            not isinstance(self.execution_id, str)
+            or _EXECUTION_ID_RE.fullmatch(self.execution_id) is None
+        ):
+            raise WorkloadAdmissionError("execution_failed", "execution id is invalid")
         if self.status not in {"accepted", "completed"}:
             raise WorkloadAdmissionError("execution_failed", "execution result is invalid")
+        if (
+            not isinstance(self.provider_job_id, str)
+            or _PROVIDER_JOB_ID_RE.fullmatch(self.provider_job_id) is None
+        ):
+            raise WorkloadAdmissionError("execution_failed", "provider job id is invalid")
+        _validate_digest(self.provider_receipt_digest, "provider receipt digest")
+
+
+@dataclass(frozen=True)
+class ExecutionAuthorization:
+    """Short-lived authority permit for one exact provider dispatch."""
+
+    execution_id: str
+    manifest_digest: str
+    policy_digest: str
+    configuration_digest: str
+    worker_hotkey: str
+    production_admission: bool
+    issued_at_epoch: int
+    expires_at_epoch: int
+    capability: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.execution_id, str)
+            or _EXECUTION_ID_RE.fullmatch(self.execution_id) is None
+        ):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution authorization id is invalid"
+            )
+        _validate_digest(self.manifest_digest, "execution authorization manifest digest")
+        _validate_digest(self.policy_digest, "execution authorization policy digest")
+        _validate_digest(
+            self.configuration_digest,
+            "execution authorization configuration digest",
+        )
+        _validate_identity(self.worker_hotkey, "execution authorization worker")
+        if not isinstance(self.production_admission, bool):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution authorization provenance is invalid"
+            )
+        if (
+            isinstance(self.issued_at_epoch, bool)
+            or not isinstance(self.issued_at_epoch, int)
+            or isinstance(self.expires_at_epoch, bool)
+            or not isinstance(self.expires_at_epoch, int)
+            or not 0 <= self.issued_at_epoch < self.expires_at_epoch
+            or self.expires_at_epoch - self.issued_at_epoch > 60
+        ):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution authorization lifetime is invalid"
+            )
+        if (
+            not isinstance(self.capability, str)
+            or _EXECUTION_AUTHORIZATION_RE.fullmatch(self.capability) is None
+        ):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution authorization capability is invalid"
+            )
+
+    def document(self) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "configuration_digest": self.configuration_digest,
+                "execution_id": self.execution_id,
+                "expires_at_epoch": self.expires_at_epoch,
+                "issued_at_epoch": self.issued_at_epoch,
+                "manifest_digest": self.manifest_digest,
+                "policy_digest": self.policy_digest,
+                "production_admission": self.production_admission,
+                "schema": EXECUTION_AUTHORIZATION_SCHEMA,
+                "worker_hotkey": self.worker_hotkey,
+            }
+        )
+
+    def wire_document(self) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                **self.document(),
+                "capability": self.capability,
+            }
+        )
+
+
+def _execution_authorization_capability(
+    key: bytes,
+    authorization: ExecutionAuthorization,
+) -> str:
+    if not isinstance(key, bytes) or len(key) < 32:
+        raise ValueError("execution authorization key must contain at least 32 bytes")
+    value = hmac.new(
+        key,
+        b"cathedral-execution-authorization-v1\0"
+        + _canonical_json(authorization.document()),
+        hashlib.sha256,
+    ).hexdigest()
+    return "execution-hmac-sha256:" + value
 
 
 class WorkloadExecutionAdapter(Protocol):
-    def execute(self, workload: AdmittedWorkload) -> WorkloadExecutionResult: ...
+    production_capable: bool
+
+    def _execute_authorized(
+        self,
+        workload: AdmittedWorkload,
+        *,
+        execution_id: str,
+        authorization: ExecutionAuthorization | None = None,
+    ) -> WorkloadExecutionResult: ...
 
 
 class RecordingExecutionAdapter:
     """Safe local adapter: records admitted manifests and executes no process."""
 
-    def __init__(self) -> None:
-        self.workloads: list[AdmittedWorkload] = []
+    production_capable = False
 
-    def execute(self, workload: AdmittedWorkload) -> WorkloadExecutionResult:
+    def __init__(self) -> None:
+        self.workloads: list[tuple[str, AdmittedWorkload]] = []
+
+    def _execute_authorized(
+        self,
+        workload: AdmittedWorkload,
+        *,
+        execution_id: str,
+        authorization: ExecutionAuthorization | None = None,
+    ) -> WorkloadExecutionResult:
         if not isinstance(workload, AdmittedWorkload):
             raise WorkloadAdmissionError(
                 "execution_denied", "execution requires an admitted workload"
             )
-        self.workloads.append(workload)
-        return WorkloadExecutionResult(workload.manifest_digest, "accepted")
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        self.workloads.append((execution_id, workload))
+        provider_job_id = "provider-job-" + hashlib.sha256(
+            b"cathedral-recording-adapter-v1\0" + execution_id.encode("ascii")
+        ).hexdigest()
+        provider_receipt_digest = _sha256(
+            b"cathedral-recording-adapter-receipt-v1\0"
+            + execution_id.encode("ascii")
+            + b"\0"
+            + workload.manifest_digest.encode("ascii")
+        )
+        return WorkloadExecutionResult(
+            workload.manifest_digest,
+            execution_id,
+            "accepted",
+            provider_job_id,
+            provider_receipt_digest,
+        )
+
+
+@dataclass(frozen=True)
+class ExternalExecutionConfig:
+    """Pinned local socket contract for a supervised CVM host agent."""
+
+    socket_path: str
+    state_path: str
+    expected_peer_uid: int
+    authorization_key: bytes = field(repr=False)
+    worker_hotkey: str
+    resource_profiles: tuple[str, ...]
+    runtime_profiles: tuple[str, ...]
+    configuration_digest: str = field(init=False)
+    timeout_seconds: float = 30.0
+    maximum_output_bytes: int = 64 * 1024
+    maximum_input_bytes: int = DEFAULT_VERIFIER_INPUT_BYTES
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authorization_key, bytes) or len(self.authorization_key) < 32:
+            raise ValueError(
+                "execution authorization key must contain at least 32 bytes"
+            )
+        _validate_identity(self.worker_hotkey, "execution worker hotkey")
+        if (
+            not isinstance(self.socket_path, str)
+            or not os.path.isabs(self.socket_path)
+            or not 1 <= len(self.socket_path) <= 4096
+            or "\x00" in self.socket_path
+            or "\n" in self.socket_path
+        ):
+            raise ValueError("execution provider socket path is invalid")
+        if (
+            not isinstance(self.state_path, str)
+            or not os.path.isabs(self.state_path)
+            or not 1 <= len(self.state_path) <= 4096
+            or "\x00" in self.state_path
+            or "\n" in self.state_path
+            or self.state_path == self.socket_path
+        ):
+            raise ValueError("execution provider state path is invalid")
+        if (
+            isinstance(self.expected_peer_uid, bool)
+            or not isinstance(self.expected_peer_uid, int)
+            or not 0 <= self.expected_peer_uid <= 2**32 - 1
+        ):
+            raise ValueError("execution provider peer uid is invalid")
+        for name, values in (
+            ("execution resource profiles", self.resource_profiles),
+            ("execution runtime profiles", self.runtime_profiles),
+        ):
+            if (
+                not isinstance(values, tuple)
+                or not values
+                or len(values) > 64
+                or tuple(sorted(values)) != values
+                or len(set(values)) != len(values)
+            ):
+                raise ValueError(f"{name} must be a sorted unique tuple")
+            for value in values:
+                _validate_id(value, name)
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(self.timeout_seconds)
+            or not 0 < self.timeout_seconds <= 60
+        ):
+            raise ValueError("execution provider timeout must be between 0 and 60 seconds")
+        if (
+            isinstance(self.maximum_output_bytes, bool)
+            or not isinstance(self.maximum_output_bytes, int)
+            or not 256 <= self.maximum_output_bytes <= MAX_VERIFIER_OUTPUT_BYTES
+        ):
+            raise ValueError("execution provider output bound is invalid")
+        if (
+            isinstance(self.maximum_input_bytes, bool)
+            or not isinstance(self.maximum_input_bytes, int)
+            or not 256 <= self.maximum_input_bytes <= MAX_VERIFIER_INPUT_BYTES
+        ):
+            raise ValueError("execution provider input bound is invalid")
+        authorization_key_digest = _sha256(
+            b"cathedral-execution-authorization-key-v1\0" + self.authorization_key
+        )
+        object.__setattr__(
+            self,
+            "configuration_digest",
+            _sha256(
+                _canonical_json(
+                    {
+                        "authorization_key_digest": authorization_key_digest,
+                        "expected_peer_uid": self.expected_peer_uid,
+                        "maximum_input_bytes": self.maximum_input_bytes,
+                        "maximum_output_bytes": self.maximum_output_bytes,
+                        "resource_profiles": list(self.resource_profiles),
+                        "runtime_profiles": list(self.runtime_profiles),
+                        "schema": "cathedral_execution_adapter_configuration_v1",
+                        "socket_path": self.socket_path,
+                        "state_path": self.state_path,
+                        "timeout_seconds": float(self.timeout_seconds),
+                        "worker_hotkey": self.worker_hotkey,
+                    }
+                )
+            ),
+        )
+
+
+class ExternalExecutionAdapter:
+    """Production-capable adapter for a supervised local CVM host agent.
+
+    The host agent is a declared trust boundary and runs as a separately
+    supervised service. Requests use a bounded canonical-JSON frame over a
+    permission- and owner-pinned Unix socket, so a request timeout never leaves
+    an adapter subprocess behind. Execution IDs are durably bound to one exact
+    request before the provider is invoked.
+    """
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if self.__dict__.get("_configuration_locked", False) and name in {
+            "_config",
+            "_configuration_locked",
+            "_preflight_complete",
+            "_production_ready",
+            "_state_lock",
+            "_authorization_clock",
+            "_authorization_clock_lock",
+            "_last_authorization_time",
+        }:
+            raise AttributeError("external execution adapter configuration is immutable")
+        object.__setattr__(self, name, value)
+
+    def __init__(
+        self,
+        config: ExternalExecutionConfig,
+        *,
+        working_directory: str | None = None,
+        authorization_clock: Callable[[], float] = time.time,
+    ) -> None:
+        if not isinstance(config, ExternalExecutionConfig):
+            raise TypeError("external execution config is invalid")
+        self._configuration_locked = False
+        self._config = config
+        if working_directory is not None:
+            raise ValueError("execution socket adapter does not use a working directory")
+        if not callable(authorization_clock):
+            raise TypeError("execution authorization clock must be callable")
+        self._state_lock = threading.Lock()
+        self._authorization_clock = authorization_clock
+        self._authorization_clock_lock = threading.Lock()
+        self._last_authorization_time: float | None = None
+        self._preflight_complete = False
+        self._production_ready = False
+        self._initialize_state()
+        self.startup_preflight()
+        object.__setattr__(self, "_production_ready", True)
+        object.__setattr__(self, "_configuration_locked", True)
+
+    @property
+    def config(self) -> ExternalExecutionConfig:
+        return self._config
+
+    @property
+    def production_capable(self) -> bool:
+        return self._production_ready
+
+    def _authorization_now(self) -> float:
+        with self._authorization_clock_lock:
+            value = self._authorization_clock()
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or (
+                    self._last_authorization_time is not None
+                    and value < self._last_authorization_time
+                )
+            ):
+                raise WorkloadAdmissionError(
+                    "execution_denied", "execution authorization clock is invalid"
+                )
+            sampled = float(value)
+            sampled_ms = int(sampled * 1000)
+            capability = hmac.new(
+                self.config.authorization_key,
+                b"cathedral-execution-clock-high-water-v1\0"
+                + self.config.configuration_digest.encode("ascii")
+                + b"\0"
+                + str(sampled_ms).encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
+            try:
+                connection = self._connect_state()
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    row = connection.execute(
+                        """
+                        SELECT high_water_ms, capability
+                        FROM workload_execution_clock_v1
+                        WHERE configuration_digest = ?
+                        """,
+                        (self.config.configuration_digest,),
+                    ).fetchone()
+                    if row is not None:
+                        persisted_ms = row["high_water_ms"]
+                        persisted_capability = row["capability"]
+                        if (
+                            isinstance(persisted_ms, bool)
+                            or not isinstance(persisted_ms, int)
+                            or not isinstance(persisted_capability, str)
+                        ):
+                            connection.execute("ROLLBACK")
+                            raise WorkloadAdmissionError(
+                                "execution_denied",
+                                "execution authorization clock state is invalid",
+                            )
+                        expected = hmac.new(
+                            self.config.authorization_key,
+                            b"cathedral-execution-clock-high-water-v1\0"
+                            + self.config.configuration_digest.encode("ascii")
+                            + b"\0"
+                            + str(persisted_ms).encode("ascii"),
+                            hashlib.sha256,
+                        ).hexdigest()
+                        if not hmac.compare_digest(persisted_capability, expected):
+                            connection.execute("ROLLBACK")
+                            raise WorkloadAdmissionError(
+                                "execution_denied",
+                                "execution authorization clock state is invalid",
+                            )
+                        if sampled_ms < persisted_ms:
+                            connection.execute("ROLLBACK")
+                            raise WorkloadAdmissionError(
+                                "execution_denied",
+                                "execution authorization clock moved backwards",
+                            )
+                    connection.execute(
+                        """
+                        INSERT INTO workload_execution_clock_v1 (
+                            configuration_digest, high_water_ms, capability
+                        ) VALUES (?, ?, ?)
+                        ON CONFLICT(configuration_digest) DO UPDATE SET
+                            high_water_ms = excluded.high_water_ms,
+                            capability = excluded.capability
+                        """,
+                        (self.config.configuration_digest, sampled_ms, capability),
+                    )
+                    connection.execute("COMMIT")
+                finally:
+                    connection.close()
+            except WorkloadAdmissionError:
+                raise
+            except sqlite3.Error as exc:
+                raise WorkloadAdmissionError(
+                    "execution_denied", "execution authorization clock is unavailable"
+                ) from exc
+            object.__setattr__(self, "_last_authorization_time", sampled)
+            return sampled
+
+    def _verify_authorization(
+        self,
+        authorization: ExecutionAuthorization | None,
+        workload: AdmittedWorkload,
+        execution_id: str,
+    ) -> None:
+        if not isinstance(authorization, ExecutionAuthorization):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution provider requires an authority permit"
+            )
+        manifest = workload.manifest
+        if (
+            authorization.execution_id != execution_id
+            or authorization.manifest_digest != manifest.digest
+            or authorization.policy_digest != manifest.policy_digest
+            or authorization.configuration_digest != self.config.configuration_digest
+            or authorization.worker_hotkey != self.config.worker_hotkey
+            or authorization.production_admission != workload.production_admission
+        ):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution authority permit binding is invalid"
+            )
+        expected = _execution_authorization_capability(
+            self.config.authorization_key,
+            authorization,
+        )
+        if not hmac.compare_digest(authorization.capability, expected):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution authority permit is invalid"
+            )
+        now = self._authorization_now()
+        if not authorization.issued_at_epoch <= now < authorization.expires_at_epoch:
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution authority permit is expired"
+            )
+
+    @staticmethod
+    def _parse_document(data: bytes) -> dict[str, object]:
+        try:
+            return _parse_verifier_document(data)
+        except SignatureVerifierError as exc:
+            raise ExecutionAdapterError(
+                exc.category, "execution provider response is invalid"
+            ) from exc
+
+    def _connect_state(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.config.state_path,
+            timeout=float(self.config.timeout_seconds),
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _state_identity(self, *, allow_missing: bool) -> tuple[int, int, int, int] | None:
+        parent_path = str(Path(self.config.state_path).parent)
+        try:
+            parent = os.lstat(parent_path)
+        except OSError as exc:
+            raise ExecutionAdapterError(
+                "state_unavailable", "execution state directory is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid()
+            or parent.st_mode & 0o022 != 0
+        ):
+            raise ExecutionAdapterError(
+                "state_unavailable", "execution state directory identity is invalid"
+            )
+        try:
+            metadata = os.lstat(self.config.state_path)
+        except FileNotFoundError:
+            if allow_missing:
+                return None
+            raise ExecutionAdapterError(
+                "state_unavailable", "execution state is unavailable"
+            ) from None
+        except OSError as exc:
+            raise ExecutionAdapterError(
+                "state_unavailable", "execution state is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077 != 0
+        ):
+            raise ExecutionAdapterError(
+                "state_unavailable", "execution state identity is invalid"
+            )
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+            metadata.st_mode,
+        )
+
+    def _initialize_state(self) -> None:
+        existing = self._state_identity(allow_missing=True)
+        try:
+            if existing is None:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(self.config.state_path, flags, 0o600)
+                os.close(descriptor)
+            before = self._state_identity(allow_missing=False)
+            connection = self._connect_state()
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = FULL")
+                connection.execute("PRAGMA temp_store = MEMORY")
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS workload_execution_bindings_v1 (
+                        execution_id TEXT PRIMARY KEY,
+                        manifest_digest TEXT NOT NULL,
+                        request_digest TEXT NOT NULL,
+                        result_json BLOB,
+                        claim_token TEXT,
+                        claim_until REAL
+                    )
+                    """
+                )
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(workload_execution_bindings_v1)"
+                    )
+                }
+                if "claim_token" not in columns:
+                    connection.execute(
+                        "ALTER TABLE workload_execution_bindings_v1 "
+                        "ADD COLUMN claim_token TEXT"
+                    )
+                if "claim_until" not in columns:
+                    connection.execute(
+                        "ALTER TABLE workload_execution_bindings_v1 "
+                        "ADD COLUMN claim_until REAL"
+                    )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS workload_execution_clock_v1 (
+                        configuration_digest TEXT PRIMARY KEY,
+                        high_water_ms INTEGER NOT NULL,
+                        capability TEXT NOT NULL
+                    )
+                    """
+                )
+            finally:
+                connection.close()
+            after = self._state_identity(allow_missing=False)
+            if after != before:
+                raise ExecutionAdapterError(
+                    "state_unavailable", "execution state changed during initialization"
+                )
+        except ExecutionAdapterError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise ExecutionAdapterError(
+                "state_unavailable", "execution state is unavailable"
+            ) from exc
+
+    def _socket_identity(self) -> tuple[int, int, int, int]:
+        try:
+            parent = os.lstat(str(Path(self.config.socket_path).parent))
+            metadata = os.lstat(self.config.socket_path)
+        except OSError as exc:
+            raise ExecutionAdapterError(
+                "unavailable", "execution provider socket is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or not stat.S_ISSOCK(metadata.st_mode)
+            or parent.st_uid != self.config.expected_peer_uid
+            or metadata.st_uid != self.config.expected_peer_uid
+            or parent.st_mode & 0o022 != 0
+            or metadata.st_mode & 0o022 != 0
+        ):
+            raise ExecutionAdapterError(
+                "unavailable", "execution provider socket identity is invalid"
+            )
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+            metadata.st_mode,
+        )
+
+    def _verify_peer(self, connection: socket.socket) -> None:
+        if hasattr(socket, "SO_PEERCRED"):
+            try:
+                raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+                _pid, uid, _gid = struct.unpack("3i", raw)
+            except (OSError, struct.error) as exc:
+                raise ExecutionAdapterError(
+                    "unavailable", "execution provider peer identity is unavailable"
+                ) from exc
+            if uid != self.config.expected_peer_uid:
+                raise ExecutionAdapterError(
+                    "unavailable", "execution provider peer identity is invalid"
+                )
+
+    def _invoke(
+        self,
+        document: Mapping[str, object],
+        *,
+        authorization: ExecutionAuthorization | None = None,
+    ) -> dict[str, object]:
+        if document.get("schema") == EXECUTION_REQUEST_SCHEMA:
+            if (
+                not isinstance(authorization, ExecutionAuthorization)
+                or document.get("execution_authorization")
+                != dict(authorization.wire_document())
+            ):
+                raise WorkloadAdmissionError(
+                    "execution_denied",
+                    "execution transport requires a provider-verifiable permit",
+                )
+        elif authorization is not None:
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution permit is invalid for this request"
+            )
+        payload = _canonical_json(document)
+        if len(payload) > self.config.maximum_input_bytes:
+            raise ExecutionAdapterError(
+                "oversized_input", "execution provider input exceeded its bound"
+            )
+        before = self._socket_identity()
+        deadline = time.monotonic() + float(self.config.timeout_seconds)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.settimeout(float(self.config.timeout_seconds))
+            connection.connect(self.config.socket_path)
+            self._verify_peer(connection)
+            after = self._socket_identity()
+            if after != before:
+                raise ExecutionAdapterError(
+                    "unavailable", "execution provider socket changed during connection"
+                )
+            connection.sendall(struct.pack(">I", len(payload)) + payload)
+            header = self._receive_exact(connection, 4, deadline)
+            response_size = struct.unpack(">I", header)[0]
+            if not 1 <= response_size <= self.config.maximum_output_bytes:
+                raise ExecutionAdapterError(
+                    "oversized_output", "execution provider output exceeded its bound"
+                )
+            response = self._receive_exact(connection, response_size, deadline)
+            connection.settimeout(max(0.001, deadline - time.monotonic()))
+            if connection.recv(1) != b"":
+                raise ExecutionAdapterError(
+                    "malformed_output", "execution provider returned trailing data"
+                )
+            return self._parse_document(response)
+        except ExecutionAdapterError:
+            raise
+        except (OSError, TimeoutError, struct.error) as exc:
+            category = "timeout" if time.monotonic() >= deadline else "unavailable"
+            raise ExecutionAdapterError(
+                category, "execution provider request failed"
+            ) from exc
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _receive_exact(
+        connection: socket.socket,
+        size: int,
+        deadline: float,
+    ) -> bytes:
+        output = bytearray()
+        while len(output) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ExecutionAdapterError(
+                    "timeout", "execution provider exceeded its timeout"
+                )
+            connection.settimeout(remaining)
+            try:
+                chunk = connection.recv(size - len(output))
+            except socket.timeout as exc:
+                raise ExecutionAdapterError(
+                    "timeout", "execution provider exceeded its timeout"
+                ) from exc
+            if not chunk:
+                raise ExecutionAdapterError(
+                    "malformed_output", "execution provider response was truncated"
+                )
+            output.extend(chunk)
+        return bytes(output)
+
+    def startup_preflight(self) -> None:
+        document = self._invoke(
+            {
+                "configuration_digest": self.config.configuration_digest,
+                "resource_profiles": list(self.config.resource_profiles),
+                "runtime_profiles": list(self.config.runtime_profiles),
+                "schema": EXECUTION_PREFLIGHT_SCHEMA,
+                "worker_hotkey": self.config.worker_hotkey,
+            }
+        )
+        expected = {
+            "configuration_digest",
+            "durable_idempotency",
+            "execution_authorization_verification",
+            "immutable_manifest_execution",
+            "manifest_binding",
+            "no_default_credentials",
+            "no_host_integration",
+            "no_host_network",
+            "no_privileged_mode",
+            "protocol_version",
+            "resource_profiles",
+            "runtime_profiles",
+            "schema",
+            "status",
+            "worker_hotkey",
+        }
+        if (
+            set(document) != expected
+            or document.get("schema") != EXECUTION_PREFLIGHT_RESULT_SCHEMA
+            or document.get("status") != "ready"
+            or type(document.get("protocol_version")) is not int
+            or document.get("protocol_version") != 1
+            or document.get("configuration_digest") != self.config.configuration_digest
+            or document.get("worker_hotkey") != self.config.worker_hotkey
+            or document.get("resource_profiles") != list(self.config.resource_profiles)
+            or document.get("runtime_profiles") != list(self.config.runtime_profiles)
+            or any(
+                document.get(name) is not True
+                for name in (
+                    "durable_idempotency",
+                    "execution_authorization_verification",
+                    "immutable_manifest_execution",
+                    "manifest_binding",
+                    "no_default_credentials",
+                    "no_host_integration",
+                    "no_host_network",
+                    "no_privileged_mode",
+                )
+            )
+        ):
+            raise ExecutionAdapterError(
+                "preflight_failed", "execution provider preflight failed"
+            )
+        object.__setattr__(self, "_preflight_complete", True)
+
+    @staticmethod
+    def _result_from_document(
+        document: Mapping[str, object],
+        *,
+        configuration_digest: str,
+        execution_id: str,
+        manifest_digest: str,
+        worker_hotkey: str,
+    ) -> WorkloadExecutionResult:
+        expected = {
+            "configuration_digest",
+            "execution_id",
+            "manifest_digest",
+            "provider_job_id",
+            "provider_receipt_digest",
+            "schema",
+            "status",
+            "worker_hotkey",
+        }
+        if (
+            set(document) != expected
+            or document.get("schema") != EXECUTION_RESULT_SCHEMA
+            or document.get("configuration_digest") != configuration_digest
+            or document.get("execution_id") != execution_id
+            or document.get("manifest_digest") != manifest_digest
+            or document.get("worker_hotkey") != worker_hotkey
+        ):
+            raise ExecutionAdapterError(
+                "invalid_result", "execution provider result binding is invalid"
+            )
+        try:
+            return WorkloadExecutionResult(
+                manifest_digest=document["manifest_digest"],  # type: ignore[arg-type]
+                execution_id=document["execution_id"],  # type: ignore[arg-type]
+                status=document["status"],  # type: ignore[arg-type]
+                provider_job_id=document["provider_job_id"],  # type: ignore[arg-type]
+                provider_receipt_digest=document["provider_receipt_digest"],  # type: ignore[arg-type]
+            )
+        except (KeyError, WorkloadAdmissionError) as exc:
+            raise ExecutionAdapterError(
+                "invalid_result", "execution provider result is invalid"
+            ) from exc
+
+    def _execute_authorized(
+        self,
+        workload: AdmittedWorkload,
+        *,
+        execution_id: str,
+        authorization: ExecutionAuthorization | None = None,
+    ) -> WorkloadExecutionResult:
+        if not isinstance(workload, AdmittedWorkload):
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution requires an admitted workload"
+            )
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        self._verify_authorization(authorization, workload, execution_id)
+        if not self._preflight_complete:
+            raise ExecutionAdapterError(
+                "preflight_failed", "execution provider preflight is incomplete"
+            )
+        manifest = workload.manifest
+        if (
+            manifest.resource_profile not in self.config.resource_profiles
+            or manifest.runtime_profile not in self.config.runtime_profiles
+            or any(
+                (
+                    manifest.default_service_credentials,
+                    manifest.host_integration,
+                    manifest.host_network,
+                    manifest.privileged,
+                )
+            )
+        ):
+            raise WorkloadAdmissionError(
+                "execution_denied", "workload is outside the provider execution profile"
+            )
+        request = {
+            "configuration_digest": self.config.configuration_digest,
+            "execution_id": execution_id,
+            "manifest": dict(manifest.document()),
+            "manifest_digest": manifest.digest,
+            "schema": EXECUTION_REQUEST_SCHEMA,
+            "worker_hotkey": self.config.worker_hotkey,
+        }
+        request_digest = _sha256(_canonical_json(request))
+        provider_request = {
+            **request,
+            "execution_authorization": dict(authorization.wire_document()),
+        }
+        with self._state_lock:
+            claim_token = secrets.token_hex(32)
+            claim_until = time.time() + float(self.config.timeout_seconds) + 5.0
+            try:
+                connection = self._connect_state()
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT manifest_digest, request_digest, result_json,
+                           claim_token, claim_until
+                    FROM workload_execution_bindings_v1
+                    WHERE execution_id = ?
+                    """,
+                    (execution_id,),
+                ).fetchone()
+                if row is not None and (
+                    row["manifest_digest"] != manifest.digest
+                    or row["request_digest"] != request_digest
+                ):
+                    connection.execute("ROLLBACK")
+                    raise ExecutionAdapterError(
+                        "idempotency_conflict",
+                        "execution id was reused with different bindings",
+                    )
+                if row is not None and row["result_json"] is not None:
+                    cached = self._parse_document(bytes(row["result_json"]))
+                    result = self._result_from_document(
+                        cached,
+                        configuration_digest=self.config.configuration_digest,
+                        execution_id=execution_id,
+                        manifest_digest=manifest.digest,
+                        worker_hotkey=self.config.worker_hotkey,
+                    )
+                    connection.execute("COMMIT")
+                    return result
+                if row is None:
+                    connection.execute(
+                        """
+                        INSERT INTO workload_execution_bindings_v1 (
+                            execution_id, manifest_digest, request_digest, result_json,
+                            claim_token, claim_until
+                        ) VALUES (?, ?, ?, NULL, ?, ?)
+                        """,
+                        (
+                            execution_id,
+                            manifest.digest,
+                            request_digest,
+                            claim_token,
+                            claim_until,
+                        ),
+                    )
+                else:
+                    active_claim = row["claim_token"]
+                    active_until = row["claim_until"]
+                    if (
+                        active_claim is not None
+                        and isinstance(active_until, (int, float))
+                        and float(active_until) > time.time()
+                    ):
+                        connection.execute("ROLLBACK")
+                        raise ExecutionAdapterError(
+                            "in_progress", "execution request is already in progress"
+                        )
+                    connection.execute(
+                        """
+                        UPDATE workload_execution_bindings_v1
+                        SET claim_token = ?, claim_until = ?
+                        WHERE execution_id = ? AND request_digest = ?
+                        """,
+                        (claim_token, claim_until, execution_id, request_digest),
+                    )
+                connection.execute("COMMIT")
+                connection.close()
+                del connection
+
+                try:
+                    document = self._invoke(
+                        provider_request,
+                        authorization=authorization,
+                    )
+                    result = self._result_from_document(
+                        document,
+                        configuration_digest=self.config.configuration_digest,
+                        execution_id=execution_id,
+                        manifest_digest=manifest.digest,
+                        worker_hotkey=self.config.worker_hotkey,
+                    )
+                    canonical_result = _canonical_json(document)
+                except ExecutionAdapterError:
+                    try:
+                        release = self._connect_state()
+                        try:
+                            release.execute("BEGIN IMMEDIATE")
+                            release.execute(
+                                """
+                                UPDATE workload_execution_bindings_v1
+                                SET claim_token = NULL, claim_until = NULL
+                                WHERE execution_id = ? AND request_digest = ?
+                                  AND claim_token = ? AND result_json IS NULL
+                                """,
+                                (execution_id, request_digest, claim_token),
+                            )
+                            release.execute("COMMIT")
+                        finally:
+                            release.close()
+                    except sqlite3.Error as exc:
+                        raise ExecutionAdapterError(
+                            "state_unavailable",
+                            "execution state is unavailable",
+                        ) from exc
+                    raise
+
+                connection = self._connect_state()
+                connection.execute("BEGIN IMMEDIATE")
+                updated = connection.execute(
+                    """
+                    UPDATE workload_execution_bindings_v1
+                    SET result_json = ?, claim_token = NULL, claim_until = NULL
+                    WHERE execution_id = ? AND request_digest = ? AND claim_token = ?
+                    """,
+                    (canonical_result, execution_id, request_digest, claim_token),
+                )
+                if updated.rowcount != 1:
+                    connection.execute("ROLLBACK")
+                    raise ExecutionAdapterError(
+                        "state_unavailable", "execution state claim was lost"
+                    )
+                connection.execute("COMMIT")
+                return result
+            except ExecutionAdapterError:
+                if "connection" in locals() and connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            except sqlite3.Error as exc:
+                if "connection" in locals() and connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise ExecutionAdapterError(
+                    "state_unavailable", "execution state is unavailable"
+                ) from exc
+            finally:
+                if "connection" in locals():
+                    connection.close()
 
 
 @dataclass(frozen=True)
@@ -1066,12 +2061,77 @@ class WorkloadAdmissionController:
         self,
         workload: AdmittedWorkload,
         adapter: WorkloadExecutionAdapter,
+        *,
+        execution_id: str,
+    ) -> WorkloadExecutionResult:
+        if self.production_mode:
+            raise WorkloadAdmissionError(
+                "execution_denied",
+                "production execution requires an authenticated assignment",
+            )
+        if type(adapter) is not RecordingExecutionAdapter:
+            raise WorkloadAdmissionError(
+                "execution_denied",
+                "direct execution is limited to the development recording adapter",
+            )
+        return self._dispatch_authorized(
+            workload,
+            adapter,
+            execution_id=execution_id,
+        )
+
+    def _dispatch_authorized(
+        self,
+        workload: AdmittedWorkload,
+        adapter: WorkloadExecutionAdapter,
+        *,
+        execution_id: str,
+        authorization: ExecutionAuthorization | None = None,
     ) -> WorkloadExecutionResult:
         self.validate_admission(workload)
-        result = adapter.execute(workload)
+        if not isinstance(execution_id, str) or _EXECUTION_ID_RE.fullmatch(execution_id) is None:
+            raise WorkloadAdmissionError("execution_denied", "execution id is invalid")
+        if self.production_mode and not execution_id.startswith("assignment-"):
+            raise WorkloadAdmissionError(
+                "execution_denied", "production execution requires an assignment id"
+            )
+        if self.production_mode:
+            if type(adapter) is not ExternalExecutionAdapter or not adapter.production_capable:
+                raise WorkloadAdmissionError(
+                    "execution_denied", "production execution adapter is unavailable"
+                )
+        elif type(adapter) not in {RecordingExecutionAdapter, ExternalExecutionAdapter}:
+            raise WorkloadAdmissionError(
+                "execution_denied", "execution adapter type is unavailable"
+            )
+        if type(adapter) is ExternalExecutionAdapter:
+            if (
+                not isinstance(authorization, ExecutionAuthorization)
+                or authorization.execution_id != execution_id
+                or authorization.manifest_digest != workload.manifest_digest
+                or authorization.policy_digest != workload.manifest.policy_digest
+                or authorization.configuration_digest
+                != adapter.config.configuration_digest
+                or authorization.worker_hotkey != adapter.config.worker_hotkey
+                or authorization.production_admission != workload.production_admission
+            ):
+                raise WorkloadAdmissionError(
+                    "execution_denied", "execution authority permit binding is invalid"
+                )
+        try:
+            result = adapter._execute_authorized(
+                workload,
+                execution_id=execution_id,
+                authorization=authorization,
+            )
+        except ExecutionAdapterError as exc:
+            raise WorkloadAdmissionError(
+                "execution_failed", "execution provider failed closed"
+            ) from exc
         if (
             not isinstance(result, WorkloadExecutionResult)
             or result.manifest_digest != workload.manifest_digest
+            or result.execution_id != execution_id
         ):
             raise WorkloadAdmissionError(
                 "execution_failed", "execution adapter returned a mismatched result"

@@ -44,9 +44,14 @@ from cathedral.enroll import RegistryStore
 from cathedral.lifecycle import WorkerLifecycleState, canonical_utc, parse_utc
 from cathedral.workload import (
     AdmittedWorkload,
+    ExecutionAuthorization,
+    ExternalExecutionAdapter,
     WorkloadAdmissionController,
     WorkloadAdmissionError,
     WorkloadAdmissionPolicy,
+    WorkloadExecutionAdapter,
+    WorkloadExecutionResult,
+    _execution_authorization_capability,
 )
 
 
@@ -311,12 +316,29 @@ class AuthenticatedWorkloadAssignment:
 class WorkloadAssignmentAuthority:
     """Mint assignments only after validating an enforced workload capability."""
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if self.__dict__.get("_configuration_locked", False) and name in {
+            "_capability_key",
+            "_clock",
+            "_clock_lock",
+            "_configuration_locked",
+            "_execution_configuration_digest",
+            "_execution_worker_hotkey",
+            "_last_seen_time",
+            "_production_admission",
+            "workload_controller",
+        }:
+            raise AttributeError("workload assignment authority configuration is immutable")
+        object.__setattr__(self, name, value)
+
     def __init__(
         self,
         workload_controller: WorkloadAdmissionController,
         capability_key: bytes,
         *,
         clock: Callable[[], datetime] = _utc_now,
+        execution_worker_hotkey: str | None = None,
+        execution_configuration_digest: str | None = None,
     ) -> None:
         if not isinstance(workload_controller, WorkloadAdmissionController):
             raise TypeError("workload_controller is invalid")
@@ -324,14 +346,29 @@ class WorkloadAssignmentAuthority:
             raise ValueError("assignment capability key must contain at least 32 bytes")
         if not callable(clock):
             raise TypeError("assignment clock must be callable")
+        if execution_worker_hotkey is not None:
+            execution_worker_hotkey = _require_text(
+                execution_worker_hotkey, "execution worker"
+            )
+        if execution_configuration_digest is not None and (
+            not isinstance(execution_configuration_digest, str)
+            or _DIGEST_RE.fullmatch(execution_configuration_digest) is None
+        ):
+            raise ValueError("execution configuration digest is invalid")
+        self._configuration_locked = False
         self.workload_controller = workload_controller
         self._capability_key = capability_key
         self._clock = clock
+        self._clock_lock = threading.Lock()
+        self._last_seen_time: datetime | None = None
+        self._execution_worker_hotkey = execution_worker_hotkey
+        self._execution_configuration_digest = execution_configuration_digest
         self._production_admission = bool(
             workload_controller.production_mode
             and workload_controller._preflight_complete
             and workload_controller.verifier.production_capable
         )
+        object.__setattr__(self, "_configuration_locked", True)
 
     @property
     def production_capable(self) -> bool:
@@ -344,6 +381,17 @@ class WorkloadAssignmentAuthority:
             hashlib.sha256,
         ).hexdigest()
         return "assignment-hmac-sha256:" + value
+
+    def _now(self) -> datetime:
+        with self._clock_lock:
+            when = self._clock()
+            _canonical_time(when, "assignment authority time")
+            if self._last_seen_time is not None and when < self._last_seen_time:
+                raise KeyReleaseError(
+                    "clock_invalid", "assignment authority clock moved backwards"
+                )
+            object.__setattr__(self, "_last_seen_time", when)
+            return when
 
     def issue(
         self,
@@ -376,8 +424,7 @@ class WorkloadAssignmentAuthority:
                 "invalid_assignment",
                 "production assignment requires production workload admission",
             )
-        when = self._clock()
-        _canonical_time(when, "assignment issue time")
+        when = self._now()
         assignment_id = "assignment-" + secrets.token_hex(32)
         issuer_digest = _keyed_identity_digest(
             self._capability_key,
@@ -440,6 +487,109 @@ class WorkloadAssignmentAuthority:
         expected = self._sign(assignment.capability_document())
         if not hmac.compare_digest(assignment._capability, expected):
             raise KeyReleaseError("invalid_assignment", "workload assignment capability is invalid")
+
+    def dispatch_execution(
+        self,
+        *,
+        assignment: AuthenticatedWorkloadAssignment,
+        workload: AdmittedWorkload,
+        adapter: WorkloadExecutionAdapter,
+    ) -> WorkloadExecutionResult:
+        """Dispatch an admitted manifest under its authenticated assignment.
+
+        The opaque assignment ID is the provider idempotency key. Issuer and
+        custody references never cross the execution-provider boundary.
+        """
+
+        when = self._now()
+        self.verify(assignment, at=when)
+        hotkey = self._execution_worker_hotkey
+        if hotkey is None:
+            raise KeyReleaseError(
+                "execution_denied", "execution worker identity is not configured"
+            )
+        try:
+            manifest = self.workload_controller.validate_admission(
+                workload,
+                require_enforced=True,
+                require_production=self._production_admission,
+            )
+        except WorkloadAdmissionError as exc:
+            raise KeyReleaseError(
+                "execution_denied", "execution workload is not admitted"
+            ) from exc
+        if (
+            assignment.worker_hotkey != hotkey
+            or assignment.manifest_digest != manifest.digest
+            or assignment.workload_policy_digest != manifest.policy_digest
+            or assignment.production_admission
+            != (self._production_admission and workload.production_admission)
+        ):
+            raise KeyReleaseError(
+                "execution_denied", "execution assignment binding is invalid"
+            )
+        if (
+            isinstance(adapter, ExternalExecutionAdapter)
+            and (
+                self._execution_configuration_digest is None
+                or adapter.config.worker_hotkey != hotkey
+                or adapter.config.configuration_digest
+                != self._execution_configuration_digest
+                or not hmac.compare_digest(
+                    adapter.config.authorization_key,
+                    self._capability_key,
+                )
+            )
+        ):
+            raise KeyReleaseError(
+                "execution_denied", "execution provider worker binding is invalid"
+            )
+        configuration_digest = self._execution_configuration_digest
+        if configuration_digest is None:
+            configuration_digest = "sha256:" + "0" * 64
+        expires_at = min(assignment.expires_at, when + timedelta(seconds=30))
+        issued_at_epoch = int(when.timestamp())
+        expires_at_epoch = int(expires_at.timestamp())
+        if expires_at_epoch <= issued_at_epoch:
+            raise KeyReleaseError(
+                "execution_denied", "execution assignment is too close to expiry"
+            )
+        unsigned_authorization = ExecutionAuthorization(
+            execution_id=assignment.assignment_id,
+            manifest_digest=manifest.digest,
+            policy_digest=manifest.policy_digest,
+            configuration_digest=configuration_digest,
+            worker_hotkey=hotkey,
+            production_admission=workload.production_admission,
+            issued_at_epoch=issued_at_epoch,
+            expires_at_epoch=expires_at_epoch,
+            capability="execution-hmac-sha256:" + "0" * 64,
+        )
+        authorization = ExecutionAuthorization(
+            execution_id=unsigned_authorization.execution_id,
+            manifest_digest=unsigned_authorization.manifest_digest,
+            policy_digest=unsigned_authorization.policy_digest,
+            configuration_digest=unsigned_authorization.configuration_digest,
+            worker_hotkey=unsigned_authorization.worker_hotkey,
+            production_admission=unsigned_authorization.production_admission,
+            issued_at_epoch=unsigned_authorization.issued_at_epoch,
+            expires_at_epoch=unsigned_authorization.expires_at_epoch,
+            capability=_execution_authorization_capability(
+                self._capability_key,
+                unsigned_authorization,
+            ),
+        )
+        try:
+            return self.workload_controller._dispatch_authorized(
+                workload,
+                adapter,
+                execution_id=assignment.assignment_id,
+                authorization=authorization,
+            )
+        except WorkloadAdmissionError as exc:
+            raise KeyReleaseError(
+                "execution_failed", "execution provider failed closed"
+            ) from exc
 
 
 @dataclass(frozen=True)
