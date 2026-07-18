@@ -37,7 +37,7 @@ import json
 import os
 import sys
 
-quote = open(sys.argv[-1], "rb").read()
+quote = open(sys.argv[1], "rb").read()
 if quote != b"tdx-quote":
     raise SystemExit(2)
 print(json.dumps({

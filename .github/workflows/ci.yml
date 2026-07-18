@@ -14,9 +14,9 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -27,3 +27,51 @@ jobs:
 
       - name: Test
         run: python -m pytest -q
+
+  tdx-verifier:
+    name: Static TDX verifier
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25.12"
+          cache-dependency-path: cmd/cathedral-tdx-verifier/go.sum
+
+      - name: Test
+        working-directory: cmd/cathedral-tdx-verifier
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          test "$(go env GOVERSION)" = go1.25.12
+          go mod verify
+          go vet ./...
+          go test -race ./...
+
+      - name: Vulnerability scan
+        working-directory: cmd/cathedral-tdx-verifier
+        env:
+          GOTOOLCHAIN: local
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Build static x86-64 verifier
+        working-directory: cmd/cathedral-tdx-verifier
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+          GOTOOLCHAIN: local
+        run: go build -trimpath -buildvcs=false -ldflags='-s -w' -o cathedral-tdx-verifier .
+
+      - name: Reject dynamic loader and dynamic segment
+        working-directory: cmd/cathedral-tdx-verifier
+        run: |
+          file cathedral-tdx-verifier | grep -q 'statically linked'
+          ! readelf -l cathedral-tdx-verifier | grep -q ' INTERP '
+          ! readelf -l cathedral-tdx-verifier | grep -q ' DYNAMIC '
+          if ./cathedral-tdx-verifier >rejected.stdout 2>rejected.stderr; then
+            exit 1
+          fi
+          test ! -s rejected.stdout
