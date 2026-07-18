@@ -57,6 +57,7 @@ from cathedral.lifecycle import (
 from cathedral.poster import Poster
 from cathedral.remote import RemoteMiner
 from cathedral.receipt import ReceiptIssuer
+from cathedral.score_audience import validate_score_audience
 from cathedral.verify import preflight_tdx_verifier, verify
 
 MAX_BEARER_TOKEN_LENGTH = 4096
@@ -101,6 +102,8 @@ class RuntimeConfig:
     admission_enabled: bool = True
     customer_job_lease_seconds: int = 120
     customer_job_max_attempts: int = 3
+    score_network: str | None = None
+    score_netuid: int | None = None
 
     def __post_init__(self) -> None:
         timeout = self.miner_timeout_seconds
@@ -133,6 +136,8 @@ class RuntimeConfig:
             raise ValueError("runtime expected tier must be CPU TDX or GPU composite")
         if not isinstance(self.admission_enabled, bool):
             raise ValueError("admission_enabled must be a boolean")
+        if self.score_network is not None or self.score_netuid is not None:
+            validate_score_audience(self.score_network, self.score_netuid)
         minimum_lease = math.ceil(float(timeout) * self.miner_attempts) + 5
         if (
             isinstance(self.customer_job_lease_seconds, bool)
@@ -489,6 +494,8 @@ class ConfidentialRuntime:
         publish: bool = False,
     ) -> EpochRun:
         self._require_admission_enabled()
+        if self.config.production_mode and self.config.score_network is None:
+            raise RuntimeError("production epoch requires an explicit score network and netuid")
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("an epoch run is already in progress")
         try:
@@ -619,6 +626,8 @@ class ConfidentialRuntime:
                     epoch_id,
                     all_hotkeys,
                     score_authority_valid_until=score_authority_valid_until,
+                    score_network=self.config.score_network,
+                    score_netuid=self.config.score_netuid,
                 )
                 outcomes = {
                     hotkey: MinerOutcome(

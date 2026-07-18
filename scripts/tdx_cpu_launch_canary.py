@@ -332,6 +332,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         customer_job_max_attempts=3,
         expected_tier=Tier.CC_CPU_TDX,
         admission_enabled=True,
+        score_network=args.score_network,
+        score_netuid=args.score_netuid,
     )
     measurements = tuple(args.measurement)
     canary_token = _load_token(args.canary_bearer_env)
@@ -501,6 +503,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-bearer-env", default="CATHEDRAL_WORKER_BEARER_TOKEN")
     parser.add_argument("--measurement", action="append", required=True)
     parser.add_argument("--source-epoch", type=int, default=1)
+    parser.add_argument("--score-network", required=True)
+    parser.add_argument("--score-netuid", type=int, required=True)
     parser.add_argument("--miner-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--evidence-dir", required=True)
     return parser

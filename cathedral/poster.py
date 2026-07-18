@@ -12,6 +12,8 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from cathedral.score_audience import validate_score_audience
+
 
 class PosterError(Exception):
     """Raised when an external-score publication is unsafe or unsuccessful."""
@@ -33,6 +35,8 @@ class Poster:
         bearer_token: str,
         secret: str | bytes,
         *,
+        network: str,
+        netuid: int,
         connect_timeout: float = 5.0,
         read_timeout: float = 10.0,
         total_timeout: float = 30.0,
@@ -55,6 +59,10 @@ class Poster:
             raise PosterError("bearer token is required")
         if not isinstance(secret, (str, bytes)) or not secret:
             raise PosterError("HMAC secret must be a nonempty string or bytes")
+        try:
+            self.network, self.netuid = validate_score_audience(network, netuid)
+        except ValueError as exc:
+            raise PosterError(str(exc)) from exc
         if connect_timeout <= 0 or read_timeout <= 0 or total_timeout <= 0:
             raise PosterError("timeouts must be positive")
         if response_cap_bytes <= 0:
@@ -71,6 +79,18 @@ class Poster:
     def post(self, report_body: bytes) -> dict[str, Any]:
         if not isinstance(report_body, bytes):
             raise PosterError("report_body must be the exact persisted bytes")
+        try:
+            report = json.loads(report_body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PosterError("report body must be valid UTF-8 JSON") from exc
+        if not isinstance(report, dict):
+            raise PosterError("report body must be a JSON object")
+        try:
+            audience = validate_score_audience(report.get("network"), report.get("netuid"))
+        except ValueError as exc:
+            raise PosterError(f"report has invalid score audience: {exc}") from exc
+        if audience != (self.network, self.netuid):
+            raise PosterError("report score audience does not match configured publisher audience")
         signature = hmac.new(self.secret, report_body, hashlib.sha256).hexdigest()
         request = urllib.request.Request(
             self.endpoint,

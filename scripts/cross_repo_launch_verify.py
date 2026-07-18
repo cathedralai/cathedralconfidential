@@ -156,7 +156,13 @@ def create_positive_epoch(ledger: Ledger, *, generated_at: str) -> tuple[int, di
             units,
             validator_derived=True,
         )
-    scores = ledger.complete_epoch(epoch_id, ALL_HOTKEYS, generated_at=generated_at)
+    scores = ledger.complete_epoch(
+        epoch_id,
+        ALL_HOTKEYS,
+        generated_at=generated_at,
+        score_network=NETWORK,
+        score_netuid=NETUID,
+    )
     require(scores["miner-alpha"] == 1.0, "positive ledger report was not max-normalized")
     require(scores[CONFIDENTIAL_ONLY] > 0.0, "positive report lacks compute-only control")
     return epoch_id, scores
@@ -164,7 +170,13 @@ def create_positive_epoch(ledger: Ledger, *, generated_at: str) -> tuple[int, di
 
 def create_zero_epoch(ledger: Ledger, *, generated_at: str) -> tuple[int, dict[str, float]]:
     epoch_id = ledger.begin_epoch(2)
-    scores = ledger.complete_epoch(epoch_id, ALL_HOTKEYS, generated_at=generated_at)
+    scores = ledger.complete_epoch(
+        epoch_id,
+        ALL_HOTKEYS,
+        generated_at=generated_at,
+        score_network=NETWORK,
+        score_netuid=NETUID,
+    )
     require(set(scores) == set(ALL_HOTKEYS), "zero report is not a complete snapshot")
     require(all(value == 0.0 for value in scores.values()), "zero report retained prior work")
     return epoch_id, scores
@@ -484,6 +496,8 @@ def run_proof(scorer_repo: Path) -> dict[str, Any]:
                     endpoint,
                     BEARER_TOKEN,
                     HMAC_SECRET,
+                    network=NETWORK,
+                    netuid=NETUID,
                     allow_http_for_tests=True,
                 )
                 positive_epoch, positive_scores = create_positive_epoch(
