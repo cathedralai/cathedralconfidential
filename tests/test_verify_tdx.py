@@ -257,9 +257,27 @@ def test_tdx_strict_accepts_complete_typed_claims(tmp_path, monkeypatch):
     assert attested.collateral_current is True
     assert attested.platform_identity_kind == "stable"
     assert attested.tcb_svn == "0d010800000000000000000000000000"
-    assert attested.tcb == int(attested.tcb_svn, 16)
+    assert attested.tcb == 0
     assert attested.pck_cert_id == "tdx-pck-cert-sha256:" + "b" * 64
     assert attested.attestation_key_id == "tdx-ak-sha256:" + "c" * 64
+
+
+def test_tdx_strict_exact_svn_never_enters_legacy_scalar_field(tmp_path, monkeypatch):
+    nonce = issue_nonce()
+    tcb_svn = "ff" * 16
+    evidence, _stable_id = _configure_strict_verifier(
+        tmp_path,
+        monkeypatch,
+        nonce=nonce,
+        hotkey="hotkey-tdx-max-svn",
+        claims={"tcb_svn": tcb_svn},
+    )
+
+    attested = verify(evidence, nonce, _strict_policy())
+
+    assert attested is not None
+    assert attested.tcb_svn == tcb_svn
+    assert attested.tcb == 0
 
 
 @pytest.mark.parametrize(

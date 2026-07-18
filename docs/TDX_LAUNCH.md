@@ -391,6 +391,48 @@ sudo env \
   python -m pytest tests/test_tdx_sat_e2e_hw.py -q
 ```
 
+The compatibility test above uses one in-process miner and predates the full
+production topology. The final CPU acceptance canary requires two different
+disposable TDX platforms: one dedicated canary and one enrolled worker. Each
+must expose a public-IP HTTPS endpoint whose private key terminates inside its
+guest and whose SPKI digest is configured on the loopback worker. After those
+endpoints are ready, run the production parent path from a separate Linux
+validator host:
+
+```bash
+sudo env \
+  CATHEDRAL_TDX_VERIFY_CMD=/opt/cathedral/bin/cathedral-tdx-verifier \
+  CATHEDRAL_TDX_VERIFY_ARTIFACTS='["/opt/cathedral/bin/cathedral-tdx-verifier"]' \
+  CATHEDRAL_TDX_VERIFY_DIGEST='sha256:<reviewed execution-contract digest>' \
+  CATHEDRAL_CANARY_BEARER_TOKEN='<ephemeral canary token>' \
+  CATHEDRAL_WORKER_BEARER_TOKEN='<ephemeral worker token>' \
+  python scripts/tdx_cpu_launch_canary.py \
+    --canary-hotkey cathedral-cpu-canary \
+    --canary-endpoint https://<canary-public-ip>:8443 \
+    --canary-certificate canary-cert.pem \
+    --worker-hotkey cathedral-cpu-worker \
+    --worker-endpoint https://<worker-public-ip>:8443 \
+    --worker-certificate worker-cert.pem \
+    --measurement tdx-measurement-sha256:<approved digest> \
+    --source-epoch 1 \
+    --evidence-dir /var/tmp/cathedral-cpu-launch-evidence
+```
+
+The runner creates fresh ephemeral Ed25519 policy and receipt keys, pins the
+trusted-key digest, advances a durable policy high-water mark, submits one
+bounded noncanonical customer SAT job, verifies two fresh TDX quotes and their
+live TLS keys, freezes the epoch, reopens the SQLite ledger, and verifies the
+exact stored receipt offline. Each certificate argument must contain exactly
+one certificate. The runner gives each endpoint a separate trust context and
+requires the live peer SPKI to equal that endpoint's designated certificate
+SPKI; a different leaf signed by the supplied certificate is rejected. It
+retains only the public registry, trusted public key, receipt, epoch report,
+and result summary. Private signing keys and bearer credentials are not
+retained. Copy those public evidence files off the validator before deleting
+every disposable VM, disk, certificate private key, and temporary firewall
+rule. This script is an isolated acceptance canary, not a service deployment
+or a substitute for normal key management.
+
 Compatibility-only defaults:
 
 ```bash
@@ -499,7 +541,54 @@ Strict static-verifier canary recorded July 18, 2026:
   no protected publisher configuration, service, or lifecycle state was
   changed, restarted, or stopped.
 
-This proves the strict static quote-verification gate on real hardware. The
-signed-registry parent path, durable receipt, and full routed SAT lane remain
-separate acceptance evidence and must pass before the CPU product is called
-fully launched.
+This proved the strict static quote-verification gate on real hardware. At that
+stage, the signed-registry parent path, durable receipt, and full routed SAT
+lane still remained separate acceptance evidence.
+
+Full production CPU-path canary recorded July 18, 2026:
+
+- A separate Linux validator admitted two different public-IP HTTPS TDX
+  endpoints: one dedicated canary and one enrolled CPU worker. Both endpoints
+  terminated their distinct TLS private keys inside their guests and bound the
+  live TLS SPKI into fresh report-data-v2 quotes.
+- Both stable platform identities were distinct. Both Intel platform/module/QE
+  evaluations were `UpToDate` with no advisories, current collateral, and debug
+  disabled. Their exact approved measurements were
+  `tdx-measurement-sha256:46f864c1197eab17cbeceab124268b6e871fd68660c5199c3e049e6a09ba98d7`
+  and
+  `tdx-measurement-sha256:49bf7370c6953f057111015c83819332aaa8ce58bc4dbc57607d6633e1efa793`.
+- The parent consumed a fresh Ed25519-signed registry, pinned the independent
+  trusted-key digest, and advanced its durable release high-water mark before
+  admission. The exact static verifier artifact remained
+  `3f0baff0e6186dfb1c83de1a680a920ef16a4e07dab1a59ce501c5b394f4abdc`.
+- One bounded customer SAT job routed only to the capability-negotiated worker,
+  succeeded in one attempt, persisted its normalized result atomically, and
+  produced a complete epoch with worker score `1.0`.
+- The reopened ledger returned exact receipt
+  `receipt-sha256:6cb79422c68762369a914539bbcabd1c621887156874fa845b52f51337d3d7f3`.
+  Its byte digest was
+  `sha256:1f29521aacb5d74ed1ba655ff50925fcb15947aa8515a2b1add0d47e5996f9ed`;
+  independent offline verification against the retained public registry and
+  trusted key passed.
+- The run exposed and fixed one cross-contract bug before acceptance: strict
+  TDX's exact 128-bit SVN had been copied into a legacy SQLite-bounded scalar
+  receipt field. Strict mode now retains the exact SVN string and records the
+  unused scalar as `0`, consistent with the existing rule that raw TDX SVN is
+  never numerically ordered.
+- Post-run independent review found that the acceptance runner treated the two
+  supplied certificates as shared trust anchors. Before merge, the runner was
+  hardened to a separate trust context and exact SPKI pin for each endpoint;
+  regression coverage rejects a different valid leaf signed by a supplied CA.
+  The retained live evidence proves quote binding to the observed TLS keys; the
+  exact per-endpoint pin is code-and-test evidence until the next live canary.
+- A host from a different pool failed strict Intel verification and was never
+  admitted. It was deleted before replacement. Four labelled disposable VMs
+  were used in total (three concurrently at most); every VM, boot disk, TLS
+  private key, bearer credential, and temporary firewall rule was confirmed
+  removed after the public evidence bundle was copied off the validator. The
+  final billed amount was not yet available when this record was written.
+
+This proves the signed-registry parent verdict, strict dual-host admission,
+live TLS channel binding, customer CPU routing, atomic durable result, complete
+epoch, signed receipt, offline receipt verification, and teardown. It does not
+by itself prove the downstream subnet publisher or on-chain weight submission.

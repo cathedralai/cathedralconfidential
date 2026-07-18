@@ -40,7 +40,7 @@ The schema identifier issued by the current runtime is
 | `policy_registry_release`, `policy_registry_digest` | Exact signed registry snapshot used for admission. |
 | `policy_profile_ids` | Exact active CPU profiles selected from that snapshot. |
 | `measurement` | Approved software measurement returned by attestation verification. |
-| `tcb` | Vendor TCB audit version, exact SVN, status, advisory IDs, debug state, and collateral-current result. Strict TDX receipts enforce the registry status/advisory policy and require a canonical SVN, debug disabled, and current collateral. Raw TDX SVN is recorded for audit and is not treated as a scalar ordering rule. |
+| `tcb` | Vendor TCB audit version, exact SVN, status, advisory IDs, debug state, and collateral-current result. Strict TDX receipts enforce the registry status/advisory policy and require a canonical SVN, debug disabled, and current collateral. Raw TDX SVN is recorded for audit and is not treated as a scalar ordering rule; its legacy scalar `version` field is therefore `0`. |
 | `channel` | Channel claim status and its evidence digest. |
 | `work` | Claim status, challenge ID, canonical workload-manifest digest, result digest, and decimal work units. Non-passing work always records `"0"`; passed work can still receive zero credit when a separate eligibility claim is unsatisfied. |
 | `assurance` | The four independent typed claims and their component digests. |

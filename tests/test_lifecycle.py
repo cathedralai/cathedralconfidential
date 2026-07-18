@@ -500,9 +500,11 @@ def test_stale_completion_cannot_overwrite_new_generation(tmp_path: Path):
     assert store.lifecycle_snapshot("worker") == current
 
 
-def test_single_flight_deduplicates_concurrent_refreshes():
+def test_single_flight_deduplicates_concurrent_refreshes(monkeypatch):  # noqa: ANN001
     started = threading.Event()
     release = threading.Event()
+    second_waiting = threading.Event()
+    second_thread_id: int | None = None
     calls = 0
     lock = threading.Lock()
 
@@ -524,13 +526,29 @@ def test_single_flight_deduplicates_concurrent_refreshes():
                 timeout_seconds=1,
             )
             assert started.wait(1)
-            second = executor.submit(
-                coordinator.run,
-                "worker",
-                1,
-                operation,
-                timeout_seconds=1,
-            )
+            with coordinator._lock:
+                shared_future = coordinator._flights["worker"].future
+            original_result = shared_future.result
+
+            def observed_result(*, timeout=None):  # noqa: ANN001
+                if threading.get_ident() == second_thread_id:
+                    second_waiting.set()
+                return original_result(timeout=timeout)
+
+            monkeypatch.setattr(shared_future, "result", observed_result)
+
+            def join_flight() -> str:
+                nonlocal second_thread_id
+                second_thread_id = threading.get_ident()
+                return coordinator.run(
+                    "worker",
+                    1,
+                    operation,
+                    timeout_seconds=1,
+                )
+
+            second = executor.submit(join_flight)
+            assert second_waiting.wait(1)
             release.set()
             assert first.result() == second.result() == "verified"
     assert calls == 1
