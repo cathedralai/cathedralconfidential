@@ -227,6 +227,29 @@ def test_runtime_restart_commands_only_require_ledger_path():
     assert args.runtime_command == "status"
 
 
+def test_production_runtime_rejects_legacy_measurements_file(tmp_path: Path):
+    measurements = tmp_path / "measurements.json"
+    measurements.write_text(json.dumps(["measurement"]))
+    args = build_parser().parse_args(
+        [
+            "runtime",
+            "audit-attestation",
+            "--registry-db",
+            str(tmp_path / "registry.sqlite"),
+            "--ledger-db",
+            str(tmp_path / "ledger.sqlite"),
+            "--measurements-file",
+            str(measurements),
+            "--canary-hotkey",
+            "canary",
+            "--canary-endpoint",
+            "https://8.8.8.8",
+        ]
+    )
+    with pytest.raises(ValueError, match="development-only"):
+        _build_runtime(args, require_policy=True)
+
+
 def test_gpu_runtime_and_worker_flags_are_explicit_and_complete(tmp_path: Path):
     parser = build_parser()
     worker = parser.parse_args(

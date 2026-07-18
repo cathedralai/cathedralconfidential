@@ -1026,9 +1026,16 @@ def test_production_gpu_probe_enforces_runtime_startup_guards_before_work(
     object.__setattr__(signed_profile, "registry_valid_until", NOW + timedelta(days=1))
     object.__setattr__(signed_profile, "_registry_verified", True)
     signed_policy = Policy(
+        allowed_measurements={"cpu-measurement"},
+        tdx_strict=True,
         registry_release=1,
         registry_digest="sha256:" + "7" * 64,
+        registry_profile_ids=("cpu-tdx-v1",),
     )
+    object.__setattr__(signed_policy, "_registry_verified", True)
+    object.__setattr__(signed_policy, "_registry_valid_from", NOW - timedelta(days=1))
+    object.__setattr__(signed_policy, "_registry_valid_until", NOW + timedelta(days=1))
+    monkeypatch.setattr("cathedral.prober.verifier.preflight_tdx_verifier", lambda _policy: None)
     development_verifier = ExternalGpuVerifier(
         TEST_VERIFIER_CONFIG,
         production_mode=False,
@@ -1038,6 +1045,7 @@ def test_production_gpu_probe_enforces_runtime_startup_guards_before_work(
             store,
             signed_policy,
             production_mode=True,
+            policy_refresher=lambda: signed_policy,
             gpu_profile=signed_profile,
             gpu_verifier=development_verifier,
             gpu_identity_registry=registry,
@@ -1057,6 +1065,7 @@ def test_production_gpu_probe_enforces_runtime_startup_guards_before_work(
         store,
         signed_policy,
         production_mode=True,
+        policy_refresher=lambda: signed_policy,
         gpu_profile=signed_profile,
         gpu_verifier=production_verifier,
         gpu_identity_registry=registry,

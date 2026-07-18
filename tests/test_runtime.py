@@ -7,11 +7,13 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
 import pytest
+
+import cathedral.runtime as runtime_module
 
 from cathedral.assurance import ClaimStatus, attestation_claims
 from cathedral.common import (
@@ -86,9 +88,7 @@ class FakeClient:
         if evidence.channel_binding != self.binding:
             raise RuntimeError("test channel binding mismatch")
         if self.spec.channel_mismatch:
-            return ChannelBinding(
-                ChannelBindingType.APPLICATION_KEY_SHA256, b"x" * 32
-            )
+            return ChannelBinding(ChannelBindingType.APPLICATION_KEY_SHA256, b"x" * 32)
         return self.binding
 
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate:
@@ -131,6 +131,23 @@ def verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | Non
         "VERIFIED",
         assurance=attestation_claims(evidence.quote, policy),
     )
+
+
+setattr(verifier, "production_ready", True)
+
+
+def production_policy() -> Policy:
+    policy = Policy(
+        allowed_measurements={"measurement"},
+        tdx_strict=True,
+        registry_release=7,
+        registry_digest="sha256:" + "7" * 64,
+        registry_profile_ids=("cpu-tdx-v1",),
+    )
+    object.__setattr__(policy, "_registry_verified", True)
+    object.__setattr__(policy, "_registry_valid_from", datetime.now(UTC) - timedelta(days=1))
+    object.__setattr__(policy, "_registry_valid_until", datetime.now(UTC) + timedelta(days=1))
+    return policy
 
 
 def make_runtime(
@@ -230,6 +247,7 @@ def _production_runtime(
     tmp_path: Path,
     *,
     enrolled_token: str | None,
+    monkeypatch,
 ) -> tuple[ConfidentialRuntime, Ledger, FakeFactory]:
     registry = RegistryStore(str(tmp_path / "production-registry.sqlite"))
     registry.enroll("miner", "https://1.1.1.1:9001")
@@ -239,11 +257,15 @@ def _production_runtime(
         "https://1.1.1.1:9001": MinerSpec("miner-chip"),
     }
     factory = FakeFactory(specs)
+    policy = production_policy()
+    monkeypatch.setattr(runtime_module, "verify", verifier)
+    monkeypatch.setattr(runtime_module, "preflight_tdx_verifier", lambda _policy: None)
     runtime = ConfidentialRuntime(
         registry,
         ledger,
-        Policy(allowed_measurements={"measurement"}),
+        policy,
         token_provider=lambda _hotkey: enrolled_token,
+        policy_refresher=lambda: policy,
         verifier=verifier,
         remote_factory=factory,
         config=RuntimeConfig(production_mode=True),
@@ -251,8 +273,12 @@ def _production_runtime(
     return runtime, ledger, factory
 
 
-def test_production_missing_canary_token_fails_before_network_or_epoch(tmp_path: Path) -> None:
-    runtime, ledger, factory = _production_runtime(tmp_path, enrolled_token="miner-token")
+def test_production_missing_canary_token_fails_before_network_or_epoch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime, ledger, factory = _production_runtime(
+        tmp_path, enrolled_token="miner-token", monkeypatch=monkeypatch
+    )
     canary = MinerTarget("canary", "https://8.8.8.8:9000")
     with pytest.raises(ValueError, match="bearer token"):
         runtime.run_epoch(1, canary)
@@ -260,10 +286,106 @@ def test_production_missing_canary_token_fails_before_network_or_epoch(tmp_path:
     assert ledger.blocking_epoch() is None
 
 
+def test_production_runtime_rejects_unsigned_or_compatibility_policy(tmp_path: Path) -> None:
+    registry = RegistryStore(str(tmp_path / "registry.sqlite"))
+    ledger = Ledger(tmp_path / "ledger.sqlite")
+    with pytest.raises(ValueError, match="strict signed CPU policy"):
+        ConfidentialRuntime(
+            registry,
+            ledger,
+            Policy(allowed_measurements={"measurement"}),
+            verifier=verifier,
+            config=RuntimeConfig(production_mode=True),
+        )
+
+
+def test_production_runtime_rejects_forged_registry_metadata(tmp_path: Path) -> None:
+    forged = Policy(
+        allowed_measurements={"measurement"},
+        tdx_strict=True,
+        registry_release=7,
+        registry_digest="sha256:" + "7" * 64,
+        registry_profile_ids=("cpu-tdx-v1",),
+    )
+    assert forged.production_ready_for_tdx is False
+    with pytest.raises(ValueError, match="strict signed CPU policy"):
+        ConfidentialRuntime(
+            RegistryStore(str(tmp_path / "registry.sqlite")),
+            Ledger(tmp_path / "ledger.sqlite"),
+            forged,
+            verifier=verifier,
+            config=RuntimeConfig(production_mode=True),
+        )
+
+
+def test_production_runtime_refreshes_policy_and_rejects_mid_epoch_change(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    initial = production_policy()
+    replacement = production_policy()
+    object.__setattr__(replacement, "_registry_valid_from", initial._registry_valid_from)
+    object.__setattr__(replacement, "_registry_valid_until", initial._registry_valid_until)
+    object.__setattr__(replacement, "registry_profile_ids", ("cpu-tdx-v2",))
+    object.__setattr__(replacement, "allowed_measurements", frozenset({"replacement"}))
+    factory = FakeFactory({"https://8.8.8.8:9000": MinerSpec("canary")})
+    monkeypatch.setattr(runtime_module, "preflight_tdx_verifier", lambda _policy: None)
+    runtime = ConfidentialRuntime(
+        RegistryStore(str(tmp_path / "registry.sqlite")),
+        Ledger(tmp_path / "ledger.sqlite"),
+        initial,
+        policy_refresher=lambda: replacement,
+        remote_factory=factory,
+        config=RuntimeConfig(production_mode=True),
+    )
+    runtime._active_policy_authority = initial.registry_authority_identity
+
+    with pytest.raises(RuntimeError, match="changed during the active epoch"):
+        runtime.check_canary(MinerTarget("canary", "https://8.8.8.8:9000", "canary-token"))
+    assert factory.log == {}
+
+
+def test_production_runtime_rejects_custom_verifier_escape_hatch(tmp_path: Path) -> None:
+    policy = production_policy()
+    with pytest.raises(ValueError, match="pinned TDX verifier"):
+        ConfidentialRuntime(
+            RegistryStore(str(tmp_path / "registry.sqlite")),
+            Ledger(tmp_path / "ledger.sqlite"),
+            policy,
+            policy_refresher=lambda: policy,
+            verifier=verifier,
+            config=RuntimeConfig(production_mode=True),
+        )
+
+
+def test_production_runtime_requires_live_policy_refresher(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="live policy registry refresher"):
+        ConfidentialRuntime(
+            RegistryStore(str(tmp_path / "registry.sqlite")),
+            Ledger(tmp_path / "ledger.sqlite"),
+            production_policy(),
+            config=RuntimeConfig(production_mode=True),
+        )
+
+
+def test_recovery_runtime_cannot_be_reused_for_admission(tmp_path: Path) -> None:
+    runtime = ConfidentialRuntime(
+        RegistryStore(str(tmp_path / "registry.sqlite")),
+        Ledger(tmp_path / "ledger.sqlite"),
+        Policy(),
+        config=RuntimeConfig(production_mode=True, admission_enabled=False),
+    )
+    with pytest.raises(RuntimeError, match="admission is disabled"):
+        runtime.check_canary(MinerTarget("canary", "https://8.8.8.8", "token"))
+
+
 def test_production_missing_enrollment_token_fails_before_network_or_epoch(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
-    runtime, ledger, factory = _production_runtime(tmp_path, enrolled_token=None)
+    runtime, ledger, factory = _production_runtime(
+        tmp_path, enrolled_token=None, monkeypatch=monkeypatch
+    )
     canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
     with pytest.raises(RuntimeError, match="authentication is required"):
         runtime.run_epoch(1, canary)
@@ -271,8 +393,10 @@ def test_production_missing_enrollment_token_fails_before_network_or_epoch(
     assert ledger.blocking_epoch() is None
 
 
-def test_production_authenticated_targets_complete(tmp_path: Path) -> None:
-    runtime, _, factory = _production_runtime(tmp_path, enrolled_token="miner-token")
+def test_production_authenticated_targets_complete(tmp_path: Path, monkeypatch) -> None:
+    runtime, _, factory = _production_runtime(
+        tmp_path, enrolled_token="miner-token", monkeypatch=monkeypatch
+    )
     canary = MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
     run = runtime.run_epoch(1, canary)
     assert run.status == "complete"
@@ -371,9 +495,7 @@ def test_runtime_atomically_persists_offline_verifiable_receipt(
 
 def test_hardware_pass_with_work_failure_is_explicit_zero(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("a", invalid_sat=True)})
-    runtime, _, _ = make_runtime(
-        tmp_path, [("miner", "http://127.0.0.1:9001")], specs
-    )
+    runtime, _, _ = make_runtime(tmp_path, [("miner", "http://127.0.0.1:9001")], specs)
 
     run = runtime.run_epoch(1, CANARY)
     outcome = next(item for item in run.outcomes if item.hotkey == "miner")
@@ -403,9 +525,7 @@ def test_runtime_rejects_legacy_verified_flag_without_typed_claims(tmp_path: Pat
 
 def test_channel_mismatch_never_dispatches_work_or_admits(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("a", channel_mismatch=True)})
-    runtime, _, factory = make_runtime(
-        tmp_path, [("miner", "http://127.0.0.1:9001")], specs
-    )
+    runtime, _, factory = make_runtime(tmp_path, [("miner", "http://127.0.0.1:9001")], specs)
 
     run = runtime.run_epoch(1, CANARY)
     outcome = next(item for item in run.outcomes if item.hotkey == "miner")
@@ -415,25 +535,25 @@ def test_channel_mismatch_never_dispatches_work_or_admits(tmp_path: Path) -> Non
     assert "sat:miner" not in factory.log
 
 
-def test_production_rejects_legacy_report_data_before_work(tmp_path: Path) -> None:
+def test_production_rejects_legacy_report_data_before_work(tmp_path: Path, monkeypatch) -> None:
     registry = RegistryStore(str(tmp_path / "registry.sqlite"))
     ledger = Ledger(tmp_path / "ledger.sqlite")
-    factory = FakeFactory(
-        {"https://8.8.8.8:9000": MinerSpec("canary", legacy_evidence=True)}
-    )
+    factory = FakeFactory({"https://8.8.8.8:9000": MinerSpec("canary", legacy_evidence=True)})
+    policy = production_policy()
+    monkeypatch.setattr(runtime_module, "verify", verifier)
+    monkeypatch.setattr(runtime_module, "preflight_tdx_verifier", lambda _policy: None)
     runtime = ConfidentialRuntime(
         registry,
         ledger,
-        Policy(allowed_measurements={"measurement"}),
+        policy,
+        policy_refresher=lambda: policy,
         verifier=verifier,
         remote_factory=factory,
         config=RuntimeConfig(production_mode=True),
     )
 
     with pytest.raises(RuntimeError, match="report data v2"):
-        runtime.check_canary(
-            MinerTarget("canary", "https://8.8.8.8:9000", "canary-token")
-        )
+        runtime.check_canary(MinerTarget("canary", "https://8.8.8.8:9000", "canary-token"))
     assert "sat:canary" not in factory.log
 
 
@@ -474,32 +594,29 @@ def test_evidence_audit_digest_commits_to_report_version_and_channel_binding():
     first = Evidence(
         **common,
         report_data_version=2,
-        channel_binding=ChannelBinding(
-            ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32
-        ),
+        channel_binding=ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32),
     )
     second = Evidence(
         **common,
         report_data_version=2,
-        channel_binding=ChannelBinding(
-            ChannelBindingType.TLS_SPKI_SHA256, b"b" * 32
-        ),
+        channel_binding=ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"b" * 32),
     )
 
-    assert len(
-        {
-            _evidence_digest(legacy),
-            _evidence_digest(first),
-            _evidence_digest(second),
-        }
-    ) == 3
+    assert (
+        len(
+            {
+                _evidence_digest(legacy),
+                _evidence_digest(first),
+                _evidence_digest(second),
+            }
+        )
+        == 3
+    )
 
 
 def test_runtime_persists_strict_attestation_policy_mode(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("a")})
-    runtime, ledger, _ = make_runtime(
-        tmp_path, [("miner-a", "http://127.0.0.1:9001")], specs
-    )
+    runtime, ledger, _ = make_runtime(tmp_path, [("miner-a", "http://127.0.0.1:9001")], specs)
 
     def strict_verifier(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested:
         assert evidence.nonce == nonce
@@ -523,9 +640,7 @@ def test_runtime_persists_strict_attestation_policy_mode(tmp_path: Path) -> None
 def test_duplicate_endpoint_excludes_all_claimants(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("unused")})
     endpoint = "http://127.0.0.1:9001"
-    runtime, _, factory = make_runtime(
-        tmp_path, [("a", endpoint), ("b", endpoint + "/")], specs
-    )
+    runtime, _, factory = make_runtime(tmp_path, [("a", endpoint), ("b", endpoint + "/")], specs)
     run = runtime.run_epoch(1, CANARY)
     assert dict(run.scores) == {"a": 0.0, "b": 0.0}
     assert {outcome.status for outcome in run.outcomes} == {"duplicate_endpoint"}
@@ -632,9 +747,7 @@ def test_retries_use_fresh_evidence_nonce_and_same_sat_challenge(tmp_path: Path)
 
 def test_exact_owner_rejection_completes_as_zero(tmp_path: Path) -> None:
     specs = default_specs(**{"9001": MinerSpec("a", invalid_sat=True)})
-    runtime, _, _ = make_runtime(
-        tmp_path, [("miner", "http://127.0.0.1:9001")], specs
-    )
+    runtime, _, _ = make_runtime(tmp_path, [("miner", "http://127.0.0.1:9001")], specs)
     run = runtime.run_epoch(1, CANARY)
     assert run.scores["miner"] == 0.0
     assert run.outcomes[0].status == "sat_failed"
@@ -642,9 +755,7 @@ def test_exact_owner_rejection_completes_as_zero(tmp_path: Path) -> None:
 
 def test_runtime_exception_aborts_and_same_source_retries(tmp_path: Path, monkeypatch) -> None:
     specs = default_specs(**{"9001": MinerSpec("a")})
-    runtime, ledger, _ = make_runtime(
-        tmp_path, [("miner", "http://127.0.0.1:9001")], specs
-    )
+    runtime, ledger, _ = make_runtime(tmp_path, [("miner", "http://127.0.0.1:9001")], specs)
     original = ledger.complete_epoch
 
     def explode(*_args, **_kwargs):
@@ -745,8 +856,7 @@ def test_policy_revocation_publishes_signed_positive_to_explicit_zero_without_ne
         ledger.report_bytes(zero.epoch_id),
     ]
     assert poster.signatures == [
-        hmac.new(poster.secret, body, hashlib.sha256).hexdigest()
-        for body in poster.bodies
+        hmac.new(poster.secret, body, hashlib.sha256).hexdigest() for body in poster.bodies
     ]
 
 

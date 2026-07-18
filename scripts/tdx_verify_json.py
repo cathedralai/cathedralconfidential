@@ -11,7 +11,7 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -20,12 +20,65 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cathedral.verify.tdx_quote import TdxQuoteParseError, parse_tdx_quote
+from cathedral.verify import _read_bounded_subprocess
+
+
+_ATTESTOR_TIMEOUT_SECONDS = 25
+_ATTESTOR_OUTPUT_BYTES = 64 * 1024
+_ATTESTOR_RESULT_BYTES = 64 * 1024
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        parsed = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or path.is_symlink()
+            or before.st_size > _ATTESTOR_RESULT_BYTES
+        ):
+            raise OSError("unsafe or oversized result file")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+                before.st_dev,
+                before.st_ino,
+            ):
+                raise OSError("unstable result file")
+            encoded = handle.read(_ATTESTOR_RESULT_BYTES + 1)
+        if len(encoded) > _ATTESTOR_RESULT_BYTES:
+            raise OSError("oversized result file")
+        after = path.lstat()
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise OSError("result file changed while reading")
+        parsed = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("non-finite JSON")),
+        )
+    except (OSError, ValueError, json.JSONDecodeError, RecursionError) as exc:
         raise SystemExit(f"attestor-verify did not produce valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise SystemExit("attestor-verify JSON was not an object")
@@ -37,15 +90,19 @@ def _run_attestor_verify(bin_path: str, quote: bytes, report_data_hex: str) -> d
         quote_path = Path(td) / "quote.bin"
         out_path = Path(td) / "verify.json"
         quote_path.write_bytes(quote)
-        proc = subprocess.run(
+        stdout, stderr, returncode = _read_bounded_subprocess(
             [bin_path, str(quote_path), report_data_hex, str(out_path)],
-            check=False,
-            capture_output=True,
-            text=True,
+            _ATTESTOR_OUTPUT_BYTES,
+            _ATTESTOR_TIMEOUT_SECONDS,
+            # The production parent has already replaced its environment with
+            # the fixed verifier environment; development fixtures intentionally
+            # inherit their test controls here.
+            sanitized=False,
+            start_new_session=False,
         )
-        if proc.returncode != 0:
-            stderr = proc.stderr.strip() or proc.stdout.strip()
-            raise SystemExit(f"attestor-verify failed: {stderr[:500]}")
+        if returncode != 0:
+            detail = stderr.strip() or stdout.strip()
+            raise SystemExit(f"attestor-verify failed: {detail[:500]}")
         return _read_json(out_path)
 
 
@@ -73,12 +130,16 @@ def _exact_optional_str(verifier: dict[str, Any], key: str) -> str | None:
 
 def _exact_optional_str_list(verifier: dict[str, Any], key: str) -> list[str] | None:
     value = verifier.get(key)
-    if not isinstance(value, list) or len(value) > 64 or any(
-        not isinstance(item, str)
-        or not item
-        or len(item) > 128
-        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in item)
-        for item in value
+    if (
+        not isinstance(value, list)
+        or len(value) > 64
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > 128
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in item)
+            for item in value
+        )
     ):
         return None
     if len(set(value)) != len(value):
@@ -126,9 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         and platform_identity_verified is True
         and claims_bound_to_quote is True
     )
-    canonical_platform_id = (
-        _canonical_platform_id(stable_platform_id) if stable_identity else None
-    )
+    canonical_platform_id = _canonical_platform_id(stable_platform_id) if stable_identity else None
 
     print(
         json.dumps(

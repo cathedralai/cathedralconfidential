@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import sqlite3
 from copy import deepcopy
@@ -24,7 +25,11 @@ from cathedral.policy_registry import (
     sign_registry,
     verify_registry,
 )
-from cathedral.cli import _verified_registry_policy, cmd_policy_registry_verify
+from cathedral.cli import (
+    _load_registry_keys,
+    _verified_registry_policy,
+    cmd_policy_registry_verify,
+)
 from cathedral.ledger import Ledger, LedgerError
 
 
@@ -36,11 +41,13 @@ PUBLIC_KEY = PRIVATE_KEY.public_key().public_bytes(
 )
 TRUSTED = {"cathedral-policy-test-1": PUBLIC_KEY}
 RECEIPT_PRIVATE_SEED = bytes(range(32, 64))
-RECEIPT_PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(
-    RECEIPT_PRIVATE_SEED
-).public_key().public_bytes(
-    serialization.Encoding.Raw,
-    serialization.PublicFormat.Raw,
+RECEIPT_PUBLIC_KEY = (
+    Ed25519PrivateKey.from_private_bytes(RECEIPT_PRIVATE_SEED)
+    .public_key()
+    .public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
 )
 NOW = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
 
@@ -92,9 +99,7 @@ def _unsigned(
             {
                 "id": "cathedral-receipt-test-1",
                 "algorithm": "ed25519",
-                "public_key_base64": base64.b64encode(RECEIPT_PUBLIC_KEY).decode(
-                    "ascii"
-                ),
+                "public_key_base64": base64.b64encode(RECEIPT_PUBLIC_KEY).decode("ascii"),
                 "purpose": "assurance_receipt",
                 "status": "active",
                 "status_changed_at": valid_from,
@@ -128,6 +133,15 @@ def test_golden_canonicalization_and_ed25519_signature():
     assert snapshot.release == 1
     assert snapshot.signing_key_id == "cathedral-policy-test-1"
     assert snapshot.digest.startswith("sha256:")
+
+
+def test_production_policy_authority_expires_without_restart():
+    snapshot = verify_registry(_bytes(_signed()), TRUSTED, now=NOW)
+    policy = snapshot.to_policy(at=NOW, max_age_seconds=86400)
+
+    assert policy.production_ready_at(NOW)
+    assert not policy.production_ready_at(NOW + timedelta(hours=13))
+    assert not policy.production_ready_at(snapshot.valid_until)
 
 
 @pytest.mark.parametrize(
@@ -167,9 +181,7 @@ def test_duplicate_keys_unknown_fields_versions_and_profile_ids_fail_closed():
 
     duplicate = _unsigned(profiles=[_profile(), _profile()])
     with pytest.raises(PolicyRegistryError, match="unique"):
-        verify_registry(
-            _bytes(sign_registry(duplicate, PRIVATE_SEED)), TRUSTED, now=NOW
-        )
+        verify_registry(_bytes(sign_registry(duplicate, PRIVATE_SEED)), TRUSTED, now=NOW)
 
 
 def test_signature_key_id_algorithm_and_base64_fail_closed():
@@ -190,17 +202,13 @@ def test_signature_key_id_algorithm_and_base64_fail_closed():
 def test_registry_integers_fit_durable_sqlite_representation():
     oversized_release = _unsigned(release=2**63)
     with pytest.raises(PolicyRegistryError, match="bounded positive"):
-        verify_registry(
-            _bytes(sign_registry(oversized_release, PRIVATE_SEED)), TRUSTED, now=NOW
-        )
+        verify_registry(_bytes(sign_registry(oversized_release, PRIVATE_SEED)), TRUSTED, now=NOW)
 
     oversized_tcb = _profile()
     oversized_tcb["min_tcb"] = 2**63
     document = _unsigned(profiles=[oversized_tcb])
     with pytest.raises(PolicyRegistryError, match="bounded nonnegative"):
-        verify_registry(
-            _bytes(sign_registry(document, PRIVATE_SEED)), TRUSTED, now=NOW
-        )
+        verify_registry(_bytes(sign_registry(document, PRIVATE_SEED)), TRUSTED, now=NOW)
 
 
 def test_admission_freshness_validity_and_clock_boundaries():
@@ -247,9 +255,7 @@ def test_historical_verification_does_not_make_old_release_current():
         ],
     )
     receipt_time = datetime(2026, 7, 11, 0, 0, 0, tzinfo=UTC)
-    assert verify_registry(
-        _bytes(old), TRUSTED, now=NOW, historical_at=receipt_time
-    )
+    assert verify_registry(_bytes(old), TRUSTED, now=NOW, historical_at=receipt_time)
     with pytest.raises(PolicyRegistryError):
         verify_registry(_bytes(old), TRUSTED, now=NOW)
 
@@ -279,18 +285,14 @@ def test_active_and_retiring_overlap_then_retired_and_revoked_are_excluded():
             measurement="revoked-measurement",
         ),
     ]
-    snapshot = verify_registry(
-        _bytes(_signed(profiles=profiles)), TRUSTED, now=NOW
-    )
+    snapshot = verify_registry(_bytes(_signed(profiles=profiles)), TRUSTED, now=NOW)
     policy = snapshot.to_policy(at=NOW)
 
     assert policy.allowed_measurements == {"old-measurement", "new-measurement"}
     assert policy.registry_release == 1
     assert policy.registry_digest == snapshot.digest
     assert policy.registry_profile_ids == ("new", "old")
-    after_retirement = snapshot.to_policy(
-        at=datetime(2026, 7, 19, 1, 0, 0, tzinfo=UTC)
-    )
+    after_retirement = snapshot.to_policy(at=datetime(2026, 7, 19, 1, 0, 0, tzinfo=UTC))
     assert after_retirement.allowed_measurements == {"new-measurement"}
 
 
@@ -307,9 +309,7 @@ def test_overlapping_profiles_cannot_weaken_security_controls():
     reordered["tdx_allowed_advisories"] = ["INTEL-SA-1", "INTEL-SA-2"]
     original = _profile("original", measurement="m4")
     original["tdx_allowed_advisories"] = ["INTEL-SA-2", "INTEL-SA-1"]
-    snapshot = verify_registry(
-        _bytes(_signed(profiles=[original, reordered])), TRUSTED, now=NOW
-    )
+    snapshot = verify_registry(_bytes(_signed(profiles=[original, reordered])), TRUSTED, now=NOW)
     assert snapshot.to_policy(at=NOW).allowed_measurements == {"m3", "m4"}
 
 
@@ -324,9 +324,7 @@ def test_scheduled_active_profile_is_excluded_until_its_activation_time():
         _bytes(_signed(profiles=[_profile("current"), future])), TRUSTED, now=NOW
     )
 
-    assert snapshot.to_policy(at=NOW).allowed_measurements == {
-        "tdx-measurement-sha256:sample-v1"
-    }
+    assert snapshot.to_policy(at=NOW).allowed_measurements == {"tdx-measurement-sha256:sample-v1"}
     assert snapshot.to_policy(
         at=datetime(2026, 7, 18, 1, 0, 0, tzinfo=UTC)
     ).allowed_measurements == {
@@ -342,9 +340,7 @@ def test_future_non_activation_transition_is_rejected():
         retire_at="2026-07-19T00:00:00Z",
     )
     with pytest.raises(PolicyRegistryError, match="not yet effective"):
-        verify_registry(
-            _bytes(_signed(profiles=[future_retirement])), TRUSTED, now=NOW
-        )
+        verify_registry(_bytes(_signed(profiles=[future_retirement])), TRUSTED, now=NOW)
 
 
 def test_fresh_production_state_requires_minimum_or_exact_pinned_checkpoint(
@@ -422,16 +418,12 @@ def test_invalid_profile_transitions_and_removal_are_rejected(tmp_path: Path):
         status_changed_at="2026-07-17T02:00:00Z",
         retire_at="2026-07-17T02:00:00Z",
     )
-    release2 = verify_registry(
-        _bytes(_signed(release=2, profiles=[retired])), TRUSTED, now=NOW
-    )
+    release2 = verify_registry(_bytes(_signed(release=2, profiles=[retired])), TRUSTED, now=NOW)
     with pytest.raises(PolicyRegistryError, match="transition"):
         state.accept(release2)
 
     replacement = _profile("replacement")
-    removed = verify_registry(
-        _bytes(_signed(release=2, profiles=[replacement])), TRUSTED, now=NOW
-    )
+    removed = verify_registry(_bytes(_signed(release=2, profiles=[replacement])), TRUSTED, now=NOW)
     with pytest.raises(PolicyRegistryError, match="remove"):
         state.accept(removed)
 
@@ -484,9 +476,7 @@ def test_registry_policy_is_immutable_during_epoch_configuration():
 def test_registry_metadata_is_deeply_immutable_and_resource_bounded():
     document = _unsigned()
     document["metadata"] = {"nested": {"values": ["one", "two"]}}
-    snapshot = verify_registry(
-        _bytes(sign_registry(document, PRIVATE_SEED)), TRUSTED, now=NOW
-    )
+    snapshot = verify_registry(_bytes(sign_registry(document, PRIVATE_SEED)), TRUSTED, now=NOW)
     with pytest.raises(TypeError):
         snapshot.metadata["nested"]["new"] = True
     with pytest.raises(AttributeError):
@@ -504,9 +494,7 @@ def test_registry_metadata_is_deeply_immutable_and_resource_bounded():
     document = _unsigned()
     document["metadata"] = too_deep
     with pytest.raises(PolicyRegistryError, match="deeply nested"):
-        verify_registry(
-            _bytes(sign_registry(document, PRIVATE_SEED)), TRUSTED, now=NOW
-        )
+        verify_registry(_bytes(sign_registry(document, PRIVATE_SEED)), TRUSTED, now=NOW)
 
 
 def test_runtime_registry_path_verifies_before_advancing_checkpoint(
@@ -531,16 +519,11 @@ def test_runtime_registry_path_verifies_before_advancing_checkpoint(
     registry_path.write_bytes(_bytes(document))
     keys_path = tmp_path / "keys.json"
     keys_path.write_text(
-        json.dumps(
-            {
-                "cathedral-policy-test-1": base64.b64encode(PUBLIC_KEY).decode(
-                    "ascii"
-                )
-            }
-        ),
+        json.dumps({"cathedral-policy-test-1": base64.b64encode(PUBLIC_KEY).decode("ascii")}),
         encoding="utf-8",
     )
     state_path = tmp_path / "state.sqlite"
+    keys_digest = "sha256:" + hashlib.sha256(keys_path.read_bytes()).hexdigest()
 
     policy = _verified_registry_policy(
         str(registry_path),
@@ -549,6 +532,7 @@ def test_runtime_registry_path_verifies_before_advancing_checkpoint(
         minimum_release=1,
         max_age_seconds=3600,
         production_mode=True,
+        trusted_keys_digest=keys_digest,
     )
     assert policy.registry_release == 1
     assert PolicyRegistryState(state_path, minimum_release=1).current()["release"] == 1
@@ -561,6 +545,7 @@ def test_runtime_registry_path_verifies_before_advancing_checkpoint(
         minimum_release=None,
         max_age_seconds=3600,
         production_mode=True,
+        trusted_keys_digest=keys_digest,
         pinned_release=1,
         pinned_digest=policy.registry_digest,
     )
@@ -603,8 +588,28 @@ def test_runtime_registry_path_verifies_before_advancing_checkpoint(
             minimum_release=1,
             max_age_seconds=3600,
             production_mode=True,
+            trusted_keys_digest=keys_digest,
         )
     assert not untouched_state.exists()
+
+
+def test_production_trusted_keys_require_independent_digest(tmp_path: Path):
+    keys_path = tmp_path / "keys.json"
+    keys_path.write_text(
+        json.dumps({"cathedral-policy-test-1": base64.b64encode(PUBLIC_KEY).decode("ascii")}),
+        encoding="utf-8",
+    )
+    digest = "sha256:" + hashlib.sha256(keys_path.read_bytes()).hexdigest()
+
+    with pytest.raises(ValueError, match="require a pinned digest"):
+        _load_registry_keys(str(keys_path), production_mode=True)
+    assert _load_registry_keys(str(keys_path), production_mode=True, pinned_digest=digest) == {
+        "cathedral-policy-test-1": PUBLIC_KEY
+    }
+
+    keys_path.write_text(keys_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match"):
+        _load_registry_keys(str(keys_path), production_mode=True, pinned_digest=digest)
 
 
 def test_epoch_report_commits_to_registry_release_and_digest(tmp_path: Path):
@@ -650,9 +655,7 @@ def test_existing_ledger_schema_migrates_registry_audit_fields(tmp_path: Path):
             """
         )
     ledger = Ledger(path)
-    columns = {
-        row["name"] for row in ledger._connection.execute("PRAGMA table_info(epochs)")
-    }
+    columns = {row["name"] for row in ledger._connection.execute("PRAGMA table_info(epochs)")}
 
     assert "policy_registry_release" in columns
     assert "policy_registry_digest" in columns
@@ -661,13 +664,8 @@ def test_existing_ledger_schema_migrates_registry_audit_fields(tmp_path: Path):
 def test_sample_registry_and_public_key_verify():
     base = Path("examples/policy-registry")
     keys = json.loads((base / "trusted-keys.json").read_text(encoding="utf-8"))
-    trusted = {
-        key_id: base64.b64decode(value, validate=True)
-        for key_id, value in keys.items()
-    }
-    snapshot = verify_registry(
-        (base / "registry-v1.json").read_bytes(), trusted, now=NOW
-    )
+    trusted = {key_id: base64.b64decode(value, validate=True) for key_id, value in keys.items()}
+    snapshot = verify_registry((base / "registry-v1.json").read_bytes(), trusted, now=NOW)
 
     assert snapshot.release == 1
     assert snapshot.to_policy(at=NOW).registry_digest == snapshot.digest

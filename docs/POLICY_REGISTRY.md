@@ -96,6 +96,12 @@ introduced.
 The runtime exposes both bootstrap forms: use
 `--policy-registry-min-release`, or supply the exact pair
 `--policy-registry-pinned-release` and `--policy-registry-pinned-digest`.
+Production also requires `--policy-registry-keys-digest sha256:...`, configured
+independently of the public key file. The daemon reloads and verifies the
+registry on every probe pass, immediately before each probe verdict commit,
+and at every runtime admission boundary. Expiry,
+maximum-age exhaustion, key-file drift, or a release change during an active
+epoch fails closed before verdict or ledger commit.
 
 ## Epoch and historical verification
 

@@ -12,16 +12,31 @@ Env knobs exercised:
 
 from __future__ import annotations
 
+import json
+import io
+import os
+import resource
+import struct
+import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from cathedral.common import Evidence, EvidenceKind, Policy, issue_nonce, report_data
-from cathedral.verify import verify
+from cathedral.verify import (
+    _read_bounded_subprocess,
+    _require_static_linux_elf,
+    _validate_production_tdx_configuration,
+    verify,
+)
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
 
 def _fake_verifier(tmp_path, body: str) -> str:
     """Write a tiny Python script that prints *body* and return CMD string."""
@@ -61,9 +76,24 @@ def _policy(measurement: str) -> Policy:
     return Policy(allowed_measurements={measurement})
 
 
+def _production_policy(measurement: str) -> Policy:
+    policy = Policy(
+        allowed_measurements={measurement},
+        tdx_strict=True,
+        registry_release=7,
+        registry_digest="sha256:" + "7" * 64,
+        registry_profile_ids=("cpu-tdx-v1",),
+    )
+    object.__setattr__(policy, "_registry_verified", True)
+    object.__setattr__(policy, "_registry_valid_from", datetime.now(UTC) - timedelta(days=1))
+    object.__setattr__(policy, "_registry_valid_until", datetime.now(UTC) + timedelta(days=1))
+    return policy
+
+
 # ---------------------------------------------------------------------------
 # Exact-True flag requirements
 # ---------------------------------------------------------------------------
+
 
 def test_missing_intel_verified_rejects(tmp_path, monkeypatch):
     """Verifier JSON omitting intel_verified must reject (fails closed)."""
@@ -153,6 +183,7 @@ def test_both_flags_false_rejects(tmp_path, monkeypatch):
 # Subprocess safety — timeout
 # ---------------------------------------------------------------------------
 
+
 def test_verifier_timeout_rejects_without_hanging(tmp_path, monkeypatch):
     """A verifier that exceeds the timeout must be rejected, not hung."""
     nonce = issue_nonce()
@@ -171,9 +202,154 @@ def test_verifier_timeout_rejects_without_hanging(tmp_path, monkeypatch):
     assert elapsed < 8, f"verify() blocked for {elapsed:.1f}s (expected < 8)"
 
 
+def test_bounded_reader_supports_pipe_descriptors_above_fd_setsize():
+    soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit < 1200:
+        pytest.skip("process descriptor limit is too small for the regression")
+    descriptors: list[int] = []
+    try:
+        while not descriptors or descriptors[-1] <= 1100:
+            descriptors.append(os.open(os.devnull, os.O_RDONLY))
+        stdout, stderr, returncode = _read_bounded_subprocess(
+            [sys.executable, "-c", "print('selector-ok')"],
+            4096,
+            5,
+        )
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+    assert (stdout, stderr, returncode) == ("selector-ok\n", "", 0)
+
+
+def test_bounded_reader_kills_descendants_that_keep_pipes_open():
+    program = (
+        "import subprocess,sys; "
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "print('parent-exit')"
+    )
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _read_bounded_subprocess(
+            [sys.executable, "-c", program],
+            4096,
+            1,
+        )
+    assert time.monotonic() - started < 5
+
+
+def test_bounded_reader_kills_descendants_after_parent_exits():
+    program = (
+        "import subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+        "print(child.pid,flush=True); raise SystemExit(1)"
+    )
+    stdout, _stderr, returncode = _read_bounded_subprocess([sys.executable, "-c", program], 4096, 5)
+    descendant_pid = int(stdout.strip())
+    assert returncode == 1
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(descendant_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        os.kill(descendant_pid, 9)
+        pytest.fail("verifier descendant survived parent completion")
+
+
+def test_duplicate_verifier_json_keys_reject_last_value_bypass(tmp_path, monkeypatch):
+    nonce = issue_nonce()
+    hotkey = "hk-duplicate-json"
+    report = report_data(nonce, hotkey).hex()
+    body = (
+        "print('{'"
+        f'\'"report_data":"{report}",\''
+        '\'"measurement":"m1","tcb":0,\''
+        '\'"platform_id":"platform",\''
+        '\'"intel_verified":false,"intel_verified":true,\''
+        "'\"report_data_match\":true}')"
+    )
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path, body))
+    assert verify(_make_evidence(nonce, hotkey), nonce, _policy("m1")) is None
+
+
+def test_signed_policy_requires_pinned_production_verifier(tmp_path, monkeypatch):
+    nonce = issue_nonce()
+    hotkey = "hk-unpinned-production"
+    report = report_data(nonce, hotkey).hex()
+    body = _good_claims_body(report, "m1", "platform")
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", _fake_verifier(tmp_path, body))
+    monkeypatch.delenv("CATHEDRAL_TDX_VERIFY_ARTIFACTS", raising=False)
+    monkeypatch.delenv("CATHEDRAL_TDX_VERIFY_DIGEST", raising=False)
+    assert verify(_make_evidence(nonce, hotkey), nonce, _production_policy("m1")) is None
+
+
+def test_production_verifier_rejects_interpreter_or_fixed_arguments():
+    with pytest.raises(ValueError, match="configuration is invalid"):
+        _validate_production_tdx_configuration(
+            (sys.executable, "/opt/cathedral/tdx_verify_json.py"),
+            [sys.executable, "/opt/cathedral/tdx_verify_json.py"],
+        )
+
+
+def test_production_verifier_requires_static_x86_64_elf():
+    executable = bytearray(120)
+    executable[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<HH", executable, 16, 2, 62)
+    struct.pack_into("<Q", executable, 32, 64)
+    struct.pack_into("<HH", executable, 54, 56, 1)
+    struct.pack_into("<I", executable, 64, 1)
+    _require_static_linux_elf(io.BytesIO(executable), len(executable))
+
+    struct.pack_into("<I", executable, 64, 3)
+    with pytest.raises(OSError):
+        _require_static_linux_elf(io.BytesIO(executable), len(executable))
+
+
+def test_signed_policy_accepts_exactly_pinned_production_verifier(tmp_path, monkeypatch):
+    nonce = issue_nonce()
+    hotkey = "hk-pinned-production"
+    report = report_data(nonce, hotkey).hex()
+    stable_id = "tdx-platform-sha256:" + "a" * 64
+    claims = {
+        "advisory_ids": [],
+        "claims_bound_to_quote": True,
+        "collateral_current": True,
+        "debug_enabled": False,
+        "intel_verified": True,
+        "measurement": "m1",
+        "platform_id": stable_id,
+        "platform_identity_kind": "stable",
+        "platform_identity_verified": True,
+        "report_data": report,
+        "report_data_match": True,
+        "stable_platform_id": stable_id,
+        "tcb": 0,
+        "tcb_status": "UpToDate",
+        "tcb_svn": "0d010800000000000000000000000000",
+        "tdx_attestation_key_id": "tdx-ak-sha256:" + "c" * 64,
+        "tdx_pck_cert_id": "tdx-pck-cert-sha256:" + "b" * 64,
+    }
+    command = _fake_verifier(
+        tmp_path,
+        f"print({json.dumps(json.dumps(claims))})",
+    )
+    monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", "/opt/cathedral/tdx-verifier")
+    monkeypatch.setattr(
+        "cathedral.verify._production_tdx_command",
+        lambda _command: command.split(),
+    )
+    attested = verify(_make_evidence(nonce, hotkey), nonce, _production_policy("m1"))
+    assert attested is not None
+    assert attested.chip_id == stable_id
+
+
 # ---------------------------------------------------------------------------
 # Subprocess safety — nonzero exit
 # ---------------------------------------------------------------------------
+
 
 def test_verifier_nonzero_exit_rejects(tmp_path, monkeypatch):
     """A verifier that exits with a nonzero code must be rejected."""
@@ -187,6 +363,7 @@ def test_verifier_nonzero_exit_rejects(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Subprocess safety — oversized output
 # ---------------------------------------------------------------------------
+
 
 def test_verifier_oversized_stdout_rejects(tmp_path, monkeypatch):
     """Output exceeding CATHEDRAL_TDX_VERIFY_MAX_OUTPUT must be rejected."""
@@ -202,6 +379,7 @@ def test_verifier_oversized_stdout_rejects(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Subprocess safety — malformed JSON
 # ---------------------------------------------------------------------------
+
 
 def test_verifier_malformed_json_rejects(tmp_path, monkeypatch):
     """Non-JSON stdout must be rejected."""

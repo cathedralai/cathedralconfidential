@@ -25,6 +25,8 @@ import argparse
 import base64
 import binascii
 import datetime
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -205,8 +207,7 @@ def _format_run_pretty(run: EpochRun, *, out: object = None) -> None:
         )
         if outcome.assurance is not None:
             claim_summary = " ".join(
-                f"{dimension.value[0].upper()}="
-                f"{outcome.assurance.claim(dimension).status.value}"
+                f"{dimension.value[0].upper()}={outcome.assurance.claim(dimension).status.value}"
                 for dimension in AssuranceDimension
             )
             print(f"            assurance {claim_summary}", file=out)
@@ -223,9 +224,7 @@ def _format_run_pretty(run: EpochRun, *, out: object = None) -> None:
     )
 
 
-def _format_publish_pretty(
-    epoch_id: int, ack: dict[str, object], *, out: object = None
-) -> None:
+def _format_publish_pretty(epoch_id: int, ack: dict[str, object], *, out: object = None) -> None:
     """Write a concise human-readable publish acknowledgement to *out*."""
     if out is None:
         out = sys.stdout
@@ -326,7 +325,9 @@ def cmd_work_submit(args: argparse.Namespace) -> int:
     queue.enqueue(item)
     pending.append(_item_to_dict(item))
     _save_pending(path, pending)
-    print(f"submitted job (n_vars={item.instance.n_vars}, seed={item.seed}); queue depth={len(pending)}")
+    print(
+        f"submitted job (n_vars={item.instance.n_vars}, seed={item.seed}); queue depth={len(pending)}"
+    )
     return 0
 
 
@@ -398,10 +399,22 @@ def _read_bounded_registry_file(path: str, label: str) -> bytes:
     return data
 
 
-def _load_registry_keys(path: str) -> dict[str, bytes]:
-    raw = parse_registry_json(
-        _read_bounded_registry_file(path, "policy registry key file")
-    )
+def _load_registry_keys(
+    path: str,
+    *,
+    production_mode: bool = False,
+    pinned_digest: str | None = None,
+) -> dict[str, bytes]:
+    encoded = _read_bounded_registry_file(path, "policy registry key file")
+    if production_mode and pinned_digest is None:
+        raise ValueError("production policy registry keys require a pinned digest")
+    if pinned_digest is not None:
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", pinned_digest) is None:
+            raise ValueError("policy registry key digest is invalid")
+        actual_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+        if not hmac.compare_digest(actual_digest, pinned_digest):
+            raise ValueError("policy registry key digest does not match")
+    raw = parse_registry_json(encoded)
     keys: dict[str, bytes] = {}
     try:
         for key_id, encoded in raw.items():
@@ -426,6 +439,7 @@ def _verified_registry_policy(
     minimum_release: int | None,
     max_age_seconds: int,
     production_mode: bool,
+    trusted_keys_digest: str | None = None,
     pinned_release: int | None = None,
     pinned_digest: str | None = None,
 ) -> Policy:
@@ -436,6 +450,7 @@ def _verified_registry_policy(
         minimum_release=minimum_release,
         max_age_seconds=max_age_seconds,
         production_mode=production_mode,
+        trusted_keys_digest=trusted_keys_digest,
         pinned_release=pinned_release,
         pinned_digest=pinned_digest,
     )
@@ -450,18 +465,23 @@ def _verified_registry_snapshot_and_policy(
     minimum_release: int | None,
     max_age_seconds: int,
     production_mode: bool,
+    trusted_keys_digest: str | None = None,
     pinned_release: int | None = None,
     pinned_digest: str | None = None,
 ) -> tuple[Policy, PolicyRegistrySnapshot]:
     data = _read_bounded_registry_file(registry_path, "policy registry")
     snapshot = verify_registry(
         data,
-        _load_registry_keys(keys_path),
+        _load_registry_keys(
+            keys_path,
+            production_mode=production_mode,
+            pinned_digest=trusted_keys_digest,
+        ),
         max_age_seconds=max_age_seconds,
     )
     # Prove the signed snapshot can produce a usable CPU admission policy
     # before advancing the durable high-water mark.
-    policy = snapshot.to_policy()
+    policy = snapshot.to_policy(max_age_seconds=max_age_seconds)
     state = PolicyRegistryState(
         state_path,
         production_mode=production_mode,
@@ -505,26 +525,15 @@ def _load_private_seed(
     try:
         try:
             metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or (metadata.st_dev, metadata.st_ino)
-                != (before.st_dev, before.st_ino)
+            if not stat.S_ISREG(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (
+                before.st_dev,
+                before.st_ino,
             ):
-                raise ValueError(
-                    f"{label} must be a stable regular non-symlink file"
-                )
+                raise ValueError(f"{label} must be a stable regular non-symlink file")
             if production_mode and metadata.st_mode & 0o077:
-                raise ValueError(
-                    f"production {label} must not be group/world accessible"
-                )
-            if (
-                production_mode
-                and hasattr(os, "getuid")
-                and metadata.st_uid != os.getuid()
-            ):
-                raise ValueError(
-                    f"production {label} must be owned by the runtime user"
-                )
+                raise ValueError(f"production {label} must not be group/world accessible")
+            if production_mode and hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+                raise ValueError(f"production {label} must be owned by the runtime user")
             raw = os.read(descriptor, 257)
         except OSError as exc:
             raise ValueError(f"unable to load {label}") from exc
@@ -561,12 +570,7 @@ def cmd_policy_registry_verify(args: argparse.Namespace) -> int:
     historical_at = None
     historical_raw = getattr(args, "historical_at", None)
     if historical_raw is not None:
-        if (
-            re.fullmatch(
-                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", historical_raw
-            )
-            is None
-        ):
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", historical_raw) is None:
             raise ValueError("--historical-at must be canonical UTC time")
         try:
             historical_at = datetime.datetime.strptime(
@@ -605,16 +609,13 @@ def cmd_receipt_verify(args: argparse.Namespace) -> int:
         issued_raw = preview.get("issued_at")
         if (
             not isinstance(issued_raw, str)
-            or re.fullmatch(
-                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", issued_raw
-            )
-            is None
+            or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", issued_raw) is None
         ):
             raise ReceiptError("schema", "receipt issued_at is invalid")
         try:
-            issued_at = datetime.datetime.strptime(
-                issued_raw, "%Y-%m-%dT%H:%M:%S.%fZ"
-            ).replace(tzinfo=datetime.UTC)
+            issued_at = datetime.datetime.strptime(issued_raw, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=datetime.UTC
+            )
         except ValueError as exc:
             raise ReceiptError("schema", "receipt issued_at is invalid") from exc
         policy_registry = verify_registry(
@@ -673,9 +674,7 @@ def _load_tokens(path: str | None, *, production_mode: bool = False) -> dict[str
     else:
         raw = _load_json(path, "token mapping")
     if not isinstance(raw, dict) or any(
-        not isinstance(hotkey, str)
-        or not hotkey
-        or not _valid_bearer_token(token)
+        not isinstance(hotkey, str) or not hotkey or not _valid_bearer_token(token)
         for hotkey, token in raw.items()
     ):
         raise ValueError("token mapping must contain bounded bearer tokens")
@@ -726,9 +725,7 @@ def _publisher_from_args(args: argparse.Namespace) -> Poster | None:
     bearer = os.environ.get(bearer_env)
     secret = os.environ.get(hmac_env)
     if not bearer or not secret:
-        raise ValueError(
-            f"publisher credentials must be set in {bearer_env} and {hmac_env}"
-        )
+        raise ValueError(f"publisher credentials must be set in {bearer_env} and {hmac_env}")
     return Poster(endpoint, bearer, secret)
 
 
@@ -746,9 +743,7 @@ def _build_runtime(
         gpu_identity_key_file,
         gpu_identity_anchor_file,
     )
-    if any(item is not None for item in gpu_values) and any(
-        item is None for item in gpu_values
-    ):
+    if any(item is not None for item in gpu_values) and any(item is None for item in gpu_values):
         raise ValueError(
             "--gpu-profile-id, --gpu-identity-db, --gpu-identity-key-file, and "
             "--gpu-identity-anchor-file are required together"
@@ -762,16 +757,13 @@ def _build_runtime(
         reattestation_failures_before_failed=getattr(
             args, "reattestation_failures_before_failed", 3
         ),
-        reattestation_retry_base_seconds=getattr(
-            args, "reattestation_retry_base_seconds", 5
-        ),
+        reattestation_retry_base_seconds=getattr(args, "reattestation_retry_base_seconds", 5),
         reattestation_retry_maximum_seconds=getattr(
             args, "reattestation_retry_maximum_seconds", 300
         ),
-        reattestation_retry_jitter_seconds=getattr(
-            args, "reattestation_retry_jitter_seconds", 5
-        ),
+        reattestation_retry_jitter_seconds=getattr(args, "reattestation_retry_jitter_seconds", 5),
         expected_tier=Tier.CC_GPU if gpu_profile_id is not None else Tier.CC_CPU_TDX,
+        admission_enabled=require_policy,
     )
     tokens = _load_tokens(
         getattr(args, "tokens_file", None),
@@ -780,10 +772,9 @@ def _build_runtime(
     measurements_file = getattr(args, "measurements_file", None)
     policy_registry = getattr(args, "policy_registry", None)
     policy_snapshot: PolicyRegistrySnapshot | None = None
+    policy_refresher = None
     if measurements_file and policy_registry:
-        raise ValueError(
-            "--measurements-file and --policy-registry are mutually exclusive"
-        )
+        raise ValueError("--measurements-file and --policy-registry are mutually exclusive")
     if policy_registry is not None:
         for name in ("policy_registry_keys", "policy_registry_state"):
             if not getattr(args, name, None):
@@ -795,10 +786,33 @@ def _build_runtime(
             minimum_release=args.policy_registry_min_release,
             max_age_seconds=args.policy_registry_max_age_seconds,
             production_mode=config.production_mode,
+            trusted_keys_digest=getattr(args, "policy_registry_keys_digest", None),
             pinned_release=getattr(args, "policy_registry_pinned_release", None),
             pinned_digest=getattr(args, "policy_registry_pinned_digest", None),
         )
+        if config.production_mode:
+
+            def refresh_policy() -> Policy:
+                refreshed, _snapshot = _verified_registry_snapshot_and_policy(
+                    policy_registry,
+                    args.policy_registry_keys,
+                    state_path=args.policy_registry_state,
+                    minimum_release=args.policy_registry_min_release,
+                    max_age_seconds=args.policy_registry_max_age_seconds,
+                    production_mode=True,
+                    trusted_keys_digest=getattr(args, "policy_registry_keys_digest", None),
+                    pinned_release=getattr(args, "policy_registry_pinned_release", None),
+                    pinned_digest=getattr(args, "policy_registry_pinned_digest", None),
+                )
+                return refreshed
+
+            policy_refresher = refresh_policy
     elif measurements_file:
+        if config.production_mode:
+            raise ValueError(
+                "production admission requires --policy-registry; "
+                "--measurements-file is development-only"
+            )
         policy = _load_policy(measurements_file)
     elif require_policy:
         raise ValueError("one of --measurements-file or --policy-registry is required")
@@ -807,6 +821,10 @@ def _build_runtime(
         # runtime methods operate only on already-frozen ledger state, so they
         # intentionally need no current admission policy.
         policy = Policy()
+    if require_policy and config.production_mode and not policy.production_ready_for_tdx:
+        raise ValueError(
+            "production admission requires strict signed CPU policy registry authority"
+        )
     receipt_key_id = getattr(args, "receipt_signing_key_id", None)
     receipt_key_file = getattr(args, "receipt_signing_key_file", None)
     if (receipt_key_id is None) != (receipt_key_file is None):
@@ -836,9 +854,7 @@ def _build_runtime(
         gpu_profile = gpu_profile_from_registry(policy_snapshot, gpu_profile_id)
         if not gpu_profile.production_ready:
             raise ValueError("GPU profile is not production ready")
-        gpu_verifier = gpu_verifier_from_env(
-            production_mode=config.production_mode
-        )
+        gpu_verifier = gpu_verifier_from_env(production_mode=config.production_mode)
         gpu_identity_registry = GpuIdentityRegistry(
             gpu_identity_db,
             identity_digest_key=_load_gpu_identity_key(
@@ -855,6 +871,7 @@ def _build_runtime(
         policy,
         _publisher_from_args(args),
         token_provider=tokens.get,
+        policy_refresher=policy_refresher,
         config=config,
         receipt_issuer=receipt_issuer,
         gpu_profile=gpu_profile,
@@ -919,9 +936,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
     except ValueError:
         is_loopback = args.host == "localhost"
     if not is_loopback and not args.development_allow_non_loopback:
-        raise ValueError(
-            "plain worker HTTP must bind loopback unless development mode is explicit"
-        )
+        raise ValueError("plain worker HTTP must bind loopback unless development mode is explicit")
     if getattr(args, "development_no_auth", False):
         token = None
     else:
@@ -930,9 +945,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             raise ValueError("worker bearer environment variable name is required")
         token = os.environ.get(bearer_env)
         if not _valid_bearer_token(token):
-            raise ValueError(
-                f"worker bearer token must be set in {bearer_env}"
-            )
+            raise ValueError(f"worker bearer token must be set in {bearer_env}")
     binding_type = getattr(args, "channel_binding_type", None)
     binding_digest = getattr(args, "channel_binding_digest", None)
     if (binding_type is None) != (binding_digest is None):
@@ -954,9 +967,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         configured_hotkey=args.hotkey,
         bearer_token=token,
         channel_binding=channel_binding,
-        evidence_collector=(
-            collect_tdx_gpu if getattr(args, "gpu_composite", False) else None
-        ),
+        evidence_collector=(collect_tdx_gpu if getattr(args, "gpu_composite", False) else None),
         allow_non_loopback_for_development=args.development_allow_non_loopback,
     ) as server:
         print(json.dumps({"host": server.host, "port": server.port, "hotkey": args.hotkey}))
@@ -1161,7 +1172,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_census = sub.add_parser("census", help="run the local CC capability probe")
     p_census.add_argument(
-        "--json", action="store_true", help="machine-readable output (passed through to cathedral.census)"
+        "--json",
+        action="store_true",
+        help="machine-readable output (passed through to cathedral.census)",
     )
     p_census.set_defaults(func=cmd_census)
 
@@ -1182,7 +1195,9 @@ def build_parser() -> argparse.ArgumentParser:
     work_sub = p_work.add_subparsers(dest="work_command", required=True)
 
     p_submit = work_sub.add_parser("submit", help="enqueue a customer job")
-    p_submit.add_argument("--n-vars", type=int, default=0, help="variable count (paired with --clauses)")
+    p_submit.add_argument(
+        "--n-vars", type=int, default=0, help="variable count (paired with --clauses)"
+    )
     p_submit.add_argument(
         "--clauses",
         default=None,
@@ -1209,8 +1224,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--gpu-composite",
         action="store_true",
         help=(
-            "collect bound TDX plus confidential-GPU evidence; requires "
-            "CATHEDRAL_GPU_COLLECT_CMD"
+            "collect bound TDX plus confidential-GPU evidence; requires CATHEDRAL_GPU_COLLECT_CMD"
         ),
     )
     p_serve.add_argument(
@@ -1223,9 +1237,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.set_defaults(func=cmd_worker_serve)
 
-    p_policy = sub.add_parser(
-        "policy-registry", help="verify signed public measurement policy"
-    )
+    p_policy = sub.add_parser("policy-registry", help="verify signed public measurement policy")
     policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)
     p_policy_verify = policy_sub.add_parser("verify", help="verify and inspect a registry")
     p_policy_verify.add_argument("--registry", required=True)
@@ -1250,17 +1262,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="newer registry used to enforce receipt-key retirement or revocation",
     )
     p_receipt_verify.add_argument("--key-registry-trusted-keys")
-    p_receipt_verify.add_argument(
-        "--key-registry-max-age-seconds", type=int, default=86400
-    )
+    p_receipt_verify.add_argument("--key-registry-max-age-seconds", type=int, default=86400)
     p_receipt_verify.set_defaults(func=cmd_receipt_verify)
 
-    p_lifecycle = sub.add_parser(
-        "lifecycle", help="inspect worker attestation lifecycle state"
-    )
-    lifecycle_sub = p_lifecycle.add_subparsers(
-        dest="lifecycle_command", required=True
-    )
+    p_lifecycle = sub.add_parser("lifecycle", help="inspect worker attestation lifecycle state")
+    lifecycle_sub = p_lifecycle.add_subparsers(dest="lifecycle_command", required=True)
     p_lifecycle_status = lifecycle_sub.add_parser(
         "status", help="show the current customer-safe worker state"
     )
@@ -1305,9 +1311,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_lifecycle_retire.set_defaults(func=cmd_lifecycle_retire)
 
-    p_runtime = sub.add_parser(
-        "runtime", help="operate confidential-compute report epochs"
-    )
+    p_runtime = sub.add_parser("runtime", help="operate confidential-compute report epochs")
     runtime_sub = p_runtime.add_subparsers(dest="runtime_command", required=True)
 
     def add_runtime_common(command: argparse.ArgumentParser) -> None:
@@ -1316,13 +1320,15 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--measurements-file")
         command.add_argument("--policy-registry")
         command.add_argument("--policy-registry-keys")
+        command.add_argument(
+            "--policy-registry-keys-digest",
+            help="independently configured sha256 digest of the trusted-key file",
+        )
         command.add_argument("--policy-registry-state")
         command.add_argument("--policy-registry-min-release", type=int)
         command.add_argument("--policy-registry-pinned-release", type=int)
         command.add_argument("--policy-registry-pinned-digest")
-        command.add_argument(
-            "--policy-registry-max-age-seconds", type=int, default=86400
-        )
+        command.add_argument("--policy-registry-max-age-seconds", type=int, default=86400)
         command.add_argument("--receipt-signing-key-id")
         command.add_argument("--receipt-signing-key-file")
         command.add_argument(
@@ -1345,23 +1351,13 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--miner-timeout-seconds", type=float, default=10.0)
         command.add_argument("--miner-attempts", type=int, default=2)
         command.add_argument("--max-workers", type=int, default=8)
-        command.add_argument(
-            "--reattestation-failures-before-failed", type=int, default=3
-        )
-        command.add_argument(
-            "--reattestation-retry-base-seconds", type=int, default=5
-        )
-        command.add_argument(
-            "--reattestation-retry-maximum-seconds", type=int, default=300
-        )
-        command.add_argument(
-            "--reattestation-retry-jitter-seconds", type=int, default=5
-        )
+        command.add_argument("--reattestation-failures-before-failed", type=int, default=3)
+        command.add_argument("--reattestation-retry-base-seconds", type=int, default=5)
+        command.add_argument("--reattestation-retry-maximum-seconds", type=int, default=300)
+        command.add_argument("--reattestation-retry-jitter-seconds", type=int, default=5)
         command.add_argument("--development", action="store_true")
         command.add_argument("--publisher-endpoint", default=None)
-        command.add_argument(
-            "--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV
-        )
+        command.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
         command.add_argument("--publisher-hmac-env", default=DEFAULT_PUBLISHER_HMAC_ENV)
 
     def add_canary(command: argparse.ArgumentParser) -> None:
@@ -1402,9 +1398,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_retry = runtime_sub.add_parser("retry-publish", help="publish frozen report bytes")
     p_retry.add_argument("--ledger-db", required=True)
     p_retry.add_argument("--publisher-endpoint", required=True)
-    p_retry.add_argument(
-        "--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV
-    )
+    p_retry.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
     p_retry.add_argument("--publisher-hmac-env", default=DEFAULT_PUBLISHER_HMAC_ENV)
     p_retry.add_argument("--epoch-id", type=int, required=True)
     p_retry.add_argument(

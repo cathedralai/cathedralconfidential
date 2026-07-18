@@ -227,6 +227,7 @@ only when all four identity/profile settings are present:
 cathedral runtime audit-attestation ... \
   --policy-registry policy.json \
   --policy-registry-keys trusted-keys.json \
+  --policy-registry-keys-digest sha256:<trusted-key-file-digest> \
   --policy-registry-state policy-state.sqlite \
   --gpu-profile-id tdx-h100-pcie-v1 \
   --gpu-identity-db /var/lib/cathedral/gpu-identities.sqlite \
@@ -260,6 +261,7 @@ cathedral-prober --production-mode --once \
   --db cathedral-enroll.sqlite \
   --policy-registry policy.json \
   --policy-registry-keys trusted-keys.json \
+  --policy-registry-keys-digest sha256:<trusted-key-file-digest> \
   --policy-registry-state policy-state.sqlite \
   --gpu-profile-id tdx-h100-pcie-v1 \
   --gpu-identity-db /var/lib/cathedral/gpu-identities.sqlite \
