@@ -27,6 +27,41 @@ from cathedral.common import (
 _DEFAULT_TSM_REPORT_ROOT = Path("/sys/kernel/config/tsm/report")
 _DEFAULT_SEV_GUEST_DEV = Path("/dev/sev-guest")
 _SNP_REPORT_SIZE = 1184  # fixed AMD SEV-SNP ATTESTATION_REPORT layout (matches verify.snp)
+_TDX_QUOTE_V4_SIGNED_SIZE_OFFSET = 0x278
+_TDX_QUOTE_V4_SIGNED_DATA_OFFSET = 0x27C
+_MAX_TDX_CONFIGFS_ZERO_PADDING = 4096
+
+
+def _canonicalize_tdx_configfs_quote(quote: bytes) -> bytes:
+    """Remove only bounded all-zero configfs padding from an Intel quote v4.
+
+    Some TDX configfs providers return a fixed-size ``outblob`` and zero-fill
+    the bytes after Intel's declared signed-data boundary. Canonicalizing that
+    kernel transport padding at collection time preserves the production
+    verifier's strict rejection of any unsigned suffix received over the
+    network. Malformed, nonzero, oversized, and non-v4 suffixes stay untouched
+    so validator-side ABI checks reject them.
+    """
+
+    if len(quote) < _TDX_QUOTE_V4_SIGNED_DATA_OFFSET:
+        return quote
+    if int.from_bytes(quote[:2], "little") != 4:
+        return quote
+    signed_size = int.from_bytes(
+        quote[
+            _TDX_QUOTE_V4_SIGNED_SIZE_OFFSET:_TDX_QUOTE_V4_SIGNED_DATA_OFFSET
+        ],
+        "little",
+    )
+    canonical_end = _TDX_QUOTE_V4_SIGNED_DATA_OFFSET + signed_size
+    if canonical_end > len(quote):
+        return quote
+    padding = quote[canonical_end:]
+    if not padding:
+        return quote
+    if len(padding) > _MAX_TDX_CONFIGFS_ZERO_PADDING or any(padding):
+        return quote
+    return quote[:canonical_end]
 
 
 def _snpguest_timeout() -> float:
@@ -225,7 +260,7 @@ def _collect_configfs_tsm_quote(report_data_bytes: bytes, *, root: Path) -> tupl
     report_dir.mkdir(mode=0o700, exist_ok=False)
     try:
         (report_dir / "inblob").write_bytes(report_data_bytes)
-        quote = (report_dir / "outblob").read_bytes()
+        quote = _canonicalize_tdx_configfs_quote((report_dir / "outblob").read_bytes())
         if not quote:
             raise RuntimeError("configfs-tsm returned an empty TDX quote")
 

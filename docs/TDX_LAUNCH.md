@@ -70,6 +70,14 @@ must be configured with the digest of a channel key generated and held inside
 the attested environment. It must not attest an arbitrary digest supplied by a
 requesting client.
 
+The launch provider returns a fixed-size configfs `outblob` with zero-filled
+transport bytes after Intel quote v4's declared signed-data boundary. The
+collector removes only an all-zero suffix of at most 4 KiB before transmitting
+evidence. Nonzero, oversized, malformed, and non-v4 suffixes remain untouched
+and the production verifier rejects them. This keeps one canonical wire
+representation without teaching the validator to ignore attacker-controlled
+unsigned data.
+
 The validator-side verifier is:
 
 ```python
@@ -468,3 +476,30 @@ This historical run predates the strict typed-claim contract. It remains valid
 evidence for quote collection, signature verification, nonce binding, and the
 SAT lane, but it is not evidence that strict platform-identity or TCB-status
 policy passed. A fresh strict-mode canary is required before making that claim.
+
+Strict static-verifier canary recorded July 18, 2026:
+
+- The exact static Linux artifact with SHA-256
+  `3f0baff0e6186dfb1c83de1a680a920ef16a4e07dab1a59ce501c5b394f4abdc`
+  verified a fresh quote v4 and exact independently generated 64-byte
+  REPORTDATA value.
+- Configfs returned an 8,000-byte `outblob`: 4,935 canonical quote bytes plus
+  3,065 zero transport bytes. Bounded collector canonicalization removed only
+  that zero suffix before verification.
+- The platform, TDX module, and quoting enclave all resolved to `UpToDate`
+  with no advisories; collateral was current, debug was disabled, the stable
+  platform identity was quote-bound, and the measurement was
+  `tdx-measurement-sha256:8db0293f338f288e5c7ce8f984b88b10feb09d9ba3878acc7d5654dee210f7ee`.
+- Another host pool correctly failed closed as `OutOfDate` and was not
+  admitted. Placement must therefore route work only after strict per-host
+  admission rather than assuming a whole provider region is current.
+- The labelled disposable 4-vCPU canary VM and its boot disk were deleted
+  immediately after the test. Only ephemeral quote collection was performed
+  on the protected publisher, and its temporary files were removed afterward;
+  no protected publisher configuration, service, or lifecycle state was
+  changed, restarted, or stopped.
+
+This proves the strict static quote-verification gate on real hardware. The
+signed-registry parent path, durable receipt, and full routed SAT lane remain
+separate acceptance evidence and must pass before the CPU product is called
+fully launched.
