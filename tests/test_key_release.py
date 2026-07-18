@@ -44,6 +44,7 @@ from cathedral.workload import (
     ExternalVerifierConfig,
     ImageReference,
     LocalSignatureVerifier,
+    RecordingExecutionAdapter,
     SignatureVerdict,
     WorkloadAdmissionController,
     WorkloadAdmissionError,
@@ -193,6 +194,7 @@ def _harness(tmp_path: Path, *, enabled: bool = True) -> Harness:
         workload_controller,
         b"a" * 32,
         clock=clock,
+        execution_worker_hotkey=HOTKEY,
     )
     assignment = authority.issue(
         authenticated_issuer_id="customer-account-7",
@@ -1151,6 +1153,60 @@ def test_forged_assignment_owner_worker_or_manifest_is_rejected(tmp_path: Path):
                 forged, harness.attested, harness.application_public_key
             )
         assert raised.value.category == "invalid_assignment"
+
+
+def test_authenticated_assignment_dispatches_exact_manifest_idempotently(tmp_path: Path):
+    harness = _harness(tmp_path)
+    admitted = harness.workload_controller.admit(_workload_request())
+    adapter = RecordingExecutionAdapter()
+
+    result = harness.authority.dispatch_execution(
+        assignment=harness.assignment,
+        workload=admitted,
+        adapter=adapter,
+    )
+
+    assert result.execution_id == harness.assignment.assignment_id
+    assert result.manifest_digest == harness.assignment.manifest_digest
+    assert adapter.workloads == [(harness.assignment.assignment_id, admitted)]
+
+
+@pytest.mark.parametrize("changed", ["worker", "manifest", "expired"])
+def test_assignment_execution_binding_fails_before_provider(
+    tmp_path: Path,
+    changed: str,
+):
+    harness = _harness(tmp_path)
+    admitted = harness.workload_controller.admit(_workload_request())
+    if changed == "worker":
+        assignment = harness.authority.issue(
+            authenticated_issuer_id="customer-account-7",
+            worker_hotkey="different-worker",
+            workload=admitted,
+            data_key_reference=DATA_KEY_REFERENCE,
+        )
+    elif changed == "manifest":
+        assignment = harness.assignment
+        admitted = harness.workload_controller.admit(
+            dataclasses.replace(
+                _workload_request(),
+                config_digest="sha256:" + "9" * 64,
+            )
+        )
+    else:
+        assignment = harness.assignment
+        harness.clock.now = harness.assignment.expires_at
+    adapter = RecordingExecutionAdapter()
+
+    with pytest.raises(KeyReleaseError) as raised:
+        harness.authority.dispatch_execution(
+            assignment=assignment,
+            workload=admitted,
+            adapter=adapter,
+        )
+
+    assert raised.value.category in {"execution_denied", "invalid_assignment"}
+    assert adapter.workloads == []
 
 
 def test_development_bypass_cannot_become_authenticated_assignment(tmp_path: Path):

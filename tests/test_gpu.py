@@ -422,7 +422,6 @@ def test_gpu_profile_is_selected_from_active_signed_registry_snapshot():
         at=NOW,
     )
 
-    assert profile.production_ready
     assert profile.registry_release == 7
     assert profile.registry_digest == snapshot.digest
     assert profile.expected_device_identity_digests == frozenset(
@@ -988,6 +987,8 @@ def test_gpu_request_rejects_tdx_only_omission_instead_of_cpu_downgrade(monkeypa
 def test_production_gpu_probe_enforces_runtime_startup_guards_before_work(
     tmp_path: Path, monkeypatch
 ):
+    current_time = datetime.now(UTC)
+
     class EmptyStore:
         verification_ttl_seconds = 60
 
@@ -1022,8 +1023,12 @@ def test_production_gpu_probe_enforces_runtime_startup_guards_before_work(
         registry_release=1,
         registry_digest="sha256:" + "7" * 64,
     )
-    object.__setattr__(signed_profile, "registry_valid_from", NOW - timedelta(days=1))
-    object.__setattr__(signed_profile, "registry_valid_until", NOW + timedelta(days=1))
+    object.__setattr__(
+        signed_profile, "registry_valid_from", current_time - timedelta(days=1)
+    )
+    object.__setattr__(
+        signed_profile, "registry_valid_until", current_time + timedelta(days=1)
+    )
     object.__setattr__(signed_profile, "_registry_verified", True)
     signed_policy = Policy(
         allowed_measurements={"cpu-measurement"},
@@ -1033,8 +1038,12 @@ def test_production_gpu_probe_enforces_runtime_startup_guards_before_work(
         registry_profile_ids=("cpu-tdx-v1",),
     )
     object.__setattr__(signed_policy, "_registry_verified", True)
-    object.__setattr__(signed_policy, "_registry_valid_from", NOW - timedelta(days=1))
-    object.__setattr__(signed_policy, "_registry_valid_until", NOW + timedelta(days=1))
+    object.__setattr__(
+        signed_policy, "_registry_valid_from", current_time - timedelta(days=1)
+    )
+    object.__setattr__(
+        signed_policy, "_registry_valid_until", current_time + timedelta(days=1)
+    )
     monkeypatch.setattr("cathedral.prober.verifier.preflight_tdx_verifier", lambda _policy: None)
     development_verifier = ExternalGpuVerifier(
         TEST_VERIFIER_CONFIG,

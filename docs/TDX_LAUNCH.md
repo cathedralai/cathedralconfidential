@@ -236,9 +236,10 @@ during an operator-approved maintenance window if the filesystem itself must
 shrink.
 
 This is a verified SAT rental path, not yet a general shell, VM, container, or
-arbitrary-code rental API. General CPU rental still requires a measured
-workload format, customer isolation, billing, and the external rental-lifecycle
-integration.
+arbitrary-code rental API. The signed immutable workload format and bounded
+external provider-adapter contract now exist, but general CPU rental still
+requires the real CVM host agent, attestation-bound customer access, teardown,
+billing, and external rental-lifecycle integration to pass live acceptance.
 
 A development-only compatibility or strict policy file can look like:
 
