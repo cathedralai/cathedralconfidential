@@ -89,13 +89,17 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
       "platform_id": "<sybil-dedup platform key>"
     }
 
-    The command is invoked as ``$CATHEDRAL_TDX_VERIFY_CMD <quote-file>``.
-    This function then enforces Cathedral policy and binding checks.
+    In production the command is invoked as
+    ``$CATHEDRAL_TDX_VERIFY_CMD <quote-file> <expected-report-data-hex>`` so
+    the static verifier independently enforces Cathedral's binding. This
+    function then repeats the policy and binding checks in the parent process.
     """
 
+    expected_report_data = evidence_report_data(evidence, nonce)
     claims = _run_tdx_verifier(
         evidence.quote,
         production_mode=policy.production_ready_for_tdx,
+        expected_report_data=expected_report_data,
     )
     # Both flags must be the exact JSON boolean true; missing, malformed, or
     # false (including string forms and integers) all reject.
@@ -105,7 +109,6 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
         return None
 
     actual_report_data = _claim_bytes(claims, "report_data")
-    expected_report_data = evidence_report_data(evidence, nonce)
     if actual_report_data != expected_report_data:
         return None
 
@@ -411,7 +414,12 @@ def preflight_tdx_verifier(policy: Policy) -> None:
     _production_tdx_command(raw_command)
 
 
-def _run_tdx_verifier(quote: bytes, *, production_mode: bool = False) -> dict[str, Any]:
+def _run_tdx_verifier(
+    quote: bytes,
+    *,
+    production_mode: bool = False,
+    expected_report_data: bytes | None = None,
+) -> dict[str, Any]:
     """Invoke the external TDX verifier and return its parsed JSON claims.
 
     Enforces output cap during execution: kills subprocess if combined stdout+stderr
@@ -429,6 +437,11 @@ def _run_tdx_verifier(quote: bytes, *, production_mode: bool = False) -> dict[st
 
     if not isinstance(production_mode, bool):
         return {}
+    production_expected_hex = ""
+    if production_mode:
+        if not isinstance(expected_report_data, bytes) or len(expected_report_data) != 64:
+            return {}
+        production_expected_hex = expected_report_data.hex()
     timeout = _bounded_int_from_env(
         "CATHEDRAL_TDX_VERIFY_TIMEOUT", _DEFAULT_VERIFY_TIMEOUT, _MAX_VERIFY_TIMEOUT
     )
@@ -442,12 +455,17 @@ def _run_tdx_verifier(quote: bytes, *, production_mode: bool = False) -> dict[st
     if not command:
         return {}
 
+    verifier_args = [*command]
+
     with tempfile.TemporaryDirectory(prefix="cathedral-tdx-") as td:
         quote_path = Path(td) / "quote.bin"
         quote_path.write_bytes(quote)
+        verifier_args.append(str(quote_path))
+        if production_mode:
+            verifier_args.append(production_expected_hex)
         try:
             stdout_str, stderr_str, returncode = _read_bounded_subprocess(
-                [*command, str(quote_path)],
+                verifier_args,
                 max_output,
                 timeout,
                 sanitized=production_mode,

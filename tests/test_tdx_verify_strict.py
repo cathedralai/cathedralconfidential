@@ -45,8 +45,9 @@ def _fake_verifier(tmp_path, body: str) -> str:
         f"""
 from __future__ import annotations
 import sys
-# consume the quote-file argument so the interface matches
-_quote = open(sys.argv[-1], "rb").read()
+# consume the quote-file argument so both development and production
+# invocation shapes are supported
+_quote = open(sys.argv[1], "rb").read()
 {body}
 """.lstrip()
     )
@@ -334,7 +335,10 @@ def test_signed_policy_accepts_exactly_pinned_production_verifier(tmp_path, monk
     }
     command = _fake_verifier(
         tmp_path,
-        f"print({json.dumps(json.dumps(claims))})",
+        (
+            f"assert sys.argv[2] == {report!r}\n"
+            f"print({json.dumps(json.dumps(claims))})"
+        ),
     )
     monkeypatch.setenv("CATHEDRAL_TDX_VERIFY_CMD", "/opt/cathedral/tdx-verifier")
     monkeypatch.setattr(

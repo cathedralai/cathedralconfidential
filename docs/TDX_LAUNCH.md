@@ -22,7 +22,7 @@ The validator-side subprocess verifier is governed by five environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `CATHEDRAL_TDX_VERIFY_CMD` | *(required)* | Verifier that receives the quote file path as a final argument and prints one JSON claims object. Production requires exactly one absolute static x86-64 Linux ELF executable and no configured arguments. |
+| `CATHEDRAL_TDX_VERIFY_CMD` | *(required)* | Verifier that receives the quote file path and, in production, the independently computed 128-character lowercase-hex expected REPORTDATA value, then prints one JSON claims object. Production requires exactly one absolute static x86-64 Linux ELF executable and no configured arguments. |
 | `CATHEDRAL_TDX_VERIFY_ARTIFACTS` | *(production required)* | JSON list containing exactly the same production executable path. |
 | `CATHEDRAL_TDX_VERIFY_DIGEST` | *(production required)* | Exact `sha256:...` digest of the fixed execution contract, path, and executable contents. |
 | `CATHEDRAL_TDX_VERIFY_TIMEOUT` | `30` | Seconds before the entire process group is killed. Values outside 1–60 use the safe default. |
@@ -76,6 +76,13 @@ The validator-side verifier is:
 from cathedral.verify import verify
 attested = verify(evidence, nonce, policy)
 ```
+
+Production invokes the fixed executable as
+`cathedral-tdx-verifier /absolute/path/to/quote <expected-report-data-hex>`.
+The parent computes the expected 64-byte nonce, hotkey, and channel-binding
+value; the executable independently compares it to the signed quote body and
+emits `report_data_match=true` only after an exact constant-time match. The
+parent then compares the returned REPORTDATA a second time before admission.
 
 Cathedral does not hand-roll Intel quote crypto. Set `CATHEDRAL_TDX_VERIFY_CMD`
 to a DCAP verifier that validates the quote and prints JSON claims. The strict
@@ -257,9 +264,9 @@ export CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py'
 ```
 
 The Python adapter is development-only. For production, build one static
-x86-64 Linux verifier that implements the same stdin-free quote-path/JSON
-interface and performs both Intel-chain and Cathedral claim extraction. Install
-it under a root-owned non-writable path:
+x86-64 Linux verifier that implements the stdin-free quote-path plus expected-
+REPORTDATA/JSON interface and performs both Intel-chain and Cathedral claim
+extraction. Install it under a root-owned non-writable path:
 
 ```bash
 export CATHEDRAL_TDX_VERIFY_CMD=/opt/cathedral/bin/cathedral-tdx-verifier
@@ -277,7 +284,62 @@ Digest generation deliberately fails for scripts, interpreters, dynamically
 linked executables, malformed ELF files, or unsafe path permissions. Recompute
 and review the digest for every verifier upgrade.
 
-The adapter fails closed unless `attestor-verify` returns both
+The repository now includes the production verifier source under
+`cmd/cathedral-tdx-verifier`. It pins the reviewed `go-tdx-guest` revision,
+accepts only quote v4 for the launch measurement contract, and fails closed
+unless all of the following hold:
+
+- the quote signature and Intel PCK chain verify to the embedded Intel root
+- current Intel PCS TDX/QE collateral verifies and is unexpired
+- PCK and Intel root revocation lists verify and the chain is not revoked
+- the TDX platform, TDX module, and QE status all resolve to `UpToDate` and
+  carry no advisory IDs
+- quote shape and bounds are valid, debug is disabled, and migration is disabled
+- collateral fetches use bounded HTTPS requests to the two required Intel hosts
+
+The TDX TCB Info and TDX QE Identity requests force Intel's `update=early`
+channel. Intel documents that the omitted/default `standard` channel commonly
+lags public-disclosure TCB recovery collateral by 12 months. Version-pinned
+`tcbEvaluationDataNumber` requests are rejected, including after redirects.
+Redirects may use only an allowlisted Intel host, must preserve the collateral
+endpoint and all resource-selecting query values, and have the `early`/no-
+version-pin rules reapplied before the redirected request is sent.
+[Intel PCS API documentation](https://api.portal.trustedservices.intel.com/content/documentation.html)
+
+The binary extracts PPID only from the verified PCK certificate. [Intel's PCK
+profile](https://api.trustedservices.intel.com/documents/Intel_SGX_PCK_Certificate_CRL_Spec-1.4.pdf)
+defines PPID as a processor-package or platform-instance identifier that does
+not depend on TCB. Cathedral domain-separates and hashes its canonical
+lowercase form before emitting `stable_platform_id`; raw PPID is never written
+to JSON or logs. The rotating PCK certificate and attestation key remain
+separate audit fingerprints and are never used as the stable anti-Sybil
+identity.
+
+Build and test the static Linux x86-64 artifact:
+
+```bash
+cd cmd/cathedral-tdx-verifier
+export GOTOOLCHAIN=go1.25.12
+test "$(go env GOVERSION)" = go1.25.12
+go mod verify
+go test -race ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -trimpath -buildvcs=false -ldflags='-s -w' \
+  -o cathedral-tdx-verifier .
+file cathedral-tdx-verifier
+readelf -l cathedral-tdx-verifier
+```
+
+The module, documented build, and CI require exactly Go 1.25.12 so a verifier
+cannot be released from an older standard library with known reachable TLS,
+X.509, or HTTP advisories. CI uses `GOTOOLCHAIN=local`, checks the exact compiler
+version, and fails if the artifact contains either an ELF interpreter or
+dynamic segment. `go mod verify` also rejects changed module-cache contents
+before tests or release builds run.
+Quote v5 remains rejected until Cathedral versions its measurement contract to
+include the additional v5 identity fields.
+
+The development adapter fails closed unless `attestor-verify` returns both
 `intel_verified=true` and `report_data_match=true`. It parses the debug bit,
 measurement, raw SVN, PCK fingerprint, and attestation-key fingerprint from the
 same verified quote bytes. If the external verifier also returns a bounded
