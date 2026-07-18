@@ -163,8 +163,10 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
         if not _exact_tcb_svn(tcb_svn):
             return None
         # Raw tee_tcb_svn remains an audit claim. Strict admission is based on
-        # the DCAP status/advisory result, never scalar ordering of that byte string.
-        tcb = int(tcb_svn, 16)
+        # the DCAP status/advisory result, never scalar ordering of that byte
+        # string. Keep the legacy scalar field at its neutral value so the
+        # exact 128-bit SVN cannot overflow durable signed-receipt integers.
+        tcb = 0
     else:
         if policy.min_tcb > 0 and tcb_svn and not tcb_status:
             return None
