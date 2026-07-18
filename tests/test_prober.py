@@ -14,9 +14,11 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cathedral.prober as prober_module
+import pytest
 from cathedral.assurance import attestation_claims
 from cathedral.common import (
     Attested,
@@ -50,9 +52,7 @@ def test_policy_from_args_supports_strict_tdx_flags():
 
 
 def test_policy_from_legacy_args_defaults_to_visible_compatibility_mode():
-    args = argparse.Namespace(
-        allow_measurement=["m"], allow_measurements_file=None, min_tcb=0
-    )
+    args = argparse.Namespace(allow_measurement=["m"], allow_measurements_file=None, min_tcb=0)
 
     policy = policy_from_args(args)
 
@@ -81,9 +81,9 @@ def test_prober_cli_wires_signed_gpu_configuration(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         "cathedral.gpu.gpu_profile_from_registry",
-        lambda received, profile_id: profile
-        if (received, profile_id) == (snapshot, "gpu-profile")
-        else None,
+        lambda received, profile_id: (
+            profile if (received, profile_id) == (snapshot, "gpu-profile") else None
+        ),
     )
     monkeypatch.setattr(
         "cathedral.gpu.gpu_verifier_from_env",
@@ -96,10 +96,9 @@ def test_prober_cli_wires_signed_gpu_configuration(monkeypatch, tmp_path):
     monkeypatch.setattr(
         prober_module,
         "probe_once",
-        lambda store, received_policy, **kwargs: captured.append(
-            (store, received_policy, kwargs)
-        )
-        or True,
+        lambda store, received_policy, **kwargs: (
+            captured.append((store, received_policy, kwargs)) or True
+        ),
     )
     monkeypatch.setattr(
         sys,
@@ -171,9 +170,7 @@ class TdxMiner(BaseHTTPRequestHandler):
         type(self).hits += 1
         length = int(self.headers["Content-Length"])
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        body = json.dumps(
-            _evidence_item("tdx", TDX_QUOTE, payload)
-        ).encode("utf-8")
+        body = json.dumps(_evidence_item("tdx", TDX_QUOTE, payload)).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -211,6 +208,20 @@ def _fake_tdx_verify(evidence, nonce, policy):
     return None
 
 
+def _production_policy() -> Policy:
+    policy = Policy(
+        allowed_measurements={TDX_MEASUREMENT},
+        tdx_strict=True,
+        registry_release=7,
+        registry_digest="sha256:" + "7" * 64,
+        registry_profile_ids=("cpu-tdx-v1",),
+    )
+    object.__setattr__(policy, "_registry_verified", True)
+    object.__setattr__(policy, "_registry_valid_from", datetime.now(UTC) - timedelta(days=1))
+    object.__setattr__(policy, "_registry_valid_until", datetime.now(UTC) + timedelta(days=1))
+    return policy
+
+
 # ---------------------------------------------------------------------------
 # Test: verified TDX evidence -> VERIFIED verdict
 # ---------------------------------------------------------------------------
@@ -235,9 +246,7 @@ def test_prober_verified_tdx_evidence(monkeypatch, tmp_path):
     assert board["miners"][0]["chip_id_prefix"] == TDX_CHIP_ID[:16]
 
 
-def test_prober_transient_failure_recovers_without_manual_reenrollment(
-    monkeypatch, tmp_path
-):
+def test_prober_transient_failure_recovers_without_manual_reenrollment(monkeypatch, tmp_path):
     server = _serve(TdxMiner)
     store = RegistryStore(str(tmp_path / "registry.sqlite"))
     hotkey = TdxMiner.hotkey
@@ -366,11 +375,12 @@ def test_prober_fault_isolation_unreachable_does_not_block_valid(monkeypatch, tm
 # ---------------------------------------------------------------------------
 
 
-def test_production_mode_rejects_non_global_ip_before_network(tmp_path):
+def test_production_mode_rejects_non_global_ip_before_network(monkeypatch, tmp_path):
     """In production_mode, local IP literals are rejected before the opener
     is ever invoked."""
     store = RegistryStore(str(tmp_path / "registry.sqlite"))
-    policy = Policy()
+    policy = _production_policy()
+    monkeypatch.setattr("cathedral.prober.verifier.preflight_tdx_verifier", lambda _policy: None)
 
     test_cases = [
         ("5" + "A" * 47, "http://127.0.0.1:8080"),
@@ -392,7 +402,13 @@ def test_production_mode_rejects_non_global_ip_before_network(tmp_path):
         opener_called.append(True)
         raise RuntimeError("opener should never be called")
 
-    probe_once(store, policy, opener=mock_opener, production_mode=True)
+    probe_once(
+        store,
+        policy,
+        opener=mock_opener,
+        production_mode=True,
+        policy_refresher=lambda: policy,
+    )
 
     assert not opener_called, "opener was invoked for a local IP literal in production mode"
 
@@ -400,6 +416,21 @@ def test_production_mode_rejects_non_global_ip_before_network(tmp_path):
     assert board["count"] == 0
     for miner in board["miners"]:
         assert miner["verification_status"] == "FAILED"
+
+
+def test_production_probe_rejects_unsigned_policy_before_network(tmp_path):
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    hotkey = "5" + "J" * 47
+    store.enroll(hotkey, "https://8.8.8.8:443")
+    with pytest.raises(ValueError, match="strict signed CPU policy"):
+        probe_once(store, Policy(), production_mode=True)
+    assert store.board()["miners"][0]["verification_status"] == "PENDING"
+
+
+def test_production_probe_requires_live_policy_refresher(tmp_path):
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    with pytest.raises(ValueError, match="live policy registry refresher"):
+        probe_once(store, _production_policy(), production_mode=True)
 
 
 def test_production_probe_persists_verified_channel_claim(monkeypatch, tmp_path):
@@ -427,15 +458,117 @@ def test_production_probe_persists_verified_channel_claim(monkeypatch, tmp_path)
 
     monkeypatch.setattr("cathedral.prober.RemoteMiner", BoundRemote)
     monkeypatch.setattr("cathedral.prober.verifier.verify", _fake_tdx_verify)
+    monkeypatch.setattr("cathedral.prober.verifier.preflight_tdx_verifier", lambda _policy: None)
     store = RegistryStore(str(tmp_path / "registry.sqlite"))
     hotkey = "5" + "P" * 47
     store.enroll(hotkey, "https://8.8.8.8:443")
 
-    probe_once(store, Policy(), production_mode=True)
+    policy = _production_policy()
+    probe_once(
+        store,
+        policy,
+        production_mode=True,
+        policy_refresher=lambda: policy,
+    )
 
     miner = store.board()["miners"][0]
     assert miner["verification_status"] == "VERIFIED"
     assert miner["assurance"]["claims"]["channel"]["status"] == "passed"
+
+
+def test_production_probe_rejects_policy_expiry_before_verdict_commit(monkeypatch, tmp_path):
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32)
+    policy = _production_policy()
+
+    class BoundRemote:
+        def __init__(self, endpoint, hotkey, *, timeout):
+            self.hotkey = hotkey
+
+        def fetch_evidence(self, nonce):
+            return Evidence(
+                EvidenceKind.TDX,
+                TDX_QUOTE,
+                nonce,
+                self.hotkey,
+                report_data_version=2,
+                channel_binding=binding,
+            )
+
+        def confirm_channel_binding(self, evidence):
+            return binding
+
+    def expiring_verify(evidence, nonce, active_policy):
+        attested = _fake_tdx_verify(evidence, nonce, active_policy)
+        object.__setattr__(
+            policy, "_registry_valid_until", datetime.now(UTC) - timedelta(seconds=1)
+        )
+        return attested
+
+    monkeypatch.setattr("cathedral.prober.RemoteMiner", BoundRemote)
+    monkeypatch.setattr("cathedral.prober.verifier.verify", expiring_verify)
+    monkeypatch.setattr("cathedral.prober.verifier.preflight_tdx_verifier", lambda _policy: None)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    store.enroll("5" + "R" * 47, "https://8.8.8.8:443")
+
+    assert (
+        probe_once(
+            store,
+            policy,
+            production_mode=True,
+            policy_refresher=lambda: policy,
+        )
+        is False
+    )
+    assert store.board()["miners"][0]["verification_status"] != "VERIFIED"
+
+
+def test_production_probe_rejects_superseding_release_before_verdict_commit(monkeypatch, tmp_path):
+    binding = ChannelBinding(ChannelBindingType.TLS_SPKI_SHA256, b"a" * 32)
+    initial = _production_policy()
+    replacement = _production_policy()
+    object.__setattr__(replacement, "registry_release", 8)
+    object.__setattr__(replacement, "registry_digest", "sha256:" + "8" * 64)
+    object.__setattr__(replacement, "allowed_measurements", frozenset({"revoked-replacement"}))
+    current = [initial]
+
+    class BoundRemote:
+        def __init__(self, endpoint, hotkey, *, timeout):
+            self.hotkey = hotkey
+
+        def fetch_evidence(self, nonce):
+            return Evidence(
+                EvidenceKind.TDX,
+                TDX_QUOTE,
+                nonce,
+                self.hotkey,
+                report_data_version=2,
+                channel_binding=binding,
+            )
+
+        def confirm_channel_binding(self, evidence):
+            return binding
+
+    def superseding_verify(evidence, nonce, active_policy):
+        attested = _fake_tdx_verify(evidence, nonce, active_policy)
+        current[0] = replacement
+        return attested
+
+    monkeypatch.setattr("cathedral.prober.RemoteMiner", BoundRemote)
+    monkeypatch.setattr("cathedral.prober.verifier.verify", superseding_verify)
+    monkeypatch.setattr("cathedral.prober.verifier.preflight_tdx_verifier", lambda _policy: None)
+    store = RegistryStore(str(tmp_path / "registry.sqlite"))
+    store.enroll("5" + "S" * 47, "https://8.8.8.8:443")
+
+    assert (
+        probe_once(
+            store,
+            initial,
+            production_mode=True,
+            policy_refresher=lambda: current[0],
+        )
+        is False
+    )
+    assert store.board()["miners"][0]["verification_status"] != "VERIFIED"
 
 
 def test_production_probe_channel_mismatch_records_failed(monkeypatch, tmp_path):
@@ -460,11 +593,18 @@ def test_production_probe_channel_mismatch_records_failed(monkeypatch, tmp_path)
 
     monkeypatch.setattr("cathedral.prober.RemoteMiner", MismatchedRemote)
     monkeypatch.setattr("cathedral.prober.verifier.verify", _fake_tdx_verify)
+    monkeypatch.setattr("cathedral.prober.verifier.preflight_tdx_verifier", lambda _policy: None)
     store = RegistryStore(str(tmp_path / "registry.sqlite"))
     hotkey = "5" + "Q" * 47
     store.enroll(hotkey, "https://8.8.4.4:443")
 
-    probe_once(store, Policy(), production_mode=True)
+    policy = _production_policy()
+    probe_once(
+        store,
+        policy,
+        production_mode=True,
+        policy_refresher=lambda: policy,
+    )
 
     assert store.board()["miners"][0]["verification_status"] == "FAILED"
 

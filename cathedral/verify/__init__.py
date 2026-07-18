@@ -15,16 +15,22 @@ from __future__ import annotations
 
 import base64
 import binascii
-import logging
+import hashlib
+import hmac
 import json
+import logging
 import os
-import select
+import re
+import selectors
 import shlex
+import signal
+import stat
+import struct
 import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from cathedral.assurance import attestation_claims
 from cathedral.common import (
@@ -87,7 +93,10 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
     This function then enforces Cathedral policy and binding checks.
     """
 
-    claims = _run_tdx_verifier(evidence.quote)
+    claims = _run_tdx_verifier(
+        evidence.quote,
+        production_mode=policy.production_ready_for_tdx,
+    )
     # Both flags must be the exact JSON boolean true; missing, malformed, or
     # false (including string forms and integers) all reject.
     if _claim_bool(claims, "intel_verified") is not True:
@@ -145,9 +154,7 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
         if not chip_id or _claim_exact_str(claims, "platform_id") != chip_id:
             return None
         pck_cert_id = _claim_digest_id(claims, "tdx_pck_cert_id", "tdx-pck-cert-sha256:")
-        attestation_key_id = _claim_digest_id(
-            claims, "tdx_attestation_key_id", "tdx-ak-sha256:"
-        )
+        attestation_key_id = _claim_digest_id(claims, "tdx_attestation_key_id", "tdx-ak-sha256:")
         if not pck_cert_id or not attestation_key_id:
             return None
         if not _exact_tcb_svn(tcb_svn):
@@ -160,9 +167,7 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
             return None
         if tcb < policy.min_tcb:
             return None
-        chip_id = _bounded_identity(
-            _claim_str(claims, "chip_id", "platform_id", "tdx_platform_id")
-        )
+        chip_id = _bounded_identity(_claim_str(claims, "chip_id", "platform_id", "tdx_platform_id"))
         if not chip_id:
             return None
         pck_cert_id = _claim_exact_str(claims, "tdx_pck_cert_id") or None
@@ -192,9 +197,221 @@ def _verify_tdx(evidence: Evidence, nonce: bytes, policy: Policy) -> Attested | 
 
 _DEFAULT_VERIFY_TIMEOUT = 30
 _DEFAULT_MAX_OUTPUT = 1024 * 1024  # 1 MiB
+_MAX_VERIFY_TIMEOUT = 60
+_MAX_VERIFY_OUTPUT = 4 * 1024 * 1024
+_MAX_PINNED_ARTIFACT_BYTES = 256 * 1024 * 1024
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SENSITIVE_ARGUMENT_RE = re.compile(
+    r"(?:password|passwd|token|secret|credential|api[-_]?key)", re.IGNORECASE
+)
 
 
-def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
+def _bounded_int_from_env(name: str, default: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if 1 <= value <= maximum else default
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate verifier JSON key")
+        result[key] = value
+    return result
+
+
+def _parse_verifier_json(body: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(
+            body,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("non-finite verifier JSON")
+            ),
+        )
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _production_tdx_command(raw_command: str) -> list[str]:
+    """Resolve and authenticate the complete production verifier command."""
+
+    try:
+        command = tuple(shlex.split(raw_command))
+        raw_artifacts = os.environ["CATHEDRAL_TDX_VERIFY_ARTIFACTS"]
+        decoded_artifacts = json.loads(raw_artifacts)
+        expected_digest = os.environ["CATHEDRAL_TDX_VERIFY_DIGEST"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("production TDX verifier pinning is incomplete") from exc
+    command, artifacts = _validate_production_tdx_configuration(command, decoded_artifacts)
+    if not isinstance(expected_digest, str) or _DIGEST_RE.fullmatch(expected_digest) is None:
+        raise ValueError("production TDX verifier configuration is invalid")
+    actual_digest = _tdx_implementation_digest(command, artifacts)
+    if not hmac.compare_digest(actual_digest, expected_digest):
+        raise ValueError("production TDX verifier digest does not match")
+    return list(command)
+
+
+def _validate_production_tdx_configuration(
+    command: tuple[str, ...], artifacts_value: object
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if (
+        len(command) != 1
+        or any(
+            not argument
+            or len(argument) > 4096
+            or "\x00" in argument
+            or "\n" in argument
+            or _SENSITIVE_ARGUMENT_RE.search(argument) is not None
+            for argument in command
+        )
+        or not os.path.isabs(command[0])
+        or not isinstance(artifacts_value, (list, tuple))
+        or len(artifacts_value) != 1
+        or any(
+            not isinstance(path, str)
+            or not path
+            or len(path) > 4096
+            or "\x00" in path
+            or "\n" in path
+            or not os.path.isabs(path)
+            for path in artifacts_value
+        )
+        or len(set(artifacts_value)) != len(artifacts_value)
+    ):
+        raise ValueError("production TDX verifier configuration is invalid")
+    artifacts = tuple(artifacts_value)
+    if artifacts != command:
+        raise ValueError("production TDX verifier must be one pinned executable")
+    return command, artifacts
+
+
+def _require_static_linux_elf(artifact: BinaryIO, size: int) -> None:
+    """Reject interpreters, scripts, dynamic loaders, and malformed executables."""
+
+    header = artifact.read(64)
+    if len(header) != 64 or header[:4] != b"\x7fELF" or header[4:7] != b"\x02\x01\x01":
+        raise OSError
+    elf_type, machine = struct.unpack_from("<HH", header, 16)
+    program_offset = struct.unpack_from("<Q", header, 32)[0]
+    program_entry_size, program_count = struct.unpack_from("<HH", header, 54)
+    if (
+        elf_type != 2
+        or machine != 62
+        or program_entry_size < 56
+        or not 1 <= program_count <= 4096
+        or program_offset < 64
+        or program_offset + program_entry_size * program_count > size
+    ):
+        raise OSError
+    artifact.seek(program_offset)
+    for _ in range(program_count):
+        entry = artifact.read(program_entry_size)
+        if len(entry) != program_entry_size:
+            raise OSError
+        # PT_DYNAMIC and PT_INTERP both introduce executable code outside the
+        # one digest-pinned artifact. Production accepts neither.
+        if struct.unpack_from("<I", entry)[0] in {2, 3}:
+            raise OSError
+    artifact.seek(0)
+
+
+def tdx_verifier_implementation_digest(command: tuple[str, ...], artifacts: tuple[str, ...]) -> str:
+    """Validate and digest an immutable production verifier installation."""
+
+    validated_command, validated_artifacts = _validate_production_tdx_configuration(
+        command, artifacts
+    )
+    return _tdx_implementation_digest(validated_command, validated_artifacts)
+
+
+def _tdx_implementation_digest(command: tuple[str, ...], artifacts: tuple[str, ...]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"cathedral-tdx-verifier-implementation-v1\0")
+    digest.update(
+        json.dumps(
+            {
+                "artifacts": list(artifacts),
+                "argv": list(command),
+                "environment": {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                "working_directory": "/",
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+    for path in artifacts:
+        try:
+            candidate = Path(path)
+            metadata = os.lstat(candidate)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_mode & 0o022 != 0
+                or metadata.st_size > _MAX_PINNED_ARTIFACT_BYTES
+            ):
+                raise OSError
+            for ancestor in candidate.parents:
+                ancestor_metadata = os.lstat(ancestor)
+                if (
+                    not stat.S_ISDIR(ancestor_metadata.st_mode)
+                    or ancestor_metadata.st_uid != 0
+                    or ancestor_metadata.st_mode & 0o022 != 0
+                ):
+                    raise OSError
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(candidate, flags)
+            with os.fdopen(descriptor, "rb") as artifact:
+                opened = os.fstat(artifact.fileno())
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    raise OSError
+                if path == command[0] and metadata.st_mode & 0o111 == 0:
+                    raise OSError
+                if path == command[0]:
+                    _require_static_linux_elf(artifact, metadata.st_size)
+                encoded_path = path.encode("utf-8")
+                digest.update(len(encoded_path).to_bytes(4, "big"))
+                digest.update(encoded_path)
+                while chunk := artifact.read(1024 * 1024):
+                    digest.update(chunk)
+            after = os.lstat(candidate)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ):
+                raise OSError
+        except (OSError, UnicodeEncodeError) as exc:
+            raise ValueError("production TDX verifier artifact pinning failed") from exc
+    return "sha256:" + digest.hexdigest()
+
+
+def preflight_tdx_verifier(policy: Policy) -> None:
+    """Fail closed before production network or epoch work begins."""
+
+    if not isinstance(policy, Policy) or not policy.production_ready_for_tdx:
+        raise ValueError("production TDX requires strict signed registry policy")
+    raw_command = os.environ.get("CATHEDRAL_TDX_VERIFY_CMD")
+    if not raw_command:
+        raise ValueError("production TDX verifier is not configured")
+    _production_tdx_command(raw_command)
+
+
+def _run_tdx_verifier(quote: bytes, *, production_mode: bool = False) -> dict[str, Any]:
     """Invoke the external TDX verifier and return its parsed JSON claims.
 
     Enforces output cap during execution: kills subprocess if combined stdout+stderr
@@ -210,41 +427,38 @@ def _run_tdx_verifier(quote: bytes) -> dict[str, Any]:
             "(DCAP or Intel Trust Authority JSON verifier)"
         )
 
+    if not isinstance(production_mode, bool):
+        return {}
+    timeout = _bounded_int_from_env(
+        "CATHEDRAL_TDX_VERIFY_TIMEOUT", _DEFAULT_VERIFY_TIMEOUT, _MAX_VERIFY_TIMEOUT
+    )
+    max_output = _bounded_int_from_env(
+        "CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", _DEFAULT_MAX_OUTPUT, _MAX_VERIFY_OUTPUT
+    )
     try:
-        timeout = int(os.environ.get("CATHEDRAL_TDX_VERIFY_TIMEOUT", str(_DEFAULT_VERIFY_TIMEOUT)))
-        if timeout <= 0:
-            timeout = _DEFAULT_VERIFY_TIMEOUT
-    except ValueError:
-        timeout = _DEFAULT_VERIFY_TIMEOUT
-    try:
-        max_output = int(
-            os.environ.get("CATHEDRAL_TDX_VERIFY_MAX_OUTPUT", str(_DEFAULT_MAX_OUTPUT))
-        )
-        if max_output <= 0:
-            max_output = _DEFAULT_MAX_OUTPUT
-    except ValueError:
-        max_output = _DEFAULT_MAX_OUTPUT
+        command = _production_tdx_command(cmd) if production_mode else shlex.split(cmd)
+    except (TypeError, ValueError):
+        return {}
+    if not command:
+        return {}
 
     with tempfile.TemporaryDirectory(prefix="cathedral-tdx-") as td:
         quote_path = Path(td) / "quote.bin"
         quote_path.write_bytes(quote)
         try:
             stdout_str, stderr_str, returncode = _read_bounded_subprocess(
-                [*shlex.split(cmd), str(quote_path)],
+                [*command, str(quote_path)],
                 max_output,
                 timeout,
+                sanitized=production_mode,
             )
-        except subprocess.TimeoutExpired:
+        except (OSError, UnicodeDecodeError, subprocess.TimeoutExpired):
             return {}  # reject: verifier exceeded time budget
 
     if returncode != 0:
         return {}  # reject: verifier signalled failure
 
-    try:
-        parsed = json.loads(stdout_str)
-    except json.JSONDecodeError:
-        return {}  # reject: not valid JSON
-    return parsed if isinstance(parsed, dict) else {}  # reject: not an object
+    return _parse_verifier_json(stdout_str)
 
 
 def _claim_bytes(claims: dict[str, Any], key: str) -> bytes:
@@ -308,8 +522,10 @@ def _claim_exact_bool(claims: dict[str, Any], key: str) -> bool | None:
 
 
 def _bounded_identity(value: str) -> str:
-    if not value or len(value) > 512 or any(
-        ord(char) < 0x21 or ord(char) == 0x7F for char in value
+    if (
+        not value
+        or len(value) > 512
+        or any(ord(char) < 0x21 or ord(char) == 0x7F for char in value)
     ):
         return ""
     return value
@@ -360,11 +576,17 @@ def _claim_bool(claims: dict[str, Any], key: str) -> bool | None:
 
 
 def _read_bounded_subprocess(
-    cmd: list[str], max_output: int, timeout: int
+    cmd: list[str],
+    max_output: int,
+    timeout: int,
+    *,
+    sanitized: bool = False,
+    start_new_session: bool = True,
 ) -> tuple[str, str, int]:
     """Run a subprocess with a hard combined-output byte cap and wall-clock timeout.
 
-    Reads both stdout and stderr in the calling thread using select(2) and
+    Reads both stdout and stderr in the calling thread using the platform's
+    scalable default selector and
     os.read so there is no race between a drain thread and the main path.
     Binary pipes prevent codec-buffering surprises.
 
@@ -373,7 +595,7 @@ def _read_bounded_subprocess(
       past max_output is discarded and triggers immediate kill+reap.
     - The post-exit pipe drain shares the same combined counter, so a fast
       child that writes and exits cannot bypass the cap.
-    - Wall-clock timeout fires inside select(); kill and reap happen before
+    - Wall-clock timeout fires inside the selector; kill and reap happen before
       raising TimeoutExpired.
 
     Returns (stdout_str, stderr_str, returncode).
@@ -382,8 +604,13 @@ def _read_bounded_subprocess(
     """
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=start_new_session,
+        cwd="/" if sanitized else None,
+        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"} if sanitized else None,
     )
 
     stdout_buf: list[bytes] = []
@@ -394,51 +621,46 @@ def _read_bounded_subprocess(
     out_fd = proc.stdout.fileno()
     err_fd = proc.stderr.fileno()
     fd_to_buf: dict[int, list[bytes]] = {out_fd: stdout_buf, err_fd: stderr_buf}
-    open_fds: set[int] = {out_fd, err_fd}
     cap_exceeded = False
-
-    while open_fds:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(out_fd, selectors.EVENT_READ)
+        selector.register(err_fd, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_subprocess(proc, process_group=start_new_session)
+                raise subprocess.TimeoutExpired(cmd, timeout)
             try:
-                proc.kill()
+                readable = selector.select(min(remaining, 1.0))
             except OSError:
-                pass
-            proc.stdout.close()
-            proc.stderr.close()
-            proc.wait()
-            raise subprocess.TimeoutExpired(cmd, timeout)
-
-        try:
-            readable, _, _ = select.select(list(open_fds), [], [], min(remaining, 1.0))
-        except OSError:
-            break
-
-        for fd in readable:
-            try:
-                data = os.read(fd, 65536)
-            except OSError:
-                data = b""
-            if not data:
-                open_fds.discard(fd)
-                continue
-            combined += len(data)
-            if combined > max_output:
-                cap_exceeded = True
+                _terminate_subprocess(proc, process_group=start_new_session)
+                return "", "", -1
+            for key, _mask in readable:
+                fd = int(key.fd)
+                try:
+                    data = os.read(fd, 65536)
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except OSError:
+                    data = b""
+                if not data:
+                    selector.unregister(fd)
+                    continue
+                combined += len(data)
+                if combined > max_output:
+                    cap_exceeded = True
+                    break
+                fd_to_buf[fd].append(data)
+            if cap_exceeded:
                 break
-            fd_to_buf[fd].append(data)
-
-        if cap_exceeded:
-            break
+    finally:
+        selector.close()
 
     if cap_exceeded:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        _terminate_subprocess(proc, process_group=start_new_session)
         proc.stdout.close()
         proc.stderr.close()
-        proc.wait()
         return "", "", -1
 
     # Both pipes are at EOF; close them and wait for the process to exit.
@@ -446,24 +668,37 @@ def _read_bounded_subprocess(
     proc.stderr.close()
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        proc.wait()
+        _terminate_subprocess(proc, process_group=start_new_session)
         raise subprocess.TimeoutExpired(cmd, timeout)
     try:
         proc.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        proc.wait()
+        _terminate_subprocess(proc, process_group=start_new_session)
         raise
 
+    # A verifier may close its pipes, spawn a background descendant, and exit.
+    # The group leader is already reaped here; kill any remaining members so a
+    # successful or failed verification cannot leave unbounded helper processes.
+    if start_new_session:
+        _terminate_subprocess(proc, process_group=True)
+
     return (
-        b"".join(stdout_buf).decode("utf-8", errors="replace"),
-        b"".join(stderr_buf).decode("utf-8", errors="replace"),
+        b"".join(stdout_buf).decode("utf-8"),
+        b"".join(stderr_buf).decode("utf-8"),
         proc.returncode,
     )
+
+
+def _terminate_subprocess(process: subprocess.Popen[bytes], *, process_group: bool) -> None:
+    if process_group:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.wait()

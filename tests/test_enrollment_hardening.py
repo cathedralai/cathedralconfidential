@@ -37,7 +37,7 @@ import pytest
 from cathedral.assurance import attestation_claims
 from substrateinterface import Keypair, KeypairType
 
-from cathedral.common import Attested, EvidenceKind, Policy, Tier
+from cathedral.common import Attested, EvidenceKind, Policy, Tier, is_globally_routable
 from cathedral.enroll import (
     IpRateLimiter,
     JsonHotkeyRegistrationProvider,
@@ -45,6 +45,7 @@ from cathedral.enroll import (
     RegistryStore,
     canonical_enroll_payload,
     now_iso,
+    validate_endpoint_url,
 )
 from cathedral.prober import (
     _PreResolvedHTTPConnection,
@@ -550,6 +551,43 @@ def test_endpoint_hostname_resolution_gates_network_access() -> None:
             opener=_TrackingOpener(),
         )
     assert network_calls
+
+
+def test_nat64_and_6to4_transition_addresses_are_rejected() -> None:
+    """``ipaddress.is_global`` does not inspect the IPv4 embedded in NAT64
+    (``64:ff9b::/96``) or 6to4 (``2002::/16``) IPv6 addresses, so
+    ``64:ff9b::7f00:1`` (127.0.0.1) reports ``is_global=True``. On a network
+    with NAT64/DNS64 or 6to4 routing those resolve to the embedded IPv4, so the
+    SSRF guards must unwrap and reject them."""
+    import ipaddress
+
+    metadata_nat64 = "64:ff9b::a9fe:a9fe"  # NAT64-wrapped 169.254.169.254
+    loopback_nat64 = "64:ff9b::7f00:1"     # NAT64-wrapped 127.0.0.1
+    metadata_6to4 = "2002:a9fe:a9fe::"     # 6to4-wrapped 169.254.169.254
+    loopback_compatible = "::7f00:1"        # deprecated IPv4-compatible loopback
+
+    # The stock is_global blind spot this guard closes.
+    assert ipaddress.ip_address(metadata_nat64).is_global is True
+    assert is_globally_routable(ipaddress.ip_address(metadata_nat64)) is False
+    assert is_globally_routable(ipaddress.ip_address(loopback_nat64)) is False
+    assert is_globally_routable(ipaddress.ip_address(metadata_6to4)) is False
+    assert is_globally_routable(ipaddress.ip_address(loopback_compatible)) is False
+    # Genuine public addresses still pass.
+    assert is_globally_routable(ipaddress.ip_address("1.1.1.1")) is True
+    assert is_globally_routable(ipaddress.ip_address("2606:4700:4700::1111")) is True
+
+    # enroll literal validation rejects them, even in IP-literal (production) mode.
+    with pytest.raises(ValueError, match="public address"):
+        validate_endpoint_url(f"http://[{metadata_nat64}]:8090", require_ip_literal=True)
+    with pytest.raises(ValueError, match="public address"):
+        validate_endpoint_url(f"http://[{metadata_6to4}]:8090", require_ip_literal=True)
+
+    # prober's resolved-address gate rejects a hostname resolving to NAT64.
+    with pytest.raises(ValueError, match="non-global"):
+        _resolve_endpoint(
+            "http://miner.example.com:8090",
+            resolver=lambda h, p: [metadata_nat64],
+        )
 
 
 # ---------------------------------------------------------------------------

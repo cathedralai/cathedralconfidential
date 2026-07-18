@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import ipaddress
 import os
 import re
 import struct
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 from cathedral.assurance import AssuranceClaims
 
@@ -86,6 +88,50 @@ MAX_GPU_EVIDENCE_CONCURRENCY = (
 )
 if MAX_GPU_EVIDENCE_CONCURRENCY < 1:
     raise RuntimeError("GPU evidence contract exceeds its working-set budget")
+
+
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+_IPV4_COMPATIBLE_PREFIX = ipaddress.IPv6Network("::/96")
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address embedded in an IPv6 transition address, else None.
+
+    Covers IPv4-mapped (``::ffff:0:0/96``), 6to4 (``2002::/16``), and the NAT64
+    well-known prefix (``64:ff9b::/96``). ``ipaddress.is_global`` looks only at
+    the outer IPv6 prefix, so on its own it reports a transition address that
+    wraps a private/loopback IPv4 as globally routable.
+    """
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip in _NAT64_WELL_KNOWN_PREFIX:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    # RFC 4291 deprecated IPv4-compatible IPv6, but some socket stacks and
+    # intermediaries still interpret ::w.x.y.z as an IPv4 transition address.
+    # Python 3.12 reports values such as ::127.0.0.1 as global, so unwrap them
+    # explicitly instead of depending on platform routing behaviour.
+    if ip in _IPV4_COMPATIBLE_PREFIX and int(ip) > 1:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
+def is_globally_routable(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Stricter ``ip.is_global`` that also rejects IPv6 transition addresses
+    wrapping a non-global IPv4.
+
+    ``ipaddress.is_global`` does not inspect the IPv4 embedded in NAT64/6to4/
+    IPv4-mapped IPv6 addresses, so e.g. ``64:ff9b::7f00:1`` (127.0.0.1) reports
+    ``is_global=True``. On a network with NAT64/DNS64 or 6to4 routing those
+    resolve to the embedded IPv4 target, defeating an SSRF guard built on
+    ``is_global`` alone. Require any embedded IPv4 to be global too.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None and not embedded.is_global:
+            return False
+    return ip.is_global
 
 
 class Tier(str, enum.Enum):
@@ -269,6 +315,63 @@ class Policy:
     registry_release: int | None = None
     registry_digest: str | None = None
     registry_profile_ids: tuple[str, ...] = ()
+    _registry_verified: bool = field(default=False, init=False, repr=False, compare=False)
+    _registry_valid_from: datetime | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _registry_valid_until: datetime | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    @property
+    def production_ready_for_tdx(self) -> bool:
+        """Whether this policy has strict signed-registry launch provenance."""
+
+        return self.production_ready_at(datetime.now(UTC))
+
+    def production_ready_at(self, when: datetime) -> bool:
+        """Whether signed policy authority is live at an exact UTC instant."""
+
+        return (
+            isinstance(when, datetime)
+            and when.tzinfo is not None
+            and when.utcoffset() == timedelta(0)
+            and self.tdx_strict
+            and bool(self.allowed_measurements)
+            and self._registry_verified
+            and self.registry_release is not None
+            and self.registry_digest is not None
+            and bool(self.registry_profile_ids)
+            and self._registry_valid_from is not None
+            and self._registry_valid_until is not None
+            and self._registry_valid_from <= when < self._registry_valid_until
+        )
+
+    @property
+    def registry_authority_identity(self) -> tuple[object, ...]:
+        """Immutable identity of the exact effective signed CPU policy.
+
+        A registry release and document digest are not sufficient on their own:
+        profile activation and retirement times can change the effective policy
+        without changing either value. Admission boundaries compare this full
+        identity so work verified under one effective profile set cannot commit
+        under another.
+        """
+
+        return (
+            self.registry_release,
+            self.registry_digest,
+            self.registry_profile_ids,
+            self.allowed_measurements,
+            self.min_tcb,
+            self.allowed_firmware,
+            self.tdx_strict,
+            self.tdx_allowed_tcb_statuses,
+            self.tdx_allowed_advisories,
+            self._registry_verified,
+            self._registry_valid_from,
+            self._registry_valid_until,
+        )
 
     def __post_init__(self) -> None:
         for name in (

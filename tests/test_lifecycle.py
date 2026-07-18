@@ -28,7 +28,7 @@ from cathedral.lifecycle import (
     require_transition,
     retry_delay_seconds,
 )
-from cathedral.runtime import ConfidentialRuntime
+from cathedral.runtime import ConfidentialRuntime, RuntimeConfig
 
 
 START = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
@@ -578,6 +578,7 @@ def test_worker_removal_cancels_refresh_and_requires_new_generation(tmp_path: Pa
         Ledger(),
         _policy(),
         reattestor=coordinator,  # type: ignore[arg-type]
+        config=RuntimeConfig(production_mode=True, admission_enabled=False),
     )
     started = threading.Event()
 

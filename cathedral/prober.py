@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from http.client import HTTPResponse
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -29,6 +29,7 @@ from cathedral.common import (
     Policy,
     Tier,
     issue_nonce,
+    is_globally_routable,
 )
 from cathedral.enroll import RegistryStore
 from cathedral.lifecycle import (
@@ -130,7 +131,7 @@ def _resolve_endpoint(
     # IP literals: validate globality; in production mode, reject all non-global.
     try:
         ip = ipaddress.ip_address(host)
-        if production_mode and not ip.is_global:
+        if production_mode and not is_globally_routable(ip):
             raise ValueError(
                 f"endpoint IP literal {host!r} rejected in production mode: "
                 "must be a public/global address"
@@ -163,7 +164,7 @@ def _resolve_endpoint(
     resolved_addr = None
     for addr in addrs:
         ip = ipaddress.ip_address(addr)
-        if not ip.is_global:
+        if not is_globally_routable(ip):
             raise ValueError(
                 f"endpoint resolves to non-global address {addr!r} for hostname {host!r}"
             )
@@ -399,6 +400,7 @@ def probe_once(
     resolver: Any = None,
     opener: Any = None,
     production_mode: bool = False,
+    policy_refresher: Callable[[], Policy] | None = None,
     gpu_profile=None,
     gpu_verifier=None,
     gpu_identity_registry=None,
@@ -438,15 +440,37 @@ def probe_once(
             gpu_identity_registry, GpuIdentityRegistry
         ):
             raise ValueError("GPU probe profile or identity registry is invalid")
+    if production_mode:
+        if not policy.production_ready_for_tdx:
+            raise ValueError(
+                "production probing requires strict signed CPU policy registry authority"
+            )
+        if policy_refresher is None:
+            raise ValueError("production probing requires a live policy registry refresher")
+        verifier.preflight_tdx_verifier(policy)
+
+    captured_policy_authority = policy.registry_authority_identity
+
+    def _require_current_policy() -> Policy:
+        if not production_mode:
+            return policy
+        assert policy_refresher is not None
+        refreshed = policy_refresher()
+        if not isinstance(refreshed, Policy) or not refreshed.production_ready_for_tdx:
+            raise ValueError("production CPU policy registry authority is not live")
+        if refreshed.registry_authority_identity != captured_policy_authority:
+            raise ValueError("production CPU policy changed during the probe")
+        return refreshed
+
+    _require_current_policy()
+    if expected_tier is Tier.CC_GPU:
         if production_mode:
             if not gpu_profile.production_ready_for(policy):
                 raise ValueError(
                     "production GPU probe requires a live profile from its CPU policy registry"
                 )
             if not gpu_identity_registry.production_ready:
-                raise ValueError(
-                    "production GPU probe requires a protected identity registry"
-                )
+                raise ValueError("production GPU probe requires a protected identity registry")
             if not isinstance(gpu_verifier, ExternalGpuVerifier):
                 raise ValueError("production GPU probe requires the pinned external verifier")
             if not gpu_verifier.production_ready:
@@ -537,6 +561,7 @@ def probe_once(
             else:
                 attested = verify_cc_evidence_bundle(evidences, nonce, policy)
             if attested is None:
+                _require_current_policy()
                 store.record_verdict(
                     enrollment.hotkey,
                     None,
@@ -583,6 +608,7 @@ def probe_once(
                         )
                         return False
                 try:
+                    _require_current_policy()
                     gpu_commit_authority = {}
                     if composite is not None and production_mode:
                         gpu_commit_authority = {
@@ -658,6 +684,10 @@ def main() -> None:
     parser.add_argument("--allow-tdx-advisory", action="append", default=[])
     parser.add_argument("--policy-registry")
     parser.add_argument("--policy-registry-keys")
+    parser.add_argument(
+        "--policy-registry-keys-digest",
+        help="independently configured sha256 digest of the trusted-key file",
+    )
     parser.add_argument("--policy-registry-state")
     parser.add_argument("--policy-registry-min-release", type=int)
     parser.add_argument("--policy-registry-pinned-release", type=int)
@@ -696,6 +726,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.production_mode and args.policy_registry is None:
+        parser.error("--production-mode requires --policy-registry authority")
 
     store = RegistryStore(args.db)
     gpu_values = (
@@ -713,27 +745,33 @@ def main() -> None:
         )
     if args.policy_registry is not None:
         if args.allow_measurement or args.allow_measurements_file:
-            parser.error(
-                "legacy measurement flags and --policy-registry are mutually exclusive"
-            )
+            parser.error("legacy measurement flags and --policy-registry are mutually exclusive")
         for name in ("policy_registry_keys", "policy_registry_state"):
             if getattr(args, name) is None:
                 parser.error(f"--{name.replace('_', '-')} is required with --policy-registry")
         from cathedral.cli import _verified_registry_snapshot_and_policy
 
-        policy, policy_snapshot = _verified_registry_snapshot_and_policy(
-            args.policy_registry,
-            args.policy_registry_keys,
-            state_path=args.policy_registry_state,
-            minimum_release=args.policy_registry_min_release,
-            max_age_seconds=args.policy_registry_max_age_seconds,
-            production_mode=args.production_mode,
-            pinned_release=args.policy_registry_pinned_release,
-            pinned_digest=args.policy_registry_pinned_digest,
-        )
+        registry_refresh_lock = threading.Lock()
+
+        def refresh_registry_authority():
+            with registry_refresh_lock:
+                return _verified_registry_snapshot_and_policy(
+                    args.policy_registry,
+                    args.policy_registry_keys,
+                    state_path=args.policy_registry_state,
+                    minimum_release=args.policy_registry_min_release,
+                    max_age_seconds=args.policy_registry_max_age_seconds,
+                    production_mode=args.production_mode,
+                    trusted_keys_digest=args.policy_registry_keys_digest,
+                    pinned_release=args.policy_registry_pinned_release,
+                    pinned_digest=args.policy_registry_pinned_digest,
+                )
+
+        policy, policy_snapshot = refresh_registry_authority()
     else:
         policy = policy_from_args(args)
         policy_snapshot = None
+        refresh_registry_authority = None
     gpu_profile = None
     gpu_verifier = None
     gpu_identity_registry = None
@@ -762,11 +800,21 @@ def main() -> None:
         expected_tier = Tier.CC_GPU
     while True:
         try:
+            if args.policy_registry is not None:
+                assert refresh_registry_authority is not None
+                policy, policy_snapshot = refresh_registry_authority()
+                if args.gpu_profile_id is not None:
+                    gpu_profile = gpu_profile_from_registry(policy_snapshot, args.gpu_profile_id)
             all_succeeded = probe_once(
                 store,
                 policy,
                 max_workers=args.workers,
                 production_mode=args.production_mode,
+                policy_refresher=(
+                    (lambda: refresh_registry_authority()[0])
+                    if refresh_registry_authority is not None
+                    else None
+                ),
                 gpu_profile=gpu_profile,
                 gpu_verifier=gpu_verifier,
                 gpu_identity_registry=gpu_identity_registry,

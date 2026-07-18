@@ -212,9 +212,7 @@ def _validate_metadata(value: object, name: str) -> Mapping[str, object]:
         if isinstance(item, dict) and all(isinstance(key, str) for key in item):
             if any(len(key.encode("utf-8")) > MAX_METADATA_KEY_BYTES for key in item):
                 raise PolicyRegistryError(f"{name} contains an oversized key")
-            return MappingProxyType(
-                {key: freeze(child, depth + 1) for key, child in item.items()}
-            )
+            return MappingProxyType({key: freeze(child, depth + 1) for key, child in item.items()})
         raise PolicyRegistryError(f"{name} contains a non-canonical value")
 
     return freeze(value, 0)  # type: ignore[return-value]
@@ -243,9 +241,7 @@ class PolicyProfile:
         if not self.valid_from <= self.status_changed_at <= when < self.valid_until:
             return False
         return not (
-            self.status == "retiring"
-            and self.retire_at is not None
-            and when >= self.retire_at
+            self.status == "retiring" and self.retire_at is not None and when >= self.retire_at
         )
 
 
@@ -299,14 +295,27 @@ class PolicyRegistrySnapshot:
         )
 
     def profile_states(self) -> Mapping[str, str]:
-        return MappingProxyType(
-            {profile.profile_id: profile.status for profile in self.profiles}
-        )
+        return MappingProxyType({profile.profile_id: profile.status for profile in self.profiles})
 
-    def to_policy(self, *, at: datetime | None = None) -> Policy:
+    def to_policy(
+        self,
+        *,
+        at: datetime | None = None,
+        max_age_seconds: int | None = None,
+    ) -> Policy:
+        if not self.signature_verified:
+            raise PolicyRegistryError(
+                "policy cannot be derived without verified registry signature provenance"
+            )
         when = at or datetime.now(UTC)
         if when.tzinfo is None or when.utcoffset() != timedelta(0):
             raise PolicyRegistryError("policy evaluation time must be UTC")
+        if max_age_seconds is not None and (
+            isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, int)
+            or max_age_seconds <= 0
+        ):
+            raise PolicyRegistryError("policy maximum age must be positive")
         eligible = [
             profile
             for profile in self.profiles
@@ -324,14 +333,10 @@ class PolicyRegistrySnapshot:
             for profile in eligible
         }
         if len(controls) != 1:
-            raise PolicyRegistryError(
-                "overlapping CPU TDX profiles must share security controls"
-            )
+            raise PolicyRegistryError("overlapping CPU TDX profiles must share security controls")
         min_tcb, statuses, advisories, firmware = controls.pop()
-        measurements = {
-            measurement for profile in eligible for measurement in profile.measurements
-        }
-        return Policy(
+        measurements = {measurement for profile in eligible for measurement in profile.measurements}
+        policy = Policy(
             allowed_measurements=measurements,
             min_tcb=min_tcb,
             allowed_firmware=set(firmware),
@@ -342,6 +347,26 @@ class PolicyRegistrySnapshot:
             registry_digest=self.digest,
             registry_profile_ids=tuple(sorted(profile.profile_id for profile in eligible)),
         )
+        object.__setattr__(policy, "_registry_verified", True)
+        authority_from = max(
+            self.valid_from,
+            *(max(profile.valid_from, profile.status_changed_at) for profile in eligible),
+        )
+        authority_until = min(
+            self.valid_until,
+            *(
+                min(profile.valid_until, profile.retire_at or profile.valid_until)
+                for profile in eligible
+            ),
+        )
+        if max_age_seconds is not None:
+            authority_until = min(
+                authority_until,
+                self.generated_at + timedelta(seconds=max_age_seconds),
+            )
+        object.__setattr__(policy, "_registry_valid_from", authority_from)
+        object.__setattr__(policy, "_registry_valid_until", authority_until)
+        return policy
 
 
 def _profile(raw: object, registry_from: datetime, registry_until: datetime) -> PolicyProfile:
@@ -384,18 +409,14 @@ def _profile(raw: object, registry_from: datetime, registry_until: datetime) -> 
     measurements = _string_list(
         raw["measurements"], "profile measurements", allow_empty=kind == "gpu_cc"
     )
-    runtime_measurements = _string_list(
-        raw["runtime_measurements"], "profile runtime_measurements"
-    )
+    runtime_measurements = _string_list(raw["runtime_measurements"], "profile runtime_measurements")
     firmware = _string_list(raw["allowed_firmware"], "profile allowed_firmware")
     statuses = _string_list(
         raw["tdx_allowed_tcb_statuses"],
         "profile tdx_allowed_tcb_statuses",
         allow_empty=kind != "cpu_tdx",
     )
-    advisories = _string_list(
-        raw["tdx_allowed_advisories"], "profile tdx_allowed_advisories"
-    )
+    advisories = _string_list(raw["tdx_allowed_advisories"], "profile tdx_allowed_advisories")
     if kind != "cpu_tdx" and (statuses or advisories):
         raise PolicyRegistryError("non-TDX profile cannot set TDX controls")
     return PolicyProfile(
@@ -420,9 +441,7 @@ def _receipt_key(
     raw: object, registry_from: datetime, registry_until: datetime
 ) -> ReceiptVerificationKey:
     if not isinstance(raw, dict) or frozenset(raw) != _RECEIPT_KEY_KEYS:
-        raise PolicyRegistryError(
-            "receipt signing key contains missing or unknown critical fields"
-        )
+        raise PolicyRegistryError("receipt signing key contains missing or unknown critical fields")
     key_id = raw["id"]
     if not isinstance(key_id, str) or _ID_RE.fullmatch(key_id) is None:
         raise PolicyRegistryError("receipt signing key id is invalid")
@@ -434,8 +453,7 @@ def _receipt_key(
         raise PolicyRegistryError("receipt signing key is not canonical base64") from exc
     if (
         len(public_key) != 32
-        or base64.b64encode(public_key).decode("ascii")
-        != raw["public_key_base64"]
+        or base64.b64encode(public_key).decode("ascii") != raw["public_key_base64"]
     ):
         raise PolicyRegistryError("receipt signing key must be 32 bytes")
     status = raw["status"]
@@ -449,11 +467,7 @@ def _receipt_key(
     if not valid_from <= changed < valid_until:
         raise PolicyRegistryError("receipt key status change must fall inside its validity")
     revoked_raw = raw["revoked_at"]
-    revoked_at = (
-        None
-        if revoked_raw is None
-        else _timestamp(revoked_raw, "receipt key revoked_at")
-    )
+    revoked_at = None if revoked_raw is None else _timestamp(revoked_raw, "receipt key revoked_at")
     if status == "revoked":
         if revoked_at != changed:
             raise PolicyRegistryError(
@@ -518,8 +532,7 @@ def verify_registry(
         raise PolicyRegistryError("registry signature is not canonical base64") from exc
     if (
         len(signature_bytes) != 64
-        or base64.b64encode(signature_bytes).decode("ascii")
-        != signature["value_base64"]
+        or base64.b64encode(signature_bytes).decode("ascii") != signature["value_base64"]
     ):
         raise PolicyRegistryError("registry signature must be 64 bytes")
     signed = canonical_signed_bytes(document)
@@ -560,10 +573,7 @@ def verify_registry(
     profiles = tuple(_profile(raw, valid_from, valid_until) for raw in profiles_raw)
     if any(
         profile.status_changed_at > check_time
-        and not (
-            profile.status == "active"
-            and profile.status_changed_at == profile.valid_from
-        )
+        and not (profile.status == "active" and profile.status_changed_at == profile.valid_from)
         for profile in profiles
     ):
         raise PolicyRegistryError("profile status transition is not yet effective")
@@ -573,27 +583,19 @@ def verify_registry(
     keys_raw = document["receipt_signing_keys"]
     if not isinstance(keys_raw, list) or len(keys_raw) > 128:
         raise PolicyRegistryError("receipt signing keys must be a bounded list")
-    receipt_keys = tuple(
-        _receipt_key(raw, valid_from, valid_until) for raw in keys_raw
-    )
+    receipt_keys = tuple(_receipt_key(raw, valid_from, valid_until) for raw in keys_raw)
     if any(
         key.status_changed_at > check_time
-        and not (
-            key.status == "active"
-            and key.status_changed_at == key.valid_from
-        )
+        and not (key.status == "active" and key.status_changed_at == key.valid_from)
         for key in receipt_keys
     ):
-        raise PolicyRegistryError(
-            "receipt signing key status transition is not yet effective"
-        )
+        raise PolicyRegistryError("receipt signing key status transition is not yet effective")
     key_ids = [key.key_id for key in receipt_keys]
     if len(set(key_ids)) != len(key_ids):
         raise PolicyRegistryError("receipt signing key ids must be unique")
     known_key_ids = set(key_ids)
     if any(
-        key.replacement_key_id is not None
-        and key.replacement_key_id not in known_key_ids
+        key.replacement_key_id is not None and key.replacement_key_id not in known_key_ids
         for key in receipt_keys
     ):
         raise PolicyRegistryError("receipt replacement key must exist in the registry")
@@ -614,17 +616,13 @@ def verify_registry(
     return snapshot
 
 
-def sign_registry(
-    unsigned_document: Mapping[str, object], private_key: bytes
-) -> dict[str, object]:
+def sign_registry(unsigned_document: Mapping[str, object], private_key: bytes) -> dict[str, object]:
     if "signature" in unsigned_document:
         raise PolicyRegistryError("unsigned registry must not contain signature")
     if not isinstance(private_key, bytes) or len(private_key) != 32:
         raise PolicyRegistryError("Ed25519 private key seed must be 32 bytes")
     document = dict(unsigned_document)
-    signature = Ed25519PrivateKey.from_private_bytes(private_key).sign(
-        canonical_json(document)
-    )
+    signature = Ed25519PrivateKey.from_private_bytes(private_key).sign(canonical_json(document))
     document["signature"] = {
         "algorithm": "ed25519",
         "value_base64": base64.b64encode(signature).decode("ascii"),
@@ -685,9 +683,7 @@ class PolicyRegistryState:
                 )
                 columns = {
                     row["name"]
-                    for row in connection.execute(
-                        "PRAGMA table_info(policy_registry_state)"
-                    )
+                    for row in connection.execute("PRAGMA table_info(policy_registry_state)")
                 }
                 if "receipt_key_states_json" not in columns:
                     connection.execute(
@@ -765,15 +761,12 @@ class PolicyRegistryState:
             ):
                 raise PolicyRegistryError("persisted receipt key state is invalid")
             try:
-                public_key = base64.b64decode(
-                    state["public_key_base64"], validate=True
-                )
+                public_key = base64.b64decode(state["public_key_base64"], validate=True)
             except (TypeError, binascii.Error, ValueError) as exc:
                 raise PolicyRegistryError("persisted receipt key state is invalid") from exc
             if (
                 len(public_key) != 32
-                or base64.b64encode(public_key).decode("ascii")
-                != state["public_key_base64"]
+                or base64.b64encode(public_key).decode("ascii") != state["public_key_base64"]
             ):
                 raise PolicyRegistryError("persisted receipt key state is invalid")
             _timestamp(
@@ -798,18 +791,14 @@ class PolicyRegistryState:
         states = {
             profile.profile_id: {
                 "status": profile.status,
-                "status_changed_at": profile.status_changed_at.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
+                "status_changed_at": profile.status_changed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             for profile in snapshot.profiles
         }
         key_states = {
             key.key_id: {
                 "status": key.status,
-                "status_changed_at": key.status_changed_at.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                ),
+                "status_changed_at": key.status_changed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "public_key_base64": base64.b64encode(key.public_key).decode("ascii"),
                 "valid_from": key.valid_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "valid_until": key.valid_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -835,9 +824,7 @@ class PolicyRegistryState:
                             )
                 else:
                     prior_release = int(row["release"])
-                    prior_states = self._decode_profile_states(
-                        row["profile_states_json"]
-                    )
+                    prior_states = self._decode_profile_states(row["profile_states_json"])
                     prior_key_states = self._decode_receipt_key_states(
                         row["receipt_key_states_json"]
                     )
@@ -851,9 +838,7 @@ class PolicyRegistryState:
                     for profile_id, prior_state in prior_states.items():
                         current_state = states.get(profile_id)
                         if current_state is None:
-                            raise PolicyRegistryError(
-                                "registry cannot remove a historical profile"
-                            )
+                            raise PolicyRegistryError("registry cannot remove a historical profile")
                         prior_status = prior_state["status"]
                         current_status = current_state["status"]
                         if current_status not in _TRANSITIONS[prior_status]:
@@ -872,9 +857,7 @@ class PolicyRegistryState:
                             )
                     for profile_id in states.keys() - prior_states.keys():
                         if states[profile_id]["status"] != "active":
-                            raise PolicyRegistryError(
-                                "new registry profile must begin active"
-                            )
+                            raise PolicyRegistryError("new registry profile must begin active")
                     for key_id, prior_state in prior_key_states.items():
                         current_state = key_states.get(key_id)
                         if current_state is None:
@@ -883,17 +866,11 @@ class PolicyRegistryState:
                             )
                         prior_status = prior_state["status"]
                         current_status = current_state["status"]
-                        if (
-                            current_state["public_key_base64"]
-                            != prior_state["public_key_base64"]
-                        ):
-                            raise PolicyRegistryError(
-                                f"receipt key material changed for {key_id}"
-                            )
+                        if current_state["public_key_base64"] != prior_state["public_key_base64"]:
+                            raise PolicyRegistryError(f"receipt key material changed for {key_id}")
                         if (
                             current_state["valid_from"] != prior_state["valid_from"]
-                            or current_state["valid_until"]
-                            != prior_state["valid_until"]
+                            or current_state["valid_until"] != prior_state["valid_until"]
                         ):
                             raise PolicyRegistryError(
                                 f"receipt key validity window changed for {key_id}"
@@ -914,9 +891,7 @@ class PolicyRegistryState:
                             )
                     for key_id in key_states.keys() - prior_key_states.keys():
                         if key_states[key_id]["status"] != "active":
-                            raise PolicyRegistryError(
-                                "new receipt signing key must begin active"
-                            )
+                            raise PolicyRegistryError("new receipt signing key must begin active")
                 connection.execute(
                     """
                     INSERT INTO policy_registry_state(

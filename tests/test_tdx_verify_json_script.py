@@ -14,6 +14,7 @@ from tests.tdx_quote_fixtures import synthetic_tdx_quote
 
 SCRIPT = Path("scripts/tdx_verify_json.py")
 
+
 def _fake_attestor_verify(tmp_path: Path) -> Path:
     script = tmp_path / "attestor-verify"
     script.write_text(
@@ -28,6 +29,9 @@ from pathlib import Path
 quote_path, report_data_hex, out_path = sys.argv[1:4]
 quote = Path(quote_path).read_bytes()
 actual = quote[568:632].hex()
+if os.environ.get("FAKE_OVERSIZED_RESULT") == "1":
+    Path(out_path).write_bytes(b"{{" + b"x" * 70000)
+    raise SystemExit(0)
 intel_verified = os.environ.get("FAKE_INTEL_VERIFIED_RAW")
 if intel_verified is None:
     intel_verified = os.environ.get("FAKE_INTEL_VERIFIED", "1") == "1"
@@ -188,6 +192,30 @@ def test_tdx_verify_json_fails_closed_without_intel_verdict(tmp_path):
 
     assert proc.returncode != 0
     assert "did not verify Intel TDX silicon" in proc.stderr
+
+
+def test_tdx_verify_json_rejects_oversized_result_file(tmp_path):
+    rd = report_data(b"n" * 32, "hotkey-tdx")
+    quote_path = tmp_path / "quote.bin"
+    quote_path.write_bytes(synthetic_tdx_quote(report_data=rd))
+    env = {**os.environ, "FAKE_OVERSIZED_RESULT": "1"}
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--attestor-verify",
+            str(_fake_attestor_verify(tmp_path)),
+            str(quote_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "oversized result file" in proc.stderr
 
 
 def test_tdx_verify_json_rejects_string_false_verifier_booleans(tmp_path):

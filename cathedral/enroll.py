@@ -33,7 +33,7 @@ from cathedral.assurance import (
     assurance_from_dict,
     empty_assurance_claims,
 )
-from cathedral.common import Attested
+from cathedral.common import Attested, is_globally_routable
 from cathedral.lifecycle import (
     NETWORK_ELIGIBLE_STATES,
     TERMINAL_STATES,
@@ -259,7 +259,7 @@ def validate_endpoint_url(endpoint_url: object, *, require_ip_literal: bool = Fa
                 "(hostnames are rejected to close the DNS check/use gap)"
             ) from None
     else:
-        if not ip.is_global:
+        if not is_globally_routable(ip):
             raise ValueError("endpoint_url host must be a public address")
     return endpoint_url
 

@@ -40,6 +40,7 @@ from cathedral.common import (
     Policy,
     Tier,
     issue_nonce,
+    is_globally_routable,
 )
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
@@ -56,7 +57,7 @@ from cathedral.lifecycle import (
 from cathedral.poster import Poster
 from cathedral.remote import RemoteMiner
 from cathedral.receipt import ReceiptIssuer
-from cathedral.verify import verify
+from cathedral.verify import preflight_tdx_verifier, verify
 
 MAX_BEARER_TOKEN_LENGTH = 4096
 SAT_WORK_POLICY_DIGEST = sha256_digest(b"cathedral-sat-work-verification-policy-v1")
@@ -95,6 +96,7 @@ class RuntimeConfig:
     reattestation_retry_maximum_seconds: int = 300
     reattestation_retry_jitter_seconds: int = 5
     expected_tier: Tier = Tier.CC_CPU_TDX
+    admission_enabled: bool = True
 
     def __post_init__(self) -> None:
         timeout = self.miner_timeout_seconds
@@ -125,6 +127,8 @@ class RuntimeConfig:
             raise ValueError("insecure HTTP is unavailable in production mode")
         if self.expected_tier not in {Tier.CC_CPU_TDX, Tier.CC_GPU}:
             raise ValueError("runtime expected tier must be CPU TDX or GPU composite")
+        if not isinstance(self.admission_enabled, bool):
+            raise ValueError("admission_enabled must be a boolean")
         if (
             isinstance(self.reattestation_failures_before_failed, bool)
             or not isinstance(self.reattestation_failures_before_failed, int)
@@ -209,6 +213,7 @@ class _CanaryResult:
 Verifier = Callable[[Evidence, bytes, Policy], Attested | None]
 NonceFactory = Callable[[], bytes]
 TokenProvider = Callable[[str], str | None]
+PolicyRefresher = Callable[[], Policy]
 RemoteFactory = Callable[..., MinerClient]
 
 
@@ -223,6 +228,7 @@ class ConfidentialRuntime:
         poster: Poster | None = None,
         *,
         token_provider: TokenProvider | None = None,
+        policy_refresher: PolicyRefresher | None = None,
         verifier: Verifier = verify,
         nonce_factory: NonceFactory = issue_nonce,
         remote_factory: RemoteFactory = RemoteMiner,
@@ -238,6 +244,7 @@ class ConfidentialRuntime:
         self.policy = policy
         self.poster = poster
         self.token_provider = token_provider or (lambda _hotkey: None)
+        self.policy_refresher = policy_refresher
         self.verifier = verifier
         self.nonce_factory = nonce_factory
         self.remote_factory = remote_factory
@@ -278,6 +285,16 @@ class ConfidentialRuntime:
                 if not gpu_verifier.production_ready:
                     raise ValueError("production GPU runtime requires a static verifier executable")
                 gpu_verifier.preflight(gpu_profile)
+        if self.config.production_mode and self.config.admission_enabled:
+            if not self.policy.production_ready_for_tdx:
+                raise ValueError(
+                    "production runtime requires strict signed CPU policy registry authority"
+                )
+            if self.verifier is not verify:
+                raise ValueError("production runtime requires the pinned TDX verifier")
+            if self.policy_refresher is None:
+                raise ValueError("production runtime requires a live policy registry refresher")
+            preflight_tdx_verifier(self.policy)
         self.gpu_profile = gpu_profile
         self.gpu_verifier = gpu_verifier
         self.gpu_identity_registry = gpu_identity_registry
@@ -296,8 +313,31 @@ class ConfidentialRuntime:
         self.reattestor = reattestor or SingleFlightReattestor(max_workers=attestation_workers)
         self._owns_reattestor = reattestor is None
         self._run_lock = threading.Lock()
+        self._active_policy_authority: tuple[object, ...] | None = None
+
+    def _require_admission_enabled(self) -> None:
+        if not self.config.admission_enabled:
+            raise RuntimeError("attestation admission is disabled for this runtime")
+
+    def _require_live_cpu_policy(self) -> None:
+        if not self.config.production_mode or not self.config.admission_enabled:
+            return
+        if self.policy_refresher is not None:
+            refreshed = self.policy_refresher()
+            if not isinstance(refreshed, Policy) or not refreshed.production_ready_for_tdx:
+                raise RuntimeError("production CPU policy registry authority is not live")
+            refreshed_authority = refreshed.registry_authority_identity
+            if (
+                self._active_policy_authority is not None
+                and refreshed_authority != self._active_policy_authority
+            ):
+                raise RuntimeError("production CPU policy changed during the active epoch")
+            self.policy = refreshed
+        if not self.policy.production_ready_for_tdx:
+            raise RuntimeError("production CPU policy registry authority is expired")
 
     def _require_live_gpu_profile(self) -> None:
+        self._require_live_cpu_policy()
         if self.config.expected_tier is not Tier.CC_GPU or not self.config.production_mode:
             return
         from cathedral.gpu import GpuProfile
@@ -310,12 +350,14 @@ class ConfidentialRuntime:
             )
 
     def check_canary(self, canary: MinerTarget) -> MinerOutcome:
+        self._require_admission_enabled()
         self._require_live_gpu_profile()
         return self._check_canary_result(canary).outcome
 
     def audit_attestation(self, target: MinerTarget) -> MinerOutcome:
         """Verify fresh evidence and its live channel without dispatch or scoring."""
 
+        self._require_admission_enabled()
         self._require_live_gpu_profile()
         checked, endpoint = self._validate_target(target)
         result = self._collect_attestation(checked, endpoint)
@@ -426,11 +468,15 @@ class ConfidentialRuntime:
         *,
         publish: bool = False,
     ) -> EpochRun:
+        self._require_admission_enabled()
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("an epoch run is already in progress")
         try:
+            self._require_live_gpu_profile()
+            self._active_policy_authority = self.policy.registry_authority_identity
             return self._run_epoch_once(source_epoch, canary, publish=publish)
         finally:
+            self._active_policy_authority = None
             self._run_lock.release()
 
     def _run_epoch_once(
@@ -527,6 +573,7 @@ class ConfidentialRuntime:
                 ):
                     raise RuntimeError("an enrolled miner shares the dedicated canary GPU identity")
 
+            self._require_live_gpu_profile()
             epoch_id = self.ledger.begin_epoch(
                 source_epoch,
                 policy_registry_release=self.policy.registry_release,
@@ -858,6 +905,7 @@ class ConfidentialRuntime:
                     )
                     continue
             try:
+                self._require_live_gpu_profile()
                 gpu_commit_authority = {}
                 if result.attested.tier is Tier.CC_GPU and self.config.production_mode:
                     gpu_commit_authority = {
@@ -902,6 +950,7 @@ class ConfidentialRuntime:
                     profile=self.gpu_profile,
                     policy=self.policy,
                 )
+            self._require_live_gpu_profile()
             self.ledger.add_attestation(
                 epoch_id,
                 result.target.hotkey,
@@ -1394,7 +1443,7 @@ def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:
         if config.production_mode:
             raise ValueError("production endpoint must use a public IP literal") from None
     else:
-        if config.production_mode and not ip.is_global:
+        if config.production_mode and not is_globally_routable(ip):
             raise ValueError("production endpoint must use a public address")
         host = f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
     try:

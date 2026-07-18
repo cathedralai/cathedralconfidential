@@ -18,13 +18,15 @@ config, or stop the VM as part of attestation development.
 
 ## Verifier Subprocess Controls
 
-The validator-side subprocess verifier is governed by three environment variables:
+The validator-side subprocess verifier is governed by five environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `CATHEDRAL_TDX_VERIFY_CMD` | *(required)* | Command (plus any fixed args) that receives the quote file path as a final argument and must print a JSON claims object to stdout. |
-| `CATHEDRAL_TDX_VERIFY_TIMEOUT` | `30` | Seconds before the subprocess is killed. Timeout causes the miner to be rejected without hanging the epoch. |
-| `CATHEDRAL_TDX_VERIFY_MAX_OUTPUT` | `1048576` (1 MiB) | Maximum bytes of stdout (or stderr) accepted. Output exceeding this limit is rejected without parsing. |
+| `CATHEDRAL_TDX_VERIFY_CMD` | *(required)* | Verifier that receives the quote file path as a final argument and prints one JSON claims object. Production requires exactly one absolute static x86-64 Linux ELF executable and no configured arguments. |
+| `CATHEDRAL_TDX_VERIFY_ARTIFACTS` | *(production required)* | JSON list containing exactly the same production executable path. |
+| `CATHEDRAL_TDX_VERIFY_DIGEST` | *(production required)* | Exact `sha256:...` digest of the fixed execution contract, path, and executable contents. |
+| `CATHEDRAL_TDX_VERIFY_TIMEOUT` | `30` | Seconds before the entire process group is killed. Values outside 1–60 use the safe default. |
+| `CATHEDRAL_TDX_VERIFY_MAX_OUTPUT` | `1048576` (1 MiB) | Combined stdout/stderr cap. Values outside 1–4194304 use the safe default. |
 
 All modes require both `intel_verified` and `report_data_match` to be the exact
 JSON boolean `true`. Missing fields, JSON strings (`"true"`), integers (`1`),
@@ -35,7 +37,18 @@ The subprocess itself is rejected (returns no claims) if:
 - it exits with a nonzero code
 - its stdout or stderr exceeds `CATHEDRAL_TDX_VERIFY_MAX_OUTPUT` bytes
 - its stdout is not valid JSON
+- its stdout contains duplicate object keys or non-finite JSON constants
 - its stdout is valid JSON but not an object
+
+Production accepts one statically linked x86-64 ELF executable, with no
+interpreter, dynamic loader, fixed arguments, plugins, or Python import path.
+The executable and every path ancestor must be root-owned and not writable by
+group or other users; symlinks are rejected.
+The validator rechecks the digest at startup and before every quote. The child
+runs with `/` as its working directory, a fixed minimal environment, closed
+inherited descriptors, no stdin, and a new process session. Timeout, output
+overflow, a descendant retaining a pipe, or normal parent completion kills and
+reaps any remaining process-group members.
 
 ## Interface
 
@@ -64,9 +77,9 @@ from cathedral.verify import verify
 attested = verify(evidence, nonce, policy)
 ```
 
-Python does not verify Intel quote crypto. Set `CATHEDRAL_TDX_VERIFY_CMD` to a
-DCAP or Intel Trust Authority verifier that validates the quote and prints JSON
-claims. The strict contract is:
+Cathedral does not hand-roll Intel quote crypto. Set `CATHEDRAL_TDX_VERIFY_CMD`
+to a DCAP verifier that validates the quote and prints JSON claims. The strict
+contract is:
 
 ```json
 {
@@ -131,7 +144,7 @@ certificate by itself does not prove confidential execution. Plain HTTP is
 limited to the explicit development loopback flag and cannot satisfy the
 production channel claim.
 
-A production policy file looks like:
+A development-only compatibility or strict policy file can look like:
 
 ```json
 {
@@ -146,13 +159,42 @@ Add a non-current status and its advisory only as a narrow, reviewed exception.
 For example, allowing `SWHardeningNeeded` does not admit an unlisted advisory.
 `Revoked` and unknown statuses cannot be configured.
 
+Production never accepts this unsigned file path. Production admission and
+probing require a current Ed25519-signed policy registry, an independently
+configured SHA-256 digest of its trusted-key file, a rollback-resistant state
+database, and either an exact release/digest
+checkpoint or a positive minimum release. The selected `cpu_tdx` profile is
+converted to strict policy; compatibility mode cannot start a production
+runtime.
+
 Use the adapter in `scripts/tdx_verify_json.py` with an `attestor-verify`
-DCAP binary:
+DCAP binary during development:
 
 ```bash
 export CATHEDRAL_TDX_ATTESTOR_VERIFY_BIN=/tmp/attestor-verify
 export CATHEDRAL_TDX_VERIFY_CMD='python scripts/tdx_verify_json.py'
 ```
+
+The Python adapter is development-only. For production, build one static
+x86-64 Linux verifier that implements the same stdin-free quote-path/JSON
+interface and performs both Intel-chain and Cathedral claim extraction. Install
+it under a root-owned non-writable path:
+
+```bash
+export CATHEDRAL_TDX_VERIFY_CMD=/opt/cathedral/bin/cathedral-tdx-verifier
+export CATHEDRAL_TDX_VERIFY_ARTIFACTS='["/opt/cathedral/bin/cathedral-tdx-verifier"]'
+
+export CATHEDRAL_TDX_VERIFY_DIGEST="$(
+  python scripts/tdx_verifier_digest.py \
+    --command "$CATHEDRAL_TDX_VERIFY_CMD" \
+    --artifact /opt/cathedral/bin/cathedral-tdx-verifier \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["digest"])'
+)"
+```
+
+Digest generation deliberately fails for scripts, interpreters, dynamically
+linked executables, malformed ELF files, or unsafe path permissions. Recompute
+and review the digest for every verifier upgrade.
 
 The adapter fails closed unless `attestor-verify` returns both
 `intel_verified=true` and `report_data_match=true`. It parses the debug bit,
@@ -244,6 +286,9 @@ uses the sole-input `confidential_primary_v1` policy merged in
 ## Definition Of Done
 
 - Hardware-free suite stays green.
+- Production runtime and prober reject unsigned policy, compatibility policy,
+  an unpinned verifier, changed artifact bytes, unsafe path ownership, and
+  verifier descendants that outlive their parent.
 - Strict policy rejects every missing or malformed typed claim and every
   unapproved status/advisory combination.
 - Repeated quotes across PCK rotation retain one package-stable identity while
