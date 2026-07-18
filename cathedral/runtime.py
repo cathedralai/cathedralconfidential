@@ -45,7 +45,7 @@ from cathedral.common import (
 from cathedral.enroll import RegistryStore
 from cathedral.lanes.sat import SatLane
 from cathedral.lanes.sat_types import SatCertificate, SatWorkItem
-from cathedral.ledger import Ledger
+from cathedral.ledger import CustomerJobLease, Ledger
 from cathedral.lifecycle import (
     NETWORK_ELIGIBLE_STATES,
     LifecycleError,
@@ -74,6 +74,8 @@ class MinerClient(Protocol):
 
     def confirm_channel_binding(self, evidence: Evidence) -> ChannelBinding: ...
 
+    def supports_customer_sat(self) -> bool: ...
+
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate: ...
 
 
@@ -97,6 +99,8 @@ class RuntimeConfig:
     reattestation_retry_jitter_seconds: int = 5
     expected_tier: Tier = Tier.CC_CPU_TDX
     admission_enabled: bool = True
+    customer_job_lease_seconds: int = 120
+    customer_job_max_attempts: int = 3
 
     def __post_init__(self) -> None:
         timeout = self.miner_timeout_seconds
@@ -129,6 +133,22 @@ class RuntimeConfig:
             raise ValueError("runtime expected tier must be CPU TDX or GPU composite")
         if not isinstance(self.admission_enabled, bool):
             raise ValueError("admission_enabled must be a boolean")
+        minimum_lease = math.ceil(float(timeout) * self.miner_attempts) + 5
+        if (
+            isinstance(self.customer_job_lease_seconds, bool)
+            or not isinstance(self.customer_job_lease_seconds, int)
+            or not minimum_lease <= self.customer_job_lease_seconds <= 86400
+        ):
+            raise ValueError(
+                "customer_job_lease_seconds must cover all configured miner attempts "
+                "plus five seconds and be at most 86400"
+            )
+        if (
+            isinstance(self.customer_job_max_attempts, bool)
+            or not isinstance(self.customer_job_max_attempts, int)
+            or not 1 <= self.customer_job_max_attempts <= 100
+        ):
+            raise ValueError("customer_job_max_attempts must be between 1 and 100")
         if (
             isinstance(self.reattestation_failures_before_failed, bool)
             or not isinstance(self.reattestation_failures_before_failed, int)
@@ -1012,7 +1032,7 @@ class ConfidentialRuntime:
             gpu_profile=self.gpu_profile,
             gpu_policy=self.policy,
         )
-        issued: list[tuple[_AttestationResult, SatWorkItem]] = []
+        eligible: list[_AttestationResult] = []
         for result in admitted:
             assert result.attested is not None
             if not lane.qualify(result.attested):
@@ -1035,81 +1055,150 @@ class ConfidentialRuntime:
                     assurance=result.attested.assurance,
                 )
                 continue
-            item = lane.dispatch(result.target.hotkey, budget=1)
-            if not isinstance(item, SatWorkItem):
-                raise RuntimeError("SAT lane returned a non-canonical work item")
-            self.ledger.issue_challenge(item.challenge_id, result.target.hotkey, epoch_id)
-            issued.append((result, item))
+            eligible.append(result)
 
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-            futures = [
-                executor.submit(self._request_sat, result.client, item) for result, item in issued
-            ]
-            for (result, item), future in zip(issued, futures, strict=True):
-                certificate, error = future.result()
-                accepted = lane.verify(item, certificate) if certificate is not None else None
-                if accepted is None:
-                    assurance = _work_assurance(result.attested, item, certificate, passed=False)
+        # Negotiate the deployment capability before touching the durable
+        # queue. Customer SAT is intentionally worker-default-off; an honest
+        # mixed-fleet worker that reports unsupported must receive canonical
+        # audit work without consuming a customer attempt.
+        customer_capable: set[str] = set()
+        if self.config.expected_tier is Tier.CC_CPU_TDX and eligible:
+            with ThreadPoolExecutor(max_workers=min(len(eligible), self.config.max_workers)) as executor:
+                capability_futures = {
+                    result.target.hotkey: executor.submit(
+                        result.client.supports_customer_sat  # type: ignore[union-attr]
+                    )
+                    for result in eligible
+                    if result.client is not None
+                }
+                for hotkey, future in capability_futures.items():
+                    try:
+                        if future.result() is True:
+                            customer_capable.add(hotkey)
+                    except Exception:
+                        # Capability failure is not a customer attempt. The
+                        # worker still receives safe canonical audit work.
+                        pass
+
+        # Claim only one executor-sized batch at a time. A job lease therefore
+        # starts immediately before its network request instead of aging while
+        # earlier waves occupy the worker pool.
+        for offset in range(0, len(eligible), self.config.max_workers):
+            batch = eligible[offset : offset + self.config.max_workers]
+            issued: list[tuple[_AttestationResult, SatWorkItem, CustomerJobLease | None]] = []
+            for result in batch:
+                lease = None
+                if (
+                    self.config.expected_tier is Tier.CC_CPU_TDX
+                    and result.target.hotkey in customer_capable
+                ):
+                    lease = self.ledger.claim_customer_job(
+                        result.target.hotkey,
+                        epoch_id,
+                        lease_seconds=self.config.customer_job_lease_seconds,
+                        max_attempts=self.config.customer_job_max_attempts,
+                    )
+                if lease is not None:
+                    lane.enqueue(lease.item)
+                item = lane.dispatch(result.target.hotkey, budget=1)
+                if not isinstance(item, SatWorkItem):
+                    raise RuntimeError("SAT lane returned an invalid work item")
+                if lease is None:
+                    self.ledger.issue_challenge(item.challenge_id, result.target.hotkey, epoch_id)
+                elif item != lease.item:
+                    raise RuntimeError("SAT lane did not dispatch the claimed customer job")
+                issued.append((result, item, lease))
+
+            with ThreadPoolExecutor(max_workers=len(issued)) as executor:
+                futures = [
+                    executor.submit(self._request_sat, result.client, item)
+                    for result, item, _lease in issued
+                ]
+                for (result, item, lease), future in zip(issued, futures, strict=True):
+                    certificate, error = future.result()
+                    accepted = lane.verify(item, certificate) if certificate is not None else None
+                    if accepted is None:
+                        failure = error or "invalid SAT certificate"
+                        assurance = _work_assurance(
+                            result.attested, item, certificate, passed=False
+                        )
+                        self._resolve_work(
+                            epoch_id,
+                            source_epoch,
+                            result,
+                            item,
+                            assurance,
+                            status="failed",
+                            work_units=0.0,
+                            customer_lease=lease,
+                            # A worker controls its response and cannot be
+                            # allowed to terminally fail customer work. Every
+                            # invalid/missing certificate receives a fresh,
+                            # bounded attempt; the ledger enforces the cap.
+                            customer_disposition="retry" if lease is not None else None,
+                            customer_error=failure if lease is not None else None,
+                        )
+                        outcomes[result.target.hotkey] = MinerOutcome(
+                            result.target.hotkey,
+                            result.endpoint,
+                            "sat_failed",
+                            admitted=True,
+                            challenge_id=item.challenge_id,
+                            error=failure,
+                            assurance=assurance,
+                        )
+                        continue
+                    assert isinstance(accepted, SatCertificate)
+                    assurance = _work_assurance(result.attested, item, certificate, passed=True)
+                    if not SCORE_ELIGIBILITY_POLICY.allows(assurance):
+                        failure = "score eligibility claims were not satisfied"
+                        self._resolve_work(
+                            epoch_id,
+                            source_epoch,
+                            result,
+                            item,
+                            assurance,
+                            status="failed",
+                            work_units=0.0,
+                            customer_lease=lease,
+                            customer_disposition="retry" if lease is not None else None,
+                            customer_error=failure if lease is not None else None,
+                        )
+                        outcomes[result.target.hotkey] = MinerOutcome(
+                            result.target.hotkey,
+                            result.endpoint,
+                            "assurance_failed",
+                            admitted=True,
+                            challenge_id=item.challenge_id,
+                            error=failure,
+                            assurance=assurance,
+                        )
+                        continue
+                    self._require_live_gpu_profile()
+                    units = lane.score(result.target.hotkey, [accepted])
                     self._resolve_work(
                         epoch_id,
                         source_epoch,
                         result,
                         item,
                         assurance,
-                        status="failed",
-                        work_units=0.0,
+                        status="verified",
+                        work_units=units,
+                        customer_lease=lease,
+                        customer_disposition="succeeded" if lease is not None else None,
+                        customer_result=(
+                            _sat_certificate_json(accepted) if lease is not None else None
+                        ),
                     )
                     outcomes[result.target.hotkey] = MinerOutcome(
                         result.target.hotkey,
                         result.endpoint,
-                        "sat_failed",
+                        "verified",
                         admitted=True,
                         challenge_id=item.challenge_id,
-                        error=error or "invalid SAT certificate",
+                        work_units=units,
                         assurance=assurance,
                     )
-                    continue
-                assurance = _work_assurance(result.attested, item, certificate, passed=True)
-                if not SCORE_ELIGIBILITY_POLICY.allows(assurance):
-                    self._resolve_work(
-                        epoch_id,
-                        source_epoch,
-                        result,
-                        item,
-                        assurance,
-                        status="failed",
-                        work_units=0.0,
-                    )
-                    outcomes[result.target.hotkey] = MinerOutcome(
-                        result.target.hotkey,
-                        result.endpoint,
-                        "assurance_failed",
-                        admitted=True,
-                        challenge_id=item.challenge_id,
-                        error="score eligibility claims were not satisfied",
-                        assurance=assurance,
-                    )
-                    continue
-                self._require_live_gpu_profile()
-                units = lane.score(result.target.hotkey, [accepted])
-                self._resolve_work(
-                    epoch_id,
-                    source_epoch,
-                    result,
-                    item,
-                    assurance,
-                    status="verified",
-                    work_units=units,
-                )
-                outcomes[result.target.hotkey] = MinerOutcome(
-                    result.target.hotkey,
-                    result.endpoint,
-                    "verified",
-                    admitted=True,
-                    challenge_id=item.challenge_id,
-                    work_units=units,
-                    assurance=assurance,
-                )
 
     def _resolve_work(
         self,
@@ -1121,6 +1210,10 @@ class ConfidentialRuntime:
         *,
         status: str,
         work_units: float,
+        customer_lease: CustomerJobLease | None = None,
+        customer_disposition: str | None = None,
+        customer_result: Mapping[str, object] | None = None,
+        customer_error: str | None = None,
     ) -> None:
         if self.receipt_issuer is None:
             self.ledger.resolve_challenge(
@@ -1128,6 +1221,11 @@ class ConfidentialRuntime:
                 status,
                 work_units,
                 validator_derived=status == "verified",
+                customer_lease=customer_lease,
+                customer_disposition=customer_disposition,
+                customer_result=customer_result,
+                customer_error=customer_error,
+                customer_max_attempts=self.config.customer_job_max_attempts,
             )
             return
         attested = result.attested
@@ -1156,6 +1254,11 @@ class ConfidentialRuntime:
             receipt_body=receipt.receipt_bytes,
             receipt_digest=receipt.receipt_digest,
             issued_at=issued_at,
+            customer_lease=customer_lease,
+            customer_disposition=customer_disposition,
+            customer_result=customer_result,
+            customer_error=customer_error,
+            customer_max_attempts=self.config.customer_job_max_attempts,
         )
 
     def _collect_attestation(
@@ -1419,6 +1522,22 @@ def _sat_manifest_digest(item: SatWorkItem) -> str:
         allow_nan=False,
     ).encode("ascii")
     return sha256_digest(encoded)
+
+
+def _sat_certificate_json(certificate: SatCertificate) -> Mapping[str, object]:
+    """Return the bounded validator-normalized customer result."""
+
+    return MappingProxyType(
+        {
+            "satisfiable": certificate.satisfiable,
+            "assignment": (
+                list(certificate.assignment) if certificate.assignment is not None else None
+            ),
+            "work_units": certificate.work_units,
+            "challenge_id": certificate.challenge_id,
+            "assigned_hotkey": certificate.assigned_hotkey,
+        }
+    )
 
 
 def _canonical_endpoint(endpoint: str, config: RuntimeConfig) -> str:

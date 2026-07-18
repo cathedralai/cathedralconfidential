@@ -1,8 +1,8 @@
 """Contract: the SAT lane's self-certifying verification (docs/DESIGN.md §4).
 
 A SAT assignment is checkable in microseconds and unforgeable — a wrong
-assignment simply fails a clause. UNSAT is verified by re-solving in the
-testable core (DRAT proof in production).
+assignment simply fails a clause. UNSAT is rejected without validator search
+until proof-carrying negative certificates ship.
 """
 
 from __future__ import annotations
@@ -13,12 +13,17 @@ import math
 import subprocess
 import sys
 
+import pytest
+
 from cathedral.common import Attested, Tier
 from cathedral.lanes.sat import (
+    CUSTOMER_SAT_WORK_UNITS,
+    MAX_N_VARS,
     SatLane,
     _compute_challenge_id,
     _derive_canonical_seed,
     solve_sat,
+    validate_sat_instance,
 )
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 
@@ -38,6 +43,28 @@ def test_solver_finds_valid_assignment_for_known_sat():
 def test_known_unsat_instance_yields_none():
     inst = SatInstance(n_vars=1, clauses=[[1], [-1]])
     assert solve_sat(inst) is None
+
+
+def test_customer_work_credit_is_fixed_independent_of_clause_count():
+    lane = SatLane()
+    inst = SatInstance(n_vars=1, clauses=[[1]] * 8192)
+    challenge_id = _compute_challenge_id(inst, 7)
+    item = SatWorkItem(inst, 7, challenge_id)
+    lane.enqueue(item)
+    dispatched = lane.dispatch("miner-x", 1)
+    cert = SatCertificate(True, [1], 1e300, challenge_id, "miner-x")
+
+    verified = lane.verify(dispatched, cert)
+
+    assert verified is not None
+    assert verified.work_units == CUSTOMER_SAT_WORK_UNITS
+    assert lane.score("miner-x", [verified]) == CUSTOMER_SAT_WORK_UNITS
+
+
+def test_customer_variable_bound_stays_below_recursive_solver_limit():
+    validate_sat_instance(SatInstance(MAX_N_VARS, [[MAX_N_VARS]]))
+    with pytest.raises(ValueError, match="n_vars"):
+        validate_sat_instance(SatInstance(MAX_N_VARS + 1, [[MAX_N_VARS + 1]]))
 
 
 def test_verify_accepts_true_certificate():
@@ -83,7 +110,7 @@ def test_verify_rejects_wrong_satisfiable_flag():
     assert lane.verify(item, wrong) is None
 
 
-def test_verify_accepts_true_unsat_certificate():
+def test_verify_rejects_true_unsat_certificate_without_solving(monkeypatch):
     lane = SatLane()
     inst = SatInstance(n_vars=1, clauses=[[1], [-1]])
     challenge_id = _compute_challenge_id(inst, 0)
@@ -97,7 +124,12 @@ def test_verify_accepts_true_unsat_certificate():
         challenge_id=challenge_id,
         assigned_hotkey="miner-x",
     )
-    assert lane.verify(item, cert) is not None
+
+    def unexpected_solve(_instance):
+        raise AssertionError("certificate verification must not invoke the SAT solver")
+
+    monkeypatch.setattr("cathedral.lanes.sat.solve_sat", unexpected_solve)
+    assert lane.verify(item, cert) is None
 
 
 def test_score_sums_verified_work_units():

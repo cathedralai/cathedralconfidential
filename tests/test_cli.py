@@ -21,6 +21,7 @@ from cathedral.cli import (
     _load_tokens,
     _outcome_json,
     build_parser,
+    cmd_work_prune,
     cmd_work_submit,
     cmd_work_status,
     cmd_worker_serve,
@@ -33,7 +34,7 @@ from cathedral.gpu import (
     GpuDeviceClaim,
     GpuIdentityRegistry,
 )
-from cathedral.ledger import Ledger
+from cathedral.ledger import Ledger, LedgerError
 from cathedral.runtime import MinerOutcome
 from cathedral.worker import WorkerServer
 
@@ -147,50 +148,148 @@ def test_roundtrip_serialization():
 
 
 # ---------------------------------------------------------------------------
-# CLI work submit writes challenge_id to queue file
+# CLI work submit writes the job to the runtime ledger
 # ---------------------------------------------------------------------------
 
-def test_work_submit_persists_challenge_id(tmp_path: Path):
-    qf = tmp_path / "queue.json"
+def test_work_submit_persists_job_in_runtime_ledger(tmp_path: Path, capsys):
+    db = tmp_path / "ledger.sqlite"
     args = argparse.Namespace(
-        queue_file=str(qf), clauses="[[1, -2, 3]]", n_vars=3, seed=7,
+        ledger_db=str(db),
+        clauses="[[1, -2, 3]]",
+        n_vars=3,
+        seed=7,
+        customer_id="customer-a",
+        idempotency_key="customer-request-7",
     )
 
     rc = cmd_work_submit(args)
     assert rc == 0
-
-    data = json.loads(qf.read_text())
-    assert len(data) == 1
-    assert "challenge_id" in data[0]
+    job_id = capsys.readouterr().out.split()[1]
+    with Ledger(db) as ledger:
+        job = ledger.customer_job(job_id)
+    assert job.status == "queued"
+    assert job.customer_id == "customer-a"
+    assert job.idempotency_key == "customer-request-7"
     expected_cid = _compute_challenge_id(SatInstance(n_vars=3, clauses=[[1, -2, 3]]), 7)
-    assert data[0]["challenge_id"] == expected_cid
+    assert job.item.challenge_id == expected_cid
 
 
 # ---------------------------------------------------------------------------
-# CLI work status reads queue file
+# CLI work status reads the runtime ledger
 # ---------------------------------------------------------------------------
 
 def test_work_status_empty(tmp_path: Path, capsys):
-    args = argparse.Namespace(queue_file=str(tmp_path / "queue.json"))
+    args = argparse.Namespace(ledger_db=str(tmp_path / "ledger.sqlite"), job_id=None)
     rc = cmd_work_status(args)
     assert rc == 0
-    out = capsys.readouterr().out
-    assert "0" in out
+    assert json.loads(capsys.readouterr().out) == {
+        "customer_jobs": {"failed": 0, "leased": 0, "queued": 0, "succeeded": 0}
+    }
+
+
+def test_work_status_redacts_persisted_failure_details(tmp_path: Path, capsys):
+    db = tmp_path / "ledger.sqlite"
+    instance = SatInstance(n_vars=1, clauses=[[1]])
+    item = SatWorkItem(instance, 1, _compute_challenge_id(instance, 1))
+    with Ledger(db) as ledger:
+        submitted = ledger.enqueue_customer_job(item)
+        lease = ledger.claim_customer_job(
+            "worker",
+            ledger.begin_epoch(1),
+            lease_seconds=60,
+            max_attempts=3,
+        )
+        assert lease is not None
+        ledger.resolve_challenge(
+            lease.challenge_id,
+            "failed",
+            customer_lease=lease,
+            customer_disposition="failed",
+            customer_error="upstream token=customer-secret failed",
+        )
+
+    assert cmd_work_status(argparse.Namespace(ledger_db=str(db), job_id=submitted.job_id)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["last_error"] == "upstream token=[REDACTED] failed"
 
 
 # ---------------------------------------------------------------------------
-# Legacy queue reload (file without challenge_id) works
+# CLI parser requires the shared runtime ledger
 # ---------------------------------------------------------------------------
 
-def test_legacy_queue_reload(tmp_path: Path):
-    qf = tmp_path / "queue.json"
-    # Write a legacy entry without challenge_id
-    legacy = [{"n_vars": 4, "clauses": [[1, -2], [3, 4]], "seed": 10}]
-    qf.write_text(json.dumps(legacy))
+def test_work_commands_require_runtime_ledger():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["work", "status"])
+    args = parser.parse_args(["work", "status", "--ledger-db", "runtime.sqlite"])
+    assert args.ledger_db == "runtime.sqlite"
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "work",
+                "submit",
+                "--ledger-db",
+                "runtime.sqlite",
+                "--clauses",
+                "[[1]]",
+                "--n-vars",
+                "1",
+            ]
+        )
+    submitted = parser.parse_args(
+        [
+            "work",
+            "submit",
+            "--ledger-db",
+            "runtime.sqlite",
+            "--customer-id",
+            "customer-a",
+            "--clauses",
+            "[[1]]",
+            "--n-vars",
+            "1",
+        ]
+    )
+    assert submitted.customer_id == "customer-a"
 
-    args = argparse.Namespace(queue_file=str(qf))
-    rc = cmd_work_status(args)
-    assert rc == 0
+
+def test_work_prune_requires_confirmation_and_removes_terminal_history(tmp_path: Path, capsys):
+    db = tmp_path / "ledger.sqlite"
+    instance = SatInstance(n_vars=1, clauses=[[1]])
+    with Ledger(db) as ledger:
+        submitted = ledger.enqueue_customer_job(
+            SatWorkItem(instance, 1, _compute_challenge_id(instance, 1)),
+            customer_id="customer-a",
+        )
+        lease = ledger.claim_customer_job(
+            "worker",
+            ledger.begin_epoch(1),
+            lease_seconds=60,
+            max_attempts=3,
+        )
+        assert lease is not None
+        ledger.resolve_challenge(
+            lease.challenge_id,
+            "failed",
+            customer_lease=lease,
+            customer_disposition="failed",
+            customer_error="terminal",
+        )
+    args = argparse.Namespace(
+        ledger_db=str(db),
+        resolved_before="2999-01-01T00:00:00Z",
+        customer_id="customer-a",
+        limit=10,
+        confirm=False,
+    )
+    with pytest.raises(ValueError, match="--confirm"):
+        cmd_work_prune(args)
+    args.confirm = True
+    assert cmd_work_prune(args) == 0
+    assert json.loads(capsys.readouterr().out) == {"pruned_customer_jobs": 1}
+    with Ledger(db) as ledger:
+        with pytest.raises(LedgerError, match="not found"):
+            ledger.customer_job(submitted.job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +688,7 @@ def test_worker_serve_defaults_to_loopback():
     assert args.host == "127.0.0.1"
     assert args.bearer_token_env == DEFAULT_WORKER_BEARER_ENV
     assert args.development_no_auth is False
+    assert args.allow_customer_sat is False
     assert args.channel_binding_type is None
     assert args.channel_binding_digest is None
 
@@ -621,6 +721,41 @@ def test_worker_production_requires_channel_binding(monkeypatch):
     monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
     args = build_parser().parse_args(["worker", "serve", "--hotkey", "miner"])
     with pytest.raises(ValueError, match="channel binding"):
+        cmd_worker_serve(args)
+
+
+def test_customer_sat_refuses_unauthenticated_worker() -> None:
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--development-no-auth",
+            "--allow-customer-sat",
+        ]
+    )
+    with pytest.raises(ValueError, match="bearer authentication and channel binding"):
+        cmd_worker_serve(args)
+
+
+def test_customer_sat_refuses_development_network_bind(monkeypatch) -> None:
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--allow-customer-sat",
+            "--development-allow-non-loopback",
+            "--channel-binding-type",
+            "application_key_sha256",
+            "--channel-binding-digest",
+            "ab" * 32,
+        ]
+    )
+    with pytest.raises(ValueError, match="non-loopback"):
         cmd_worker_serve(args)
 
 
@@ -687,6 +822,45 @@ def test_worker_cli_builds_typed_channel_binding(monkeypatch):
 
     assert cmd_worker_serve(args) == 0
     assert calls[0]["channel_binding"].digest == bytes.fromhex("ab" * 32)
+
+
+def test_worker_cli_explicitly_enables_authenticated_customer_sat(monkeypatch):
+    calls = []
+
+    class FakeServer:
+        host = "127.0.0.1"
+        port = 8081
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--allow-customer-sat",
+            "--channel-binding-type",
+            "application_key_sha256",
+            "--channel-binding-digest",
+            "ab" * 32,
+        ]
+    )
+
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["allow_noncanonical_sat"] is True
 
 
 def test_production_token_mapping_requires_owner_only_permissions(tmp_path: Path):

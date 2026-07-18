@@ -53,6 +53,10 @@ cathedral worker serve --help
 - Fresh-nonce, measurement, TCB, and platform policy enforced at admission.
 - Deterministic validator-dispatched audit work as the scored workload:
   60-second epochs, 20 validator-derived work units, score 1.0.
+- Durable bounded satisfiable SAT jobs with idempotent submission, atomic
+  claim/lease/result transitions, authenticated channel-bound worker dispatch,
+  negotiated worker capability, fixed validator-derived credit, queue/storage
+  quotas, and resource-isolated noncanonical solves.
 - A signed, complete compute vector with explicit zeros for missing, failed,
   stale, and revoked workers.
 - On testnet SN292, a dedicated Cathedral validator maps the proven worker
@@ -66,10 +70,15 @@ token emissions.
 
 ## Roadmap
 
+Current CPU workload foundation:
+
+- Bounded satisfiable SAT jobs route through the same verified CPU worker path as
+  canonical audit work. See [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md#customer-cpu-job-routing).
+
 Future product direction, not yet scored on chain:
 
-- Customer jobs, long-running agents, inference, and evaluation as scored
-  workloads.
+- General customer containers, long-running agents, inference, and evaluation
+  as scored workloads.
 - Confidential GPU workloads (NVIDIA H100/H200 in CC mode) now have a
   fail-closed, hardware-free composite-attestation foundation. Live hardware
   acceptance and scoring remain disabled; B200-class remains later work.

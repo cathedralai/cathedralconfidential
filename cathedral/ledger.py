@@ -9,11 +9,18 @@ import re
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol
 
+from cathedral.lanes.sat import (
+    CUSTOMER_SAT_WORK_UNITS,
+    _compute_challenge_id,
+    validate_sat_work_item,
+)
+from cathedral.lanes.sat_types import SatInstance, SatWorkItem
 from cathedral.lifecycle import (
     LifecycleReason,
     LifecycleSnapshot,
@@ -35,6 +42,13 @@ class LedgerError(Exception):
 # under `epochs` itself -- see that method's docstring for why).
 _EPOCHS_MIGRATION_TEMP_PREFIX = "epochs_migration_new_"
 _MAX_SQLITE_INTEGER = 2**63 - 1
+_MAX_CUSTOMER_JOB_RESULT_BYTES = 64 * 1024
+_MAX_CUSTOMER_JOB_ERROR_LENGTH = 1000
+_CUSTOMER_JOB_IDEMPOTENCY_RE = re.compile(r"[\x21-\x7e]{1,128}")
+_CUSTOMER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+MAX_ACTIVE_CUSTOMER_JOBS = 1024
+MAX_ACTIVE_CUSTOMER_JOBS_PER_CUSTOMER = 64
+MAX_CUSTOMER_JOB_STORAGE_BYTES = 256 * 1024 * 1024
 _GPU_POLICY_MODE_RE = re.compile(
     r"gpu-profile:[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
     r"@profile=sha256:[0-9a-f]{64}"
@@ -142,6 +156,45 @@ CREATE TABLE IF NOT EXISTS epoch_worker_lifecycle (
     snapshot_at TEXT NOT NULL,
     PRIMARY KEY (epoch_id, hotkey)
 );
+
+CREATE TABLE IF NOT EXISTS customer_jobs (
+    job_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    idempotency_key TEXT,
+    payload_body BLOB NOT NULL,
+    payload_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'leased', 'succeeded', 'failed')),
+    submitted_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    lease_token TEXT,
+    lease_owner TEXT,
+    lease_epoch_id INTEGER REFERENCES epochs(epoch_id),
+    lease_challenge_id TEXT REFERENCES challenges(challenge_id),
+    lease_expires_at TEXT,
+    result_body BLOB,
+    result_digest TEXT,
+    last_error TEXT,
+    resolved_at TEXT,
+    CHECK (
+        (status = 'leased' AND lease_token IS NOT NULL AND lease_owner IS NOT NULL
+         AND lease_epoch_id IS NOT NULL AND lease_challenge_id IS NOT NULL
+         AND lease_expires_at IS NOT NULL)
+        OR
+        (status != 'leased' AND lease_token IS NULL AND lease_owner IS NULL
+         AND lease_epoch_id IS NULL AND lease_challenge_id IS NULL
+         AND lease_expires_at IS NULL)
+    ),
+    CHECK (
+        (status = 'succeeded' AND result_body IS NOT NULL AND result_digest IS NOT NULL
+         AND resolved_at IS NOT NULL)
+        OR status != 'succeeded'
+    ),
+    UNIQUE (customer_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS customer_jobs_claim_order
+ON customer_jobs(status, available_at, submitted_at, job_id);
 """
 
 
@@ -172,6 +225,162 @@ def _canonical_json(value: Any) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _strict_json_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
+def _customer_item_body(item: SatWorkItem) -> bytes:
+    try:
+        validate_sat_work_item(item)
+    except ValueError as exc:
+        raise LedgerError(str(exc)) from exc
+    return _canonical_json(
+        {
+            "challenge_id": item.challenge_id,
+            "clauses": item.instance.clauses,
+            "n_vars": item.instance.n_vars,
+            "seed": item.seed,
+        }
+    )
+
+
+def _customer_item_from_body(body: bytes, digest: str) -> SatWorkItem:
+    if (
+        not isinstance(body, bytes)
+        or not isinstance(digest, str)
+        or "sha256:" + hashlib.sha256(body).hexdigest() != digest
+    ):
+        raise LedgerError("customer job payload integrity check failed")
+    try:
+        value = json.loads(body, object_pairs_hook=_strict_json_object_pairs)
+        if not isinstance(value, dict) or set(value) != {
+            "challenge_id",
+            "clauses",
+            "n_vars",
+            "seed",
+        }:
+            raise ValueError
+        item = SatWorkItem(
+            instance=SatInstance(n_vars=value["n_vars"], clauses=value["clauses"]),
+            seed=value["seed"],
+            challenge_id=value["challenge_id"],
+        )
+        validate_sat_work_item(item)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise LedgerError("customer job payload is invalid") from exc
+    return item
+
+
+def _customer_result_body(result: Mapping[str, object] | None) -> bytes | None:
+    if result is None:
+        return None
+    if not isinstance(result, Mapping):
+        raise LedgerError("customer job result must be a mapping")
+    try:
+        body = _canonical_json(dict(result))
+    except (TypeError, ValueError) as exc:
+        raise LedgerError("customer job result is invalid") from exc
+    if not body or len(body) > _MAX_CUSTOMER_JOB_RESULT_BYTES:
+        raise LedgerError("customer job result exceeds size limit")
+    return body
+
+
+def _customer_dispatch_item(
+    original: SatWorkItem,
+    job_id: str,
+    attempt: int,
+) -> SatWorkItem:
+    seed_material = _canonical_json(
+        {
+            "domain": "cathedral-customer-sat-dispatch-v1",
+            "job_id": job_id,
+            "attempt": attempt,
+            "submitted_seed": original.seed,
+        }
+    )
+    dispatch_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+    dispatch_seed &= _MAX_SQLITE_INTEGER
+    challenge_id = _compute_challenge_id(original.instance, dispatch_seed)
+    return SatWorkItem(original.instance, dispatch_seed, challenge_id)
+
+
+def _validate_customer_result(
+    lease: CustomerJobLease,
+    result: Mapping[str, object],
+) -> None:
+    if set(result) != {
+        "satisfiable",
+        "assignment",
+        "work_units",
+        "challenge_id",
+        "assigned_hotkey",
+    }:
+        raise LedgerError("customer job result schema is invalid")
+    satisfiable = result["satisfiable"]
+    assignment = result["assignment"]
+    work_units = result["work_units"]
+    if (
+        not isinstance(satisfiable, bool)
+        or result["challenge_id"] != lease.challenge_id
+        or result["assigned_hotkey"] != lease.owner_hotkey
+        or isinstance(work_units, bool)
+        or not isinstance(work_units, (int, float))
+        or not math.isfinite(float(work_units))
+        or float(work_units) != CUSTOMER_SAT_WORK_UNITS
+    ):
+        raise LedgerError("customer job result does not match its dispatch")
+    if not satisfiable:
+        raise LedgerError("customer job success requires a satisfiable assignment witness")
+    if not isinstance(assignment, list) or len(assignment) != lease.item.instance.n_vars:
+        raise LedgerError("customer job SAT result assignment is invalid")
+    if any(isinstance(literal, bool) or not isinstance(literal, int) for literal in assignment):
+        raise LedgerError("customer job SAT result assignment is invalid")
+    if {abs(literal) for literal in assignment} != set(
+        range(1, lease.item.instance.n_vars + 1)
+    ):
+        raise LedgerError("customer job SAT result assignment is invalid")
+    true_literals = set(assignment)
+    if any(
+        not any(literal in true_literals for literal in clause)
+        for clause in lease.item.instance.clauses
+    ):
+        raise LedgerError("customer job SAT result does not satisfy its instance")
+
+
+@dataclass(frozen=True)
+class CustomerJobLease:
+    """Opaque authority to complete one specific customer-job attempt."""
+
+    job_id: str
+    lease_token: str
+    owner_hotkey: str
+    epoch_id: int
+    challenge_id: str
+    attempt: int
+    item: SatWorkItem
+
+
+@dataclass(frozen=True)
+class CustomerJobSnapshot:
+    """Customer-safe durable job state."""
+
+    job_id: str
+    customer_id: str
+    status: str
+    attempt_count: int
+    item: SatWorkItem
+    idempotency_key: str | None = None
+    lease_owner: str | None = None
+    lease_epoch_id: int | None = None
+    result: Mapping[str, object] | None = None
+    last_error: str | None = None
 
 
 def _receipt_lifecycle_values(receipt: Mapping[str, object]) -> tuple[object, ...]:
@@ -528,6 +737,7 @@ class Ledger:
             "epoch_scores",
             "assurance_receipts",
             "epoch_worker_lifecycle",
+            "customer_jobs",
         ):
             row = cx.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -550,6 +760,263 @@ class Ledger:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    def enqueue_customer_job(
+        self,
+        item: SatWorkItem,
+        *,
+        customer_id: str = "operator",
+        idempotency_key: str | None = None,
+    ) -> CustomerJobSnapshot:
+        """Persist one bounded customer job, with optional replay-safe submission."""
+
+        if not isinstance(customer_id, str) or _CUSTOMER_ID_RE.fullmatch(customer_id) is None:
+            raise LedgerError("customer_id must be a bounded public identifier")
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str)
+            or _CUSTOMER_JOB_IDEMPOTENCY_RE.fullmatch(idempotency_key) is None
+        ):
+            raise LedgerError("idempotency_key must be 1-128 printable non-space ASCII bytes")
+        body = _customer_item_body(item)
+        digest = "sha256:" + hashlib.sha256(body).hexdigest()
+        with self._transaction() as cx:
+            if idempotency_key is not None:
+                existing = cx.execute(
+                    "SELECT * FROM customer_jobs WHERE customer_id = ? AND idempotency_key = ?",
+                    (customer_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    if existing["payload_digest"] != digest:
+                        raise LedgerError("idempotency_key was already used for different work")
+                    return self._customer_job_snapshot(existing)
+            capacity = cx.execute(
+                "SELECT COUNT(*) AS total,"
+                "SUM(CASE WHEN status IN ('queued','leased') THEN 1 ELSE 0 END) AS active,"
+                "COALESCE(SUM(LENGTH(payload_body) + "
+                "CASE WHEN status IN ('queued','leased') THEN ? "
+                "ELSE COALESCE(LENGTH(result_body),0) END + "
+                "COALESCE(LENGTH(last_error),0)),0) AS storage_bytes "
+                "FROM customer_jobs",
+                (_MAX_CUSTOMER_JOB_RESULT_BYTES,),
+            ).fetchone()
+            assert capacity is not None
+            customer_active = cx.execute(
+                "SELECT COUNT(*) FROM customer_jobs WHERE customer_id = ? "
+                "AND status IN ('queued','leased')",
+                (customer_id,),
+            ).fetchone()[0]
+            if int(capacity["active"] or 0) >= MAX_ACTIVE_CUSTOMER_JOBS:
+                raise LedgerError("customer job queue capacity reached")
+            if int(customer_active) >= MAX_ACTIVE_CUSTOMER_JOBS_PER_CUSTOMER:
+                raise LedgerError("customer active-job quota reached")
+            reserved_bytes = len(body) + _MAX_CUSTOMER_JOB_RESULT_BYTES
+            if int(capacity["storage_bytes"] or 0) + reserved_bytes > MAX_CUSTOMER_JOB_STORAGE_BYTES:
+                raise LedgerError("customer job ledger storage capacity reached; prune terminal jobs")
+            job_id = f"job-{uuid.uuid4().hex}"
+            now = _now()
+            cx.execute(
+                "INSERT INTO customer_jobs("
+                "job_id,customer_id,idempotency_key,payload_body,payload_digest,status,"
+                "submitted_at,available_at) VALUES (?,?,?,?,?, 'queued',?,?)",
+                (job_id, customer_id, idempotency_key, body, digest, now, now),
+            )
+            row = cx.execute(
+                "SELECT * FROM customer_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            assert row is not None
+            return self._customer_job_snapshot(row)
+
+    def customer_job(self, job_id: str) -> CustomerJobSnapshot:
+        if not isinstance(job_id, str) or re.fullmatch(r"job-[0-9a-f]{32}", job_id) is None:
+            raise LedgerError("customer job_id is invalid")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM customer_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise LedgerError(f"customer job {job_id!r} not found")
+            return self._customer_job_snapshot(row)
+
+    def customer_job_counts(self) -> Mapping[str, int]:
+        counts = {status: 0 for status in ("queued", "leased", "succeeded", "failed")}
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT status,COUNT(*) AS count FROM customer_jobs GROUP BY status"
+            ).fetchall()
+        for row in rows:
+            counts[row["status"]] = int(row["count"])
+        return MappingProxyType(counts)
+
+    @staticmethod
+    def _customer_job_snapshot(row: sqlite3.Row) -> CustomerJobSnapshot:
+        result = None
+        if row["result_body"] is not None:
+            body = row["result_body"]
+            digest = row["result_digest"]
+            if (
+                not isinstance(body, bytes)
+                or not isinstance(digest, str)
+                or "sha256:" + hashlib.sha256(body).hexdigest() != digest
+            ):
+                raise LedgerError("customer job result integrity check failed")
+            try:
+                parsed = json.loads(body, object_pairs_hook=_strict_json_object_pairs)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise LedgerError("customer job result is invalid") from exc
+            if not isinstance(parsed, dict):
+                raise LedgerError("customer job result is invalid")
+            result = MappingProxyType(parsed)
+        return CustomerJobSnapshot(
+            job_id=row["job_id"],
+            customer_id=row["customer_id"],
+            status=row["status"],
+            attempt_count=row["attempt_count"],
+            item=_customer_item_from_body(row["payload_body"], row["payload_digest"]),
+            idempotency_key=row["idempotency_key"],
+            lease_owner=row["lease_owner"],
+            lease_epoch_id=row["lease_epoch_id"],
+            result=result,
+            last_error=row["last_error"],
+        )
+
+    def prune_customer_jobs(
+        self,
+        resolved_before: datetime,
+        *,
+        limit: int = 1000,
+        customer_id: str | None = None,
+    ) -> int:
+        """Delete bounded terminal history so freed SQLite pages can be reused."""
+
+        if (
+            not isinstance(resolved_before, datetime)
+            or resolved_before.tzinfo is None
+            or resolved_before.utcoffset() != timezone.utc.utcoffset(None)
+        ):
+            raise LedgerError("resolved_before must be a UTC timestamp")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise LedgerError("prune limit must be between 1 and 10000")
+        if customer_id is not None and (
+            not isinstance(customer_id, str) or _CUSTOMER_ID_RE.fullmatch(customer_id) is None
+        ):
+            raise LedgerError("customer_id must be a bounded public identifier")
+        before = resolved_before.isoformat()
+        with self._transaction() as cx:
+            parameters: list[object] = [before]
+            customer_clause = ""
+            if customer_id is not None:
+                customer_clause = " AND customer_id = ?"
+                parameters.append(customer_id)
+            parameters.append(limit)
+            cursor = cx.execute(
+                "DELETE FROM customer_jobs WHERE job_id IN ("
+                "SELECT job_id FROM customer_jobs "
+                "WHERE status IN ('succeeded','failed') AND resolved_at < ?"
+                + customer_clause
+                + " ORDER BY resolved_at,job_id LIMIT ?)",
+                parameters,
+            )
+            return cursor.rowcount
+
+    def claim_customer_job(
+        self,
+        owner_hotkey: str,
+        epoch_id: int,
+        *,
+        lease_seconds: int,
+        max_attempts: int,
+    ) -> CustomerJobLease | None:
+        """Atomically reclaim stale work and lease the oldest queued job."""
+
+        if not isinstance(owner_hotkey, str) or not owner_hotkey or len(owner_hotkey) > 256:
+            raise LedgerError("customer job owner hotkey is invalid")
+        for name, value, maximum in (
+            ("lease_seconds", lease_seconds, 86400),
+            ("max_attempts", max_attempts, 100),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                raise LedgerError(f"{name} must be between 1 and {maximum}")
+        with self._transaction() as cx:
+            self._require_running(cx, epoch_id, "claim customer jobs")
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat()
+            expired = cx.execute(
+                "SELECT job_id,lease_challenge_id,attempt_count FROM customer_jobs "
+                "WHERE status = 'leased' AND lease_expires_at <= ?",
+                (now,),
+            ).fetchall()
+            for stale in expired:
+                cx.execute(
+                    "UPDATE challenges SET status = 'abandoned',work_units = 0,resolved_at = ? "
+                    "WHERE challenge_id = ? AND status = 'issued'",
+                    (now, stale["lease_challenge_id"]),
+                )
+                terminal = stale["attempt_count"] >= max_attempts
+                cx.execute(
+                    "UPDATE customer_jobs SET status = ?,available_at = ?,lease_token = NULL,"
+                    "lease_owner = NULL,lease_epoch_id = NULL,lease_challenge_id = NULL,"
+                    "lease_expires_at = NULL,last_error = ?,resolved_at = ? WHERE job_id = ?",
+                    (
+                        "failed" if terminal else "queued",
+                        now,
+                        "customer job lease expired",
+                        now if terminal else None,
+                        stale["job_id"],
+                    ),
+                )
+            cx.execute(
+                "UPDATE customer_jobs SET status = 'failed',last_error = ?,resolved_at = ? "
+                "WHERE status = 'queued' AND attempt_count >= ?",
+                ("customer job retry limit reached", now, max_attempts),
+            )
+            row = cx.execute(
+                "SELECT * FROM customer_jobs WHERE status = 'queued' AND available_at <= ? "
+                "AND attempt_count < ? "
+                "ORDER BY available_at,submitted_at,job_id LIMIT 1",
+                (now, max_attempts),
+            ).fetchone()
+            if row is None:
+                return None
+            original = _customer_item_from_body(row["payload_body"], row["payload_digest"])
+            attempt = int(row["attempt_count"]) + 1
+            item = _customer_dispatch_item(original, row["job_id"], attempt)
+            challenge_id = item.challenge_id
+            lease_token = uuid.uuid4().hex
+            expires_at = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+            try:
+                cx.execute(
+                    "INSERT INTO challenges(challenge_id,epoch_id,hotkey,status,issued_at) "
+                    "VALUES (?,?,?,'issued',?)",
+                    (challenge_id, epoch_id, owner_hotkey, now),
+                )
+                cursor = cx.execute(
+                    "UPDATE customer_jobs SET status = 'leased',attempt_count = ?,"
+                    "lease_token = ?,lease_owner = ?,lease_epoch_id = ?,"
+                    "lease_challenge_id = ?,lease_expires_at = ?,last_error = NULL,"
+                    "resolved_at = NULL WHERE job_id = ? AND status = 'queued'",
+                    (
+                        attempt,
+                        lease_token,
+                        owner_hotkey,
+                        epoch_id,
+                        challenge_id,
+                        expires_at,
+                        row["job_id"],
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise LedgerError("failed to issue a unique customer job challenge") from exc
+            if cursor.rowcount != 1:
+                raise LedgerError("customer job claim lost its atomic queue state")
+            return CustomerJobLease(
+                row["job_id"],
+                lease_token,
+                owner_hotkey,
+                epoch_id,
+                challenge_id,
+                attempt,
+                item,
+            )
 
     def begin_epoch(
         self,
@@ -617,6 +1084,25 @@ class Ledger:
                 return
             if row["status"] != "running":
                 raise LedgerError(f"epoch {epoch_id} is {row['status']}; cannot abort")
+            now = _now()
+            leased = cx.execute(
+                "SELECT job_id,lease_challenge_id FROM customer_jobs "
+                "WHERE status = 'leased' AND lease_epoch_id = ?",
+                (epoch_id,),
+            ).fetchall()
+            for job in leased:
+                cx.execute(
+                    "UPDATE challenges SET status = 'abandoned',work_units = 0,resolved_at = ? "
+                    "WHERE challenge_id = ? AND status = 'issued'",
+                    (now, job["lease_challenge_id"]),
+                )
+                cx.execute(
+                    "UPDATE customer_jobs SET status = 'queued',available_at = ?,"
+                    "lease_token = NULL,lease_owner = NULL,lease_epoch_id = NULL,"
+                    "lease_challenge_id = NULL,lease_expires_at = NULL,"
+                    "last_error = ? WHERE job_id = ?",
+                    (now, "customer job epoch aborted", job["job_id"]),
+                )
             cx.execute("UPDATE epochs SET status = 'aborted' WHERE epoch_id = ?", (epoch_id,))
 
     def abandon_completed_epoch(self, epoch_id: int, reason: str) -> None:
@@ -673,12 +1159,39 @@ class Ledger:
         work_units: float = 0.0,
         *,
         validator_derived: bool = False,
+        customer_lease: CustomerJobLease | None = None,
+        customer_disposition: str | None = None,
+        customer_result: Mapping[str, object] | None = None,
+        customer_error: str | None = None,
+        customer_max_attempts: int = 3,
     ) -> None:
         units = self._validated_resolution_units(
             status, work_units, validator_derived=validator_derived
         )
+        result_body, checked_error = self._validate_customer_resolution(
+            status=status,
+            lease=customer_lease,
+            disposition=customer_disposition,
+            result=customer_result,
+            error=customer_error,
+            max_attempts=customer_max_attempts,
+        )
+        if customer_lease is not None and customer_lease.challenge_id != challenge_id:
+            raise LedgerError("customer lease does not match the resolved challenge")
         with self._transaction() as cx:
+            if customer_lease is not None:
+                self._require_current_customer_lease(cx, customer_lease)
             self._resolve_challenge_in_transaction(cx, challenge_id, status, units)
+            if customer_lease is not None:
+                assert customer_disposition is not None
+                self._resolve_customer_job_in_transaction(
+                    cx,
+                    customer_lease,
+                    customer_disposition,
+                    result_body,
+                    checked_error,
+                    customer_max_attempts,
+                )
 
     @staticmethod
     def _validated_resolution_units(
@@ -735,6 +1248,11 @@ class Ledger:
         receipt_body: bytes,
         receipt_digest: str,
         issued_at: str,
+        customer_lease: CustomerJobLease | None = None,
+        customer_disposition: str | None = None,
+        customer_result: Mapping[str, object] | None = None,
+        customer_error: str | None = None,
+        customer_max_attempts: int = 3,
     ) -> None:
         """Atomically resolve work and freeze its exact signed receipt bytes."""
 
@@ -781,7 +1299,19 @@ class Ledger:
             raise LedgerError("receipt work units are invalid") from exc
         if not math.isfinite(parsed_units) or parsed_units != units:
             raise LedgerError("receipt work units do not match their resolution")
+        result_body, checked_error = self._validate_customer_resolution(
+            status=status,
+            lease=customer_lease,
+            disposition=customer_disposition,
+            result=customer_result,
+            error=customer_error,
+            max_attempts=customer_max_attempts,
+        )
+        if customer_lease is not None and customer_lease.challenge_id != challenge_id:
+            raise LedgerError("customer lease does not match the resolved challenge")
         with self._transaction() as cx:
+            if customer_lease is not None:
+                self._require_current_customer_lease(cx, customer_lease)
             row = self._resolve_challenge_in_transaction(cx, challenge_id, status, units)
             if (
                 receipt.get("epoch_id") != row["epoch_id"]
@@ -824,6 +1354,133 @@ class Ledger:
                 )
             except sqlite3.DatabaseError as exc:
                 raise LedgerError("failed to persist receipt atomically") from exc
+            if customer_lease is not None:
+                assert customer_disposition is not None
+                self._resolve_customer_job_in_transaction(
+                    cx,
+                    customer_lease,
+                    customer_disposition,
+                    result_body,
+                    checked_error,
+                    customer_max_attempts,
+                )
+
+    @staticmethod
+    def _validate_customer_resolution(
+        *,
+        status: str,
+        lease: CustomerJobLease | None,
+        disposition: str | None,
+        result: Mapping[str, object] | None,
+        error: str | None,
+        max_attempts: int,
+    ) -> tuple[bytes | None, str | None]:
+        supplied = (disposition is not None, result is not None, error is not None)
+        if lease is None:
+            if any(supplied):
+                raise LedgerError("customer resolution fields require a customer lease")
+            return None, None
+        if not isinstance(lease, CustomerJobLease):
+            raise LedgerError("customer lease is invalid")
+        if disposition not in {"succeeded", "failed", "retry"}:
+            raise LedgerError("customer job disposition is invalid")
+        if (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or not 1 <= max_attempts <= 100
+        ):
+            raise LedgerError("customer_max_attempts must be between 1 and 100")
+        if disposition == "succeeded":
+            if status != "verified" or result is None or error is not None:
+                raise LedgerError("successful customer jobs require a verified bounded result")
+            _validate_customer_result(lease, result)
+        elif status not in {"failed", "abandoned"} or result is not None:
+            raise LedgerError("failed or retried customer jobs require a failed resolution")
+        if error is not None and (
+            not isinstance(error, str)
+            or not error.strip()
+            or len(error) > _MAX_CUSTOMER_JOB_ERROR_LENGTH
+        ):
+            raise LedgerError("customer job error must be a bounded nonempty string")
+        if disposition in {"failed", "retry"} and error is None:
+            raise LedgerError("failed or retried customer jobs require an error")
+        return _customer_result_body(result), error.strip() if error is not None else None
+
+    @staticmethod
+    def _require_current_customer_lease(
+        cx: sqlite3.Connection,
+        lease: CustomerJobLease,
+    ) -> None:
+        row = cx.execute(
+            "SELECT * FROM customer_jobs WHERE job_id = ?", (lease.job_id,)
+        ).fetchone()
+        if row is None:
+            raise LedgerError(f"customer job {lease.job_id!r} not found")
+        expected = (
+            "leased",
+            lease.lease_token,
+            lease.owner_hotkey,
+            lease.epoch_id,
+            lease.challenge_id,
+            lease.attempt,
+        )
+        actual = (
+            row["status"],
+            row["lease_token"],
+            row["lease_owner"],
+            row["lease_epoch_id"],
+            row["lease_challenge_id"],
+            row["attempt_count"],
+        )
+        if actual != expected:
+            raise LedgerError("customer job lease is stale or does not match its dispatch")
+        original = _customer_item_from_body(row["payload_body"], row["payload_digest"])
+        expected_item = _customer_dispatch_item(original, lease.job_id, lease.attempt)
+        if lease.item != expected_item:
+            raise LedgerError("customer job lease item does not match its durable payload")
+        if row["lease_expires_at"] <= _now():
+            raise LedgerError("customer job lease has expired")
+
+    @staticmethod
+    def _resolve_customer_job_in_transaction(
+        cx: sqlite3.Connection,
+        lease: CustomerJobLease,
+        disposition: str,
+        result_body: bytes | None,
+        error: str | None,
+        max_attempts: int,
+    ) -> None:
+        now = _now()
+        if disposition == "succeeded":
+            final_status = "succeeded"
+        elif disposition == "retry" and lease.attempt < max_attempts:
+            final_status = "queued"
+        else:
+            final_status = "failed"
+        result_digest = (
+            "sha256:" + hashlib.sha256(result_body).hexdigest()
+            if result_body is not None
+            else None
+        )
+        cursor = cx.execute(
+            "UPDATE customer_jobs SET status = ?,available_at = ?,"
+            "lease_token = NULL,lease_owner = NULL,lease_epoch_id = NULL,"
+            "lease_challenge_id = NULL,lease_expires_at = NULL,result_body = ?,"
+            "result_digest = ?,last_error = ?,resolved_at = ? "
+            "WHERE job_id = ? AND status = 'leased' AND lease_token = ?",
+            (
+                final_status,
+                now,
+                result_body,
+                result_digest,
+                error,
+                None if final_status == "queued" else now,
+                lease.job_id,
+                lease.lease_token,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise LedgerError("customer job lease changed during atomic resolution")
 
     def add_attestation(
         self,

@@ -84,8 +84,8 @@ class MockMiner:
     def do_sat_work(self, item: SatWorkItem) -> SatCertificate:
         """Solve a dispatched SAT instance and return a self-certifying result.
 
-        SAT: a satisfying assignment is the certificate (checkable in µs); UNSAT
-        is claimed with no assignment (DRAT proof in production).
+        SAT: a satisfying assignment is the certificate (checkable in µs).
+        Negative claims remain unverified until proof-carrying UNSAT ships.
         """
 
         return _solve_sat_work(item, self.uid)

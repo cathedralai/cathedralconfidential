@@ -74,7 +74,7 @@ print('admitted', r.admitted); print('weights', r.weights); print('burn', r.burn
 
 ## Console entry points (installed by step 1)
 
-- `cathedral` — operator CLI (`census`, `verify-quote`, `work submit/status`)
+- `cathedral` — operator CLI (`census`, `verify-quote`, durable `work submit/status`)
 - `cathedral-census` — the CC capability probe
 - `cathedral-validator` — compatibility wrapper for `cathedral runtime ...`
 - `cathedral-miner` — compatibility wrapper for `cathedral worker ...`

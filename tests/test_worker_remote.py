@@ -33,7 +33,13 @@ from cathedral.common import (
     EvidenceKind,
     MAX_CPU_EVIDENCE_RESPONSE_BODY,
 )
-from cathedral.lanes.sat import SatLane, _canonical_instance, _compute_challenge_id, solve_sat
+from cathedral.lanes.sat import (
+    MAX_N_VARS,
+    SatLane,
+    _canonical_instance,
+    _compute_challenge_id,
+    solve_sat,
+)
 from cathedral.lanes.sat_types import SatCertificate, SatInstance, SatWorkItem
 from cathedral.remote import (
     MAX_RESPONSE_BODY,
@@ -41,7 +47,10 @@ from cathedral.remote import (
     RemoteError,
     RemoteMiner as _RemoteMiner,
 )
-from cathedral.worker import WorkerServer as _WorkerServer
+from cathedral.worker import (
+    WorkerServer as _WorkerServer,
+    _solve_customer_sat_bounded,
+)
 
 # ---------------------------------------------------------------------------
 # Test fixtures / helpers
@@ -49,16 +58,21 @@ from cathedral.worker import WorkerServer as _WorkerServer
 
 HOTKEY = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 OTHER_HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+TEST_BEARER = "test-worker-token"
+TEST_BINDING = ChannelBinding(ChannelBindingType.APPLICATION_KEY_SHA256, b"t" * 32)
 
 
 def WorkerServer(*args, **kwargs):
     kwargs.setdefault("configured_hotkey", HOTKEY)
     kwargs.setdefault("allow_noncanonical_sat", True)
+    kwargs.setdefault("bearer_token", TEST_BEARER)
+    kwargs.setdefault("channel_binding", TEST_BINDING)
     return _WorkerServer(*args, **kwargs)
 
 
 def RemoteMiner(endpoint, hotkey, **kwargs):
     kwargs.setdefault("allow_insecure_http", True)
+    kwargs.setdefault("bearer_token", TEST_BEARER)
     return _RemoteMiner(endpoint, hotkey, **kwargs)
 
 
@@ -90,7 +104,7 @@ def _start_server(server: _WorkerServer) -> threading.Thread:
     return t
 
 
-def _post_raw(url: str, body: bytes, *, bearer: str | None = None) -> tuple[int, bytes]:
+def _post_raw(url: str, body: bytes, *, bearer: str | None = TEST_BEARER) -> tuple[int, bytes]:
     """Return (status_code, body_bytes) without raising on 4xx/5xx."""
     req = urllib.request.Request(
         url,
@@ -170,6 +184,15 @@ def test_canonical_sat_happy_path_with_production_default():
     assert cert.satisfiable is True
 
 
+def test_worker_api_cannot_enable_customer_sat_without_auth_and_binding():
+    with pytest.raises(ValueError, match="bearer authentication"):
+        _WorkerServer(
+            configured_hotkey=HOTKEY,
+            evidence_collector=_fake_evidence,
+            allow_noncanonical_sat=True,
+        )
+
+
 def test_default_worker_rejects_valid_hash_noncanonical_instance(monkeypatch):
     item = _make_sat_item()
 
@@ -194,6 +217,54 @@ def test_default_worker_rejects_valid_hash_noncanonical_instance(monkeypatch):
         code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
     assert code == 400
     assert b"noncanonical" in body
+
+
+def test_customer_sat_resource_exhaustion_returns_retryable_failure(monkeypatch):
+    item = _make_sat_item()
+    monkeypatch.setattr(
+        "cathedral.worker._solve_customer_sat_bounded",
+        lambda _instance, _timeout: (False, None),
+    )
+    with WorkerServer(evidence_collector=_fake_evidence) as srv:
+        _start_server(srv)
+        payload = json.dumps(
+            {
+                "challenge_id": item.challenge_id,
+                "assigned_hotkey": HOTKEY,
+                "instance": {
+                    "n_vars": item.instance.n_vars,
+                    "clauses": item.instance.clauses,
+                },
+                "seed": item.seed,
+            }
+        ).encode()
+        code, body = _post_raw(f"{srv.base_url}/v1/sat-work", payload)
+    assert code == 503
+    assert b"resource limits" in body
+
+
+def test_customer_sat_solver_process_handles_maximum_branch_depth():
+    instance = SatInstance(
+        n_vars=MAX_N_VARS,
+        clauses=[[variable, variable] for variable in range(1, MAX_N_VARS + 1)],
+    )
+    completed, assignment = _solve_customer_sat_bounded(instance, 5.0)
+    assert completed is True
+    assert assignment is not None
+    assert len(assignment) == MAX_N_VARS
+
+
+def test_worker_capability_negotiation_tracks_customer_sat_mode():
+    with _WorkerServer(
+        configured_hotkey=HOTKEY,
+        evidence_collector=_fake_evidence,
+    ) as default_server:
+        _start_server(default_server)
+        assert RemoteMiner(default_server.base_url, HOTKEY).supports_customer_sat() is False
+
+    with WorkerServer(evidence_collector=_fake_evidence) as customer_server:
+        _start_server(customer_server)
+        assert RemoteMiner(customer_server.base_url, HOTKEY).supports_customer_sat() is True
 
 
 def test_evidence_with_bearer_good_round_trip():

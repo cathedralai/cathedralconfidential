@@ -2,12 +2,9 @@
 
 Thin argparse front-end over the in-process control plane (cathedral.api),
 the SAT lane (cathedral.lanes.sat), and the shared Policy check
-(cathedral.common). No hardware, no network: ``census`` shells into the
-existing CC probe, ``verify-quote`` is a client-side policy check against a
-caller-supplied (mocked) measurement/tcb pair, and ``work submit`` / ``work
-status`` drive a WorkQueue backed by the SAT lane's canonical backfill.
-Pending customer jobs persist across invocations in a small JSON queue file
-so ``submit`` and ``status`` compose naturally from the shell.
+(cathedral.common). ``work submit`` and ``work status`` use the runtime's
+durable SQLite ledger so customer work can be atomically leased to admitted
+CPU workers instead of living in a disconnected local file.
 
 Every subcommand is a plain, importable function taking parsed args and
 returning an int exit code -- callers (tests, scripts) never need to shell
@@ -15,8 +12,8 @@ out.
 
     python -m cathedral.cli census
     python -m cathedral.cli verify-quote --measurement M --allowed-measurement M --tcb 3 --min-tcb 1
-    python -m cathedral.cli work submit --n-vars 3 --clauses '[[1, 2, -3]]'
-    python -m cathedral.cli work status
+    python -m cathedral.cli work submit --ledger-db runtime.sqlite --customer-id demo --n-vars 3 --clauses '[[1, 2, -3]]'
+    python -m cathedral.cli work status --ledger-db runtime.sqlite
 """
 
 from __future__ import annotations
@@ -37,7 +34,6 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from cathedral import census as census_mod
-from cathedral.api import WorkQueue
 from cathedral.attest import collect_tdx_gpu
 from cathedral.assurance import AssuranceDimension
 from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
@@ -76,7 +72,6 @@ from cathedral.runtime import (
 )
 from cathedral.worker import WorkerServer
 
-DEFAULT_QUEUE_FILE = Path(".cathedral_queue.json")
 DEFAULT_PUBLISHER_BEARER_ENV = "CATHEDRAL_PUBLISHER_BEARER_TOKEN"
 DEFAULT_PUBLISHER_HMAC_ENV = "CATHEDRAL_PUBLISHER_HMAC_SECRET"
 DEFAULT_WORKER_BEARER_ENV = "CATHEDRAL_WORKER_BEARER_TOKEN"
@@ -235,28 +230,6 @@ def _format_publish_pretty(epoch_id: int, ack: dict[str, object], *, out: object
     )
 
 
-# --------------------------------------------------------------------------
-# work-queue persistence: a JSON file holding pending customer SAT jobs, so
-# separate `work submit` / `work status` invocations see the same state.
-# --------------------------------------------------------------------------
-
-
-def _queue_path(args: argparse.Namespace) -> Path:
-    return Path(getattr(args, "queue_file", None) or DEFAULT_QUEUE_FILE)
-
-
-def _load_pending(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open() as fh:
-        return json.load(fh)
-
-
-def _save_pending(path: Path, pending: list[dict]) -> None:
-    with path.open("w") as fh:
-        json.dump(pending, fh)
-
-
 def _item_to_dict(item: SatWorkItem) -> dict:
     return {
         "n_vars": item.instance.n_vars,
@@ -279,16 +252,6 @@ def _dict_to_item(d: dict) -> SatWorkItem:
     return SatWorkItem(instance=instance, seed=d["seed"], challenge_id=computed_id)
 
 
-def _build_queue(pending: list[dict]) -> WorkQueue:
-    """A WorkQueue preloaded with persisted customer jobs, backfilled by SatLane."""
-
-    lane = SatLane()
-    queue = WorkQueue(backfill=lambda: lane.dispatch("cli", budget=1))
-    for d in pending:
-        queue.enqueue(_dict_to_item(d))
-    return queue
-
-
 # --------------------------------------------------------------------------
 # subcommands
 # --------------------------------------------------------------------------
@@ -306,14 +269,10 @@ def cmd_verify_quote(args: argparse.Namespace) -> int:
 
 
 def cmd_work_submit(args: argparse.Namespace) -> int:
-    path = _queue_path(args)
-    pending = _load_pending(path)
-    queue = _build_queue(pending)
-
     if args.clauses is not None:
         clauses = json.loads(args.clauses)
         instance = SatInstance(n_vars=args.n_vars, clauses=clauses)
-        seed = args.seed or 0
+        seed = args.seed if args.seed is not None else 0
         challenge_id = _compute_challenge_id(instance, seed)
         item = SatWorkItem(instance=instance, seed=seed, challenge_id=challenge_id)
     else:
@@ -322,20 +281,63 @@ def cmd_work_submit(args: argparse.Namespace) -> int:
         assert isinstance(dispatched, SatWorkItem)
         item = dispatched
 
-    queue.enqueue(item)
-    pending.append(_item_to_dict(item))
-    _save_pending(path, pending)
-    print(
-        f"submitted job (n_vars={item.instance.n_vars}, seed={item.seed}); queue depth={len(pending)}"
-    )
+    with Ledger(args.ledger_db) as ledger:
+        job = ledger.enqueue_customer_job(
+            item,
+            customer_id=getattr(args, "customer_id", "operator"),
+            idempotency_key=getattr(args, "idempotency_key", None),
+        )
+        queued = ledger.customer_job_counts()["queued"]
+    print(f"submitted {job.job_id} (n_vars={item.instance.n_vars}, seed={item.seed}); queued={queued}")
     return 0
 
 
 def cmd_work_status(args: argparse.Namespace) -> int:
-    path = _queue_path(args)
-    pending = _load_pending(path)
-    print(f"customer jobs queued : {len(pending)}")
-    print(f"next claim source    : {'customer' if pending else 'backfill (canonical)'}")
+    with Ledger(args.ledger_db) as ledger:
+        job_id = getattr(args, "job_id", None)
+        if job_id is not None:
+            job = ledger.customer_job(job_id)
+            print(
+                json.dumps(
+                    {
+                        "job_id": job.job_id,
+                        "customer_id": job.customer_id,
+                        "status": job.status,
+                        "attempt_count": job.attempt_count,
+                        "lease_owner": job.lease_owner,
+                        "lease_epoch_id": job.lease_epoch_id,
+                        "result": dict(job.result) if job.result is not None else None,
+                        "last_error": (
+                            _sanitize_error(job.last_error, maxlen=300)
+                            if job.last_error is not None
+                            else None
+                        ),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        counts = ledger.customer_job_counts()
+    print(json.dumps({"customer_jobs": dict(counts)}, sort_keys=True))
+    return 0
+
+
+def cmd_work_prune(args: argparse.Namespace) -> int:
+    if not getattr(args, "confirm", False):
+        raise ValueError("work prune requires --confirm")
+    try:
+        before = datetime.datetime.fromisoformat(args.resolved_before.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("--resolved-before must be a UTC ISO-8601 timestamp") from None
+    if before.tzinfo is None or before.utcoffset() != datetime.timedelta(0):
+        raise ValueError("--resolved-before must be a UTC ISO-8601 timestamp")
+    with Ledger(args.ledger_db) as ledger:
+        removed = ledger.prune_customer_jobs(
+            before,
+            limit=args.limit,
+            customer_id=getattr(args, "customer_id", None),
+        )
+    print(json.dumps({"pruned_customer_jobs": removed}, sort_keys=True))
     return 0
 
 
@@ -762,6 +764,8 @@ def _build_runtime(
             args, "reattestation_retry_maximum_seconds", 300
         ),
         reattestation_retry_jitter_seconds=getattr(args, "reattestation_retry_jitter_seconds", 5),
+        customer_job_lease_seconds=getattr(args, "customer_job_lease_seconds", 120),
+        customer_job_max_attempts=getattr(args, "customer_job_max_attempts", 3),
         expected_tier=Tier.CC_GPU if gpu_profile_id is not None else Tier.CC_CPU_TDX,
         admission_enabled=require_policy,
     )
@@ -961,6 +965,13 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             raise ValueError("worker channel binding is invalid") from None
     if not getattr(args, "development_no_auth", False) and channel_binding is None:
         raise ValueError("production worker requires a configured channel binding")
+    allow_customer_sat = getattr(args, "allow_customer_sat", False)
+    if allow_customer_sat and (token is None or channel_binding is None):
+        raise ValueError("customer SAT requires bearer authentication and channel binding")
+    if allow_customer_sat and getattr(args, "development_allow_non_loopback", False):
+        raise ValueError("customer SAT cannot use the development non-loopback HTTP bind")
+    if allow_customer_sat and getattr(args, "gpu_composite", False):
+        raise ValueError("customer SAT is available only on the CPU worker path")
     with WorkerServer(
         args.host,
         args.port,
@@ -968,6 +979,7 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         bearer_token=token,
         channel_binding=channel_binding,
         evidence_collector=(collect_tdx_gpu if getattr(args, "gpu_composite", False) else None),
+        allow_noncanonical_sat=allow_customer_sat,
         allow_non_loopback_for_development=args.development_allow_non_loopback,
     ) as server:
         print(json.dumps({"host": server.host, "port": server.port, "hotkey": args.hotkey}))
@@ -1204,12 +1216,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON list of clauses (DIMACS ints); omit to submit canonical backfill work",
     )
     p_submit.add_argument("--seed", type=int, default=None)
-    p_submit.add_argument("--queue-file", default=None, help=f"default: {DEFAULT_QUEUE_FILE}")
+    p_submit.add_argument("--ledger-db", required=True)
+    p_submit.add_argument("--customer-id", required=True)
+    p_submit.add_argument("--idempotency-key")
     p_submit.set_defaults(func=cmd_work_submit)
 
     p_status = work_sub.add_parser("status", help="report queue/backfill state")
-    p_status.add_argument("--queue-file", default=None, help=f"default: {DEFAULT_QUEUE_FILE}")
+    p_status.add_argument("--ledger-db", required=True)
+    p_status.add_argument("--job-id")
     p_status.set_defaults(func=cmd_work_status)
+
+    p_prune = work_sub.add_parser("prune", help="delete bounded terminal customer-job history")
+    p_prune.add_argument("--ledger-db", required=True)
+    p_prune.add_argument("--resolved-before", required=True)
+    p_prune.add_argument("--customer-id")
+    p_prune.add_argument("--limit", type=int, default=1000)
+    p_prune.add_argument("--confirm", action="store_true")
+    p_prune.set_defaults(func=cmd_work_prune)
 
     p_worker = sub.add_parser("worker", help="run a miner worker")
     worker_sub = p_worker.add_subparsers(dest="worker_command", required=True)
@@ -1220,6 +1243,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--bearer-token-env", default=DEFAULT_WORKER_BEARER_ENV)
     p_serve.add_argument("--development-no-auth", action="store_true")
     p_serve.add_argument("--development-allow-non-loopback", action="store_true")
+    p_serve.add_argument(
+        "--allow-customer-sat",
+        action="store_true",
+        help="accept bounded customer SAT jobs; requires bearer auth and channel binding",
+    )
     p_serve.add_argument(
         "--gpu-composite",
         action="store_true",
@@ -1355,6 +1383,8 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--reattestation-retry-base-seconds", type=int, default=5)
         command.add_argument("--reattestation-retry-maximum-seconds", type=int, default=300)
         command.add_argument("--reattestation-retry-jitter-seconds", type=int, default=5)
+        command.add_argument("--customer-job-lease-seconds", type=int, default=120)
+        command.add_argument("--customer-job-max-attempts", type=int, default=3)
         command.add_argument("--development", action="store_true")
         command.add_argument("--publisher-endpoint", default=None)
         command.add_argument("--publisher-bearer-env", default=DEFAULT_PUBLISHER_BEARER_ENV)
