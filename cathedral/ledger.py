@@ -143,6 +143,21 @@ CREATE TABLE IF NOT EXISTS assurance_receipts (
     UNIQUE (epoch_id, hotkey)
 );
 
+CREATE TABLE IF NOT EXISTS score_class_exports (
+    epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
+    source_epoch INTEGER NOT NULL,
+    network TEXT NOT NULL,
+    netuid INTEGER NOT NULL CHECK (netuid >= 0),
+    class_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    report_id TEXT NOT NULL,
+    report_body BLOB NOT NULL,
+    report_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (epoch_id, network, netuid, class_id, source_id),
+    UNIQUE (source_epoch, network, netuid, class_id, source_id)
+);
+
 CREATE TABLE IF NOT EXISTS epoch_worker_lifecycle (
     epoch_id INTEGER NOT NULL REFERENCES epochs(epoch_id),
     hotkey TEXT NOT NULL,
@@ -590,7 +605,8 @@ class Ledger:
         governed by ``PRAGMA legacy_alter_table``, not ``PRAGMA
         foreign_keys``, so setting ``foreign_keys = OFF`` does not suppress
         it. That left ``challenges``/``epoch_attestations``/``epoch_scores``
-        permanently referencing ``epochs_pre_abandon_migration`` in their
+        and other child tables permanently referencing
+        ``epochs_pre_abandon_migration`` in their
         stored schema, and once that table was dropped, every subsequent
         insert into a child table failed with ``no such table: main.
         epochs_pre_abandon_migration`` even though the schema, on its face,
@@ -737,6 +753,7 @@ class Ledger:
             "epoch_attestations",
             "epoch_scores",
             "assurance_receipts",
+            "score_class_exports",
             "epoch_worker_lifecycle",
             "customer_jobs",
         ):
@@ -1923,6 +1940,177 @@ class Ledger:
                 (challenge_id,),
             ).fetchone()
         return MappingProxyType(dict(row)) if row is not None else None
+
+    def score_class_snapshot(self, epoch_id: int) -> Mapping[str, Any]:
+        """Return frozen score facts and their exact receipt provenance.
+
+        This is the narrow integration boundary used by external Bittensor
+        validators.  It deliberately exposes facts, not weights: the consuming
+        validator still chooses the metric, class allocation, coldkey collapse,
+        and final on-chain vector.
+
+        A positive work row without the atomically stored assurance receipt is
+        rejected here so no exporter can accidentally turn legacy, receiptless
+        work into a provenance-bearing score-class report.
+        """
+
+        with self._lock:
+            epoch = self._epoch(self._connection, epoch_id)
+            if epoch["status"] not in {"complete", "published"}:
+                raise LedgerError(
+                    f"epoch {epoch_id} is {epoch['status']}; score facts are not frozen"
+                )
+            if epoch["report_body"] is None or epoch["report_digest"] is None:
+                raise LedgerError(f"epoch {epoch_id} has no completed report")
+            report_body = bytes(epoch["report_body"])
+            if hashlib.sha256(report_body).hexdigest() != str(epoch["report_digest"]):
+                raise LedgerError("persisted report bytes do not match their frozen digest")
+            try:
+                report = json.loads(report_body)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                raise LedgerError("persisted report body is invalid") from exc
+            if not isinstance(report, dict) or report.get("complete") is not True:
+                raise LedgerError("persisted report is not a complete score snapshot")
+
+            rows = self._connection.execute(
+                "SELECT scores.hotkey,scores.work_units,scores.score,"
+                "receipts.receipt_id,receipts.challenge_id,receipts.work_status,"
+                "receipts.receipt_body,receipts.receipt_digest,receipts.issued_at "
+                "FROM epoch_scores AS scores LEFT JOIN assurance_receipts AS receipts "
+                "ON receipts.epoch_id=scores.epoch_id AND receipts.hotkey=scores.hotkey "
+                "WHERE scores.epoch_id = ? ORDER BY scores.hotkey",
+                (epoch_id,),
+            ).fetchall()
+            for row in rows:
+                if float(row["work_units"]) > 0 and row["receipt_id"] is None:
+                    raise LedgerError(
+                        f"positive work for {row['hotkey']!r} lacks an assurance receipt"
+                    )
+            snapshot = {
+                "epoch_id": epoch_id,
+                "source_epoch": int(epoch["source_epoch"]),
+                "status": str(epoch["status"]),
+                "generated_at": str(epoch["generated_at"]),
+                "network": report.get("network"),
+                "netuid": report.get("netuid"),
+                "policy_registry_release": epoch["policy_registry_release"],
+                "policy_registry_digest": epoch["policy_registry_digest"],
+                "report_digest": "sha256:" + str(epoch["report_digest"]),
+                "rows": tuple(MappingProxyType(dict(row)) for row in rows),
+            }
+        return MappingProxyType(snapshot)
+
+    def get_score_class_export(
+        self,
+        epoch_id: int,
+        *,
+        network: str,
+        netuid: int,
+        class_id: str,
+        source_id: str,
+    ) -> Mapping[str, Any] | None:
+        """Return the immutable first export for one epoch and target class."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM score_class_exports WHERE epoch_id = ? AND network = ? "
+                "AND netuid = ? AND class_id = ? AND source_id = ?",
+                (epoch_id, network, netuid, class_id, source_id),
+            ).fetchone()
+        return MappingProxyType(dict(row)) if row is not None else None
+
+    def previous_score_class_export(
+        self,
+        source_epoch: int,
+        *,
+        network: str,
+        netuid: int,
+        class_id: str,
+        source_id: str,
+    ) -> Mapping[str, Any] | None:
+        """Return the latest prior export in the same validator-facing stream."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM score_class_exports WHERE source_epoch < ? "
+                "AND network = ? AND netuid = ? AND class_id = ? AND source_id = ? "
+                "ORDER BY source_epoch DESC LIMIT 1",
+                (source_epoch, network, netuid, class_id, source_id),
+            ).fetchone()
+        return MappingProxyType(dict(row)) if row is not None else None
+
+    def record_score_class_export(
+        self,
+        epoch_id: int,
+        *,
+        source_epoch: int,
+        network: str,
+        netuid: int,
+        class_id: str,
+        source_id: str,
+        report_id: str,
+        report_body: bytes,
+    ) -> bytes:
+        """Persist first-published bytes and replay them on every retry.
+
+        Concurrent exporters may race to build a candidate, but only the first
+        body becomes durable. Every caller receives those exact bytes, which
+        prevents an upload retry or mirror repair from creating same-epoch
+        equivocation.
+        """
+
+        if not isinstance(report_body, bytes) or not report_body:
+            raise LedgerError("score-class report body must be nonempty bytes")
+        if (
+            not isinstance(report_id, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", report_id) is None
+        ):
+            raise LedgerError("score-class report id is invalid")
+        report_digest = "sha256:" + hashlib.sha256(report_body).hexdigest()
+        with self._transaction() as cx:
+            epoch = self._epoch(cx, epoch_id)
+            if epoch["status"] not in {"complete", "published"}:
+                raise LedgerError(
+                    f"epoch {epoch_id} is {epoch['status']}; score facts are not frozen"
+                )
+            if int(epoch["source_epoch"]) != source_epoch:
+                raise LedgerError("score-class source epoch does not match ledger epoch")
+            existing = cx.execute(
+                "SELECT report_body FROM score_class_exports WHERE epoch_id = ? "
+                "AND network = ? AND netuid = ? AND class_id = ? AND source_id = ?",
+                (epoch_id, network, netuid, class_id, source_id),
+            ).fetchone()
+            if existing is not None:
+                return bytes(existing["report_body"])
+            try:
+                cx.execute(
+                    "INSERT INTO score_class_exports("
+                    "epoch_id,source_epoch,network,netuid,class_id,source_id,"
+                    "report_id,report_body,report_digest,created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        epoch_id,
+                        source_epoch,
+                        network,
+                        netuid,
+                        class_id,
+                        source_id,
+                        report_id,
+                        report_body,
+                        report_digest,
+                        _now(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raced = cx.execute(
+                    "SELECT report_body FROM score_class_exports WHERE epoch_id = ? "
+                    "AND network = ? AND netuid = ? AND class_id = ? AND source_id = ?",
+                    (epoch_id, network, netuid, class_id, source_id),
+                ).fetchone()
+                if raced is None:
+                    raise LedgerError("score-class export stream conflicts") from exc
+                return bytes(raced["report_body"])
+        return report_body
 
     def attested_hotkeys(self, epoch_id: int) -> frozenset[str]:
         with self._lock:
