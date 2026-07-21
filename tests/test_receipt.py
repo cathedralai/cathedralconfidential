@@ -23,7 +23,7 @@ from cathedral.assurance import (
     evaluated_claim,
     with_verified_channel,
 )
-from cathedral.cli import _load_receipt_private_seed, cmd_receipt_verify
+from cathedral.cli import _load_receipt_private_seed, cmd_receipt_verify, main as cli_main
 from cathedral.common import Attested, Policy, Tier
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.lifecycle import (
@@ -46,6 +46,7 @@ from cathedral.receipt import (
     verify_receipt,
 )
 from cathedral.runtime import SAT_WORK_POLICY_DIGEST
+from cathedral.score_class import ScoreClassError, export_score_class_report
 
 
 REGISTRY_SEED = bytes(range(32))
@@ -726,6 +727,277 @@ def test_epoch_snapshot_must_match_the_exact_lifecycle_signed_in_receipt(tmp_pat
 
     with pytest.raises(LedgerError, match="does not match"):
         ledger.add_lifecycle_snapshot(epoch_id, mismatched, snapshot_at=ISSUED_TEXT)
+
+
+def _completed_receipt_epoch(tmp_path: Path, *, work_units: float = 3.5) -> tuple[Ledger, int]:
+    snapshot = _snapshot()
+    ledger = Ledger(tmp_path / "score-class-ledger.sqlite")
+    epoch_id = ledger.begin_epoch(
+        11,
+        policy_registry_release=snapshot.release,
+        policy_registry_digest=snapshot.digest,
+    )
+    _snapshot_value, policy, claims, receipt = _issued_receipt(
+        epoch_id=epoch_id, work_units=work_units
+    )
+    ledger.issue_challenge(CHALLENGE_ID, "public-hotkey", epoch_id)
+    ledger.resolve_challenge_with_receipt(
+        CHALLENGE_ID,
+        "verified",
+        work_units,
+        validator_derived=True,
+        receipt_id=receipt.receipt_id,
+        receipt_body=receipt.receipt_bytes,
+        receipt_digest=receipt.receipt_digest,
+        issued_at=ISSUED_TEXT,
+    )
+    ledger.add_attestation(
+        epoch_id,
+        "public-hotkey",
+        verdict="VERIFIED",
+        tee_type="TDX",
+        workload="CPU",
+        evidence_digest=claims.hardware.evidence_digest,
+        policy_mode="strict",
+    )
+    ledger.add_lifecycle_snapshot(
+        epoch_id,
+        _worker_lifecycle(policy, claims, "public-hotkey"),
+        snapshot_at=ISSUED_TEXT,
+    )
+    ledger.complete_epoch(
+        epoch_id,
+        {"public-hotkey", "zero-hotkey"},
+        generated_at=ISSUED_TEXT,
+        score_network="local",
+        score_netuid=1,
+    )
+    return ledger, epoch_id
+
+
+def _export_score_class(
+    ledger: Ledger,
+    epoch_id: int,
+    *,
+    generated_at: datetime = ISSUED,
+    evidence_base_uri: str | None = None,
+) -> bytes:
+    return export_score_class_report(
+        ledger,
+        epoch_id,
+        network="local",
+        netuid=1,
+        class_id="confidential_compute",
+        source_id="cathedralconfidential",
+        signing_key_id="score-test-1",
+        private_key_seed=RECEIPT_SEED_2,
+        generated_at=generated_at,
+        valid_until=generated_at + timedelta(minutes=5),
+        valid_from_block=70,
+        valid_until_block=80,
+        verifier_digest="sha256:" + "d" * 64,
+        evidence_base_uri=evidence_base_uri,
+    )
+
+
+def test_score_class_export_contains_exact_receipt_provenance_and_zero_revocation(
+    tmp_path: Path,
+):
+    ledger, epoch_id = _completed_receipt_epoch(tmp_path)
+
+    raw = _export_score_class(
+        ledger,
+        epoch_id,
+        evidence_base_uri="https://evidence.example/receipts/",
+    )
+    document = json.loads(raw)
+    rows = {entry["miner_hotkey"]: entry for entry in document["entries"]}
+    stored = ledger.receipt_for_challenge(CHALLENGE_ID)
+
+    assert raw == canonical_json(document)
+    assert document["schema"] == "cathedral_score_class_report_v1"
+    assert (document["network"], document["netuid"]) == ("local", 1)
+    assert document["source_epoch"] == 11
+    assert rows["public-hotkey"]["metrics"] == {"verified_work_units": "3.5"}
+    assert rows["public-hotkey"]["asserted_score"] is None
+    assert rows["public-hotkey"]["evidence"] == [
+        {
+            "kind": "cathedral_assurance_receipt_v2",
+            "id": stored["receipt_id"],
+            "digest": stored["receipt_digest"],
+            "uri": "https://evidence.example/receipts/" + stored["receipt_id"] + ".json",
+        }
+    ]
+    assert rows["zero-hotkey"] == {
+        "miner_hotkey": "zero-hotkey",
+        "metrics": {"verified_work_units": "0"},
+        "asserted_score": None,
+        "reason_codes": ["no_verified_work"],
+        "evidence": [],
+    }
+
+
+def test_score_class_export_rejects_receiptless_positive_work(tmp_path: Path):
+    ledger = Ledger(tmp_path / "legacy-ledger.sqlite")
+    epoch_id = ledger.begin_epoch(1)
+    ledger.issue_challenge("legacy", "legacy-hotkey", epoch_id)
+    ledger.resolve_challenge("legacy", "verified", 1, validator_derived=True)
+    ledger.add_attestation(
+        epoch_id,
+        "legacy-hotkey",
+        verdict="VERIFIED",
+        tee_type="TDX",
+        workload="CPU",
+        evidence_digest="legacy-evidence",
+    )
+    ledger.complete_epoch(
+        epoch_id,
+        {"legacy-hotkey"},
+        score_network="local",
+        score_netuid=1,
+    )
+
+    with pytest.raises(ScoreClassError, match="lacks an assurance receipt"):
+        _export_score_class(ledger, epoch_id)
+
+
+def test_score_class_export_rejects_wrong_audience_and_corrupt_receipt(tmp_path: Path):
+    ledger, epoch_id = _completed_receipt_epoch(tmp_path)
+
+    with pytest.raises(ScoreClassError, match="audience"):
+        export_score_class_report(
+            ledger,
+            epoch_id,
+            network="local",
+            netuid=2,
+            class_id="confidential_compute",
+            source_id="cathedralconfidential",
+            signing_key_id="score-test-1",
+            private_key_seed=RECEIPT_SEED_2,
+            generated_at=ISSUED,
+            valid_until=ISSUED + timedelta(minutes=5),
+            valid_from_block=70,
+            valid_until_block=80,
+            verifier_digest="sha256:" + "d" * 64,
+        )
+
+    ledger._connection.execute(
+        "UPDATE assurance_receipts SET receipt_body = ? WHERE epoch_id = ?",
+        (b"{}", epoch_id),
+    )
+    with pytest.raises(ScoreClassError, match="receipt digest mismatch"):
+        _export_score_class(ledger, epoch_id)
+
+
+def test_score_class_export_replays_exact_first_bytes_and_chains_next_epoch(tmp_path: Path):
+    ledger, first_epoch = _completed_receipt_epoch(tmp_path)
+    first = _export_score_class(ledger, first_epoch)
+    first_document = json.loads(first)
+
+    replay = _export_score_class(
+        ledger,
+        first_epoch,
+        generated_at=ISSUED + timedelta(hours=1),
+        evidence_base_uri="https://different.example/receipts/",
+    )
+    assert replay == first
+    assert (
+        ledger.get_score_class_export(
+            first_epoch,
+            network="local",
+            netuid=1,
+            class_id="confidential_compute",
+            source_id="cathedralconfidential",
+        )["report_body"]
+        == first
+    )
+
+    ledger.mark_published(first_epoch)
+    snapshot = _snapshot()
+    second_epoch = ledger.begin_epoch(
+        12,
+        policy_registry_release=snapshot.release,
+        policy_registry_digest=snapshot.digest,
+    )
+    ledger.complete_epoch(
+        second_epoch,
+        {"public-hotkey"},
+        generated_at="2026-07-17T12:01:00.000000Z",
+        score_network="local",
+        score_netuid=1,
+    )
+    second = _export_score_class(
+        ledger,
+        second_epoch,
+        generated_at=ISSUED + timedelta(minutes=1),
+    )
+
+    assert json.loads(second)["previous_report_id"] == first_document["report_id"]
+
+
+@pytest.mark.parametrize("work_units", [0.30000000000000004, 1e30])
+def test_out_of_range_metric_excludes_only_that_miner(tmp_path: Path, work_units: float):
+    ledger, epoch_id = _completed_receipt_epoch(tmp_path, work_units=work_units)
+
+    report = json.loads(_export_score_class(ledger, epoch_id))
+    rows = {entry["miner_hotkey"]: entry for entry in report["entries"]}
+
+    assert rows["public-hotkey"]["metrics"] == {"verified_work_units": "0"}
+    assert rows["public-hotkey"]["reason_codes"] == ["unsupported_work_unit_precision"]
+    assert rows["public-hotkey"]["evidence"]
+    assert rows["zero-hotkey"]["metrics"] == {"verified_work_units": "0"}
+
+
+def test_runtime_cli_exports_validator_consumable_score_class(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    ledger, epoch_id = _completed_receipt_epoch(tmp_path)
+    ledger.close()
+    key_path = tmp_path / "score-class.key"
+    key_path.write_bytes(base64.b64encode(RECEIPT_SEED_2))
+    key_path.chmod(0o600)
+    output = tmp_path / "confidential-compute.json"
+
+    arguments = [
+        "runtime",
+        "export-score-class",
+        "--ledger-db",
+        str(tmp_path / "score-class-ledger.sqlite"),
+        "--epoch-id",
+        str(epoch_id),
+        "--score-network",
+        "local",
+        "--score-netuid",
+        "1",
+        "--signing-key-id",
+        "score-test-1",
+        "--signing-key-file",
+        str(key_path),
+        "--generated-at",
+        ISSUED_TEXT,
+        "--valid-until",
+        "2026-07-17T12:05:00.000000Z",
+        "--valid-from-block",
+        "70",
+        "--valid-until-block",
+        "80",
+        "--verifier-digest",
+        "sha256:" + "d" * 64,
+        "--output",
+        str(output),
+    ]
+    assert cli_main(arguments) == 2
+    assert "requires --evidence-base-uri" in capsys.readouterr().err
+    assert not output.exists()
+
+    result = cli_main([*arguments, "--development"])
+
+    status = json.loads(capsys.readouterr().out)
+    report = json.loads(output.read_bytes())
+    assert result == 0
+    assert status["report_id"] == report["report_id"]
+    assert status["entries"] == 2
+    assert output.read_bytes() == canonical_json(report)
 
 
 def test_offline_cli_returns_machine_readable_verification_categories(

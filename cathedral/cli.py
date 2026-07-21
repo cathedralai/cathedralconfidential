@@ -70,6 +70,7 @@ from cathedral.runtime import (
     MinerTarget,
     RuntimeConfig,
 )
+from cathedral.score_class import export_score_class_report
 from cathedral.worker import WorkerServer
 
 DEFAULT_PUBLISHER_BEARER_ENV = "CATHEDRAL_PUBLISHER_BEARER_TOKEN"
@@ -1054,6 +1055,101 @@ def cmd_runtime_status(args: argparse.Namespace) -> int:
         ledger.close()
 
 
+def _score_class_time(value: str, label: str) -> datetime.datetime:
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} must be a timezone-aware ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != datetime.timedelta(0):
+        raise ValueError(f"{label} must be UTC")
+    return parsed
+
+
+def _write_score_class_report(path: str, body: bytes) -> None:
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(temporary, flags, 0o644)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def cmd_runtime_export_score_class(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.ledger_db)
+    try:
+        existing = ledger.get_score_class_export(
+            args.epoch_id,
+            network=args.score_network,
+            netuid=args.score_netuid,
+            class_id=args.class_id,
+            source_id=args.source_id,
+        )
+        replayed = existing is not None
+        if existing is not None:
+            report = bytes(existing["report_body"])
+        else:
+            if not args.development and not args.evidence_base_uri:
+                raise ValueError(
+                    "production score-class export requires --evidence-base-uri "
+                    "for validator provenance"
+                )
+            generated_at = (
+                datetime.datetime.now(datetime.timezone.utc)
+                if args.generated_at is None
+                else _score_class_time(args.generated_at, "generated_at")
+            )
+            report = export_score_class_report(
+                ledger,
+                args.epoch_id,
+                network=args.score_network,
+                netuid=args.score_netuid,
+                class_id=args.class_id,
+                source_id=args.source_id,
+                signing_key_id=args.signing_key_id,
+                private_key_seed=_load_private_seed(
+                    args.signing_key_file,
+                    production_mode=not args.development,
+                    label="score-class signing key",
+                ),
+                generated_at=generated_at,
+                valid_until=_score_class_time(args.valid_until, "valid_until"),
+                valid_from_block=args.valid_from_block,
+                valid_until_block=args.valid_until_block,
+                verifier_digest=args.verifier_digest,
+                policy_digest=args.policy_digest,
+                previous_report_id=args.previous_report_id,
+                evidence_base_uri=args.evidence_base_uri,
+            )
+        _write_score_class_report(args.output, report)
+        document = json.loads(report)
+        print(
+            json.dumps(
+                {
+                    "class_id": document["class_id"],
+                    "entries": len(document["entries"]),
+                    "output": str(Path(args.output).expanduser()),
+                    "replayed": replayed,
+                    "report_id": document["report_id"],
+                    "source_epoch": document["source_epoch"],
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    finally:
+        ledger.close()
+
+
 def cmd_runtime_retry_publish(args: argparse.Namespace) -> int:
     runtime, ledger, _ = _build_runtime(args)
     try:
@@ -1450,6 +1546,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_runtime_status = runtime_sub.add_parser("status", help="show restart-blocking state")
     p_runtime_status.add_argument("--ledger-db", required=True)
     p_runtime_status.set_defaults(func=cmd_runtime_status)
+
+    p_export_class = runtime_sub.add_parser(
+        "export-score-class",
+        help="export a frozen receipt-backed report for an independent validator",
+    )
+    p_export_class.add_argument("--ledger-db", required=True)
+    p_export_class.add_argument("--epoch-id", type=int, required=True)
+    p_export_class.add_argument("--score-network", required=True)
+    p_export_class.add_argument("--score-netuid", type=int, required=True)
+    p_export_class.add_argument("--class-id", default="confidential_compute")
+    p_export_class.add_argument("--source-id", default="cathedralconfidential")
+    p_export_class.add_argument("--signing-key-id", required=True)
+    p_export_class.add_argument("--signing-key-file", required=True)
+    p_export_class.add_argument("--generated-at")
+    p_export_class.add_argument("--valid-until", required=True)
+    p_export_class.add_argument("--valid-from-block", type=int, required=True)
+    p_export_class.add_argument("--valid-until-block", type=int, required=True)
+    p_export_class.add_argument("--verifier-digest", required=True)
+    p_export_class.add_argument("--policy-digest")
+    p_export_class.add_argument("--previous-report-id")
+    p_export_class.add_argument("--evidence-base-uri")
+    p_export_class.add_argument("--output", required=True)
+    p_export_class.add_argument(
+        "--development",
+        action="store_true",
+        help="relax production signing-key ownership and mode checks",
+    )
+    p_export_class.set_defaults(func=cmd_runtime_export_score_class)
 
     p_retry = runtime_sub.add_parser("retry-publish", help="publish frozen report bytes")
     p_retry.add_argument("--ledger-db", required=True)
