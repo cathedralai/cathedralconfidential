@@ -27,7 +27,8 @@ COPY --chmod=0555 runtime/cathedral-job /opt/cathedral/bin/cathedral-job
 # private keys must never enter this image or its build context.
 RUN --mount=type=secret,id=kbs_root_ca,required=true \
     install -D -m 0444 /run/secrets/kbs_root_ca /etc/cathedral/kbs-root.pem && \
-    ln -s /usr/local/bin/python3.12 /usr/bin/python3 && \
+    ln -sfnT /usr/local/bin/python3.12 /usr/bin/python3 && \
+    test "$(readlink -f /usr/bin/python3)" = "/usr/local/bin/python3.12" && \
     install -d -o root -g root -m 0555 /work && \
     dpkg-query -W -f='${Status}' util-linux | grep -qx 'install ok installed' && \
     test -x /usr/bin/unshare && test -x /usr/bin/setpriv && test -x /usr/bin/python3 && \
