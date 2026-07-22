@@ -2049,14 +2049,14 @@ class Ledger:
         class_id: str,
         source_id: str,
         report_id: str,
+        previous_report_id: str | None,
         report_body: bytes,
     ) -> bytes:
-        """Persist first-published bytes and replay them on every retry.
+        """Persist one append-only report while holding the stream write lock.
 
-        Concurrent exporters may race to build a candidate, but only the first
-        body becomes durable. Every caller receives those exact bytes, which
-        prevents an upload retry or mirror repair from creating same-epoch
-        equivocation.
+        The stream predecessor is checked in the same ``BEGIN IMMEDIATE``
+        transaction as the insert. Exact retries replay the frozen bytes, while
+        conflicting duplicates and non-monotonic appends fail closed.
         """
 
         if not isinstance(report_body, bytes) or not report_body:
@@ -2066,6 +2066,27 @@ class Ledger:
             or re.fullmatch(r"sha256:[0-9a-f]{64}", report_id) is None
         ):
             raise LedgerError("score-class report id is invalid")
+        if previous_report_id is not None and (
+            not isinstance(previous_report_id, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", previous_report_id) is None
+        ):
+            raise LedgerError("score-class previous report id is invalid")
+        try:
+            document = json.loads(report_body, object_pairs_hook=_strict_json_object_pairs)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise LedgerError("score-class report body is invalid") from exc
+        if not isinstance(document, dict) or _canonical_json(document) != report_body:
+            raise LedgerError("score-class report body is not canonical JSON")
+        if (
+            document.get("source_epoch") != source_epoch
+            or document.get("network") != network
+            or document.get("netuid") != netuid
+            or document.get("class_id") != class_id
+            or document.get("source_id") != source_id
+            or document.get("report_id") != report_id
+            or document.get("previous_report_id") != previous_report_id
+        ):
+            raise LedgerError("score-class report body does not match export metadata")
         report_digest = "sha256:" + hashlib.sha256(report_body).hexdigest()
         with self._transaction() as cx:
             epoch = self._epoch(cx, epoch_id)
@@ -2076,12 +2097,31 @@ class Ledger:
             if int(epoch["source_epoch"]) != source_epoch:
                 raise LedgerError("score-class source epoch does not match ledger epoch")
             existing = cx.execute(
-                "SELECT report_body FROM score_class_exports WHERE epoch_id = ? "
+                "SELECT report_id,report_body FROM score_class_exports WHERE epoch_id = ? "
                 "AND network = ? AND netuid = ? AND class_id = ? AND source_id = ?",
                 (epoch_id, network, netuid, class_id, source_id),
             ).fetchone()
             if existing is not None:
-                return bytes(existing["report_body"])
+                frozen = bytes(existing["report_body"])
+                if existing["report_id"] == report_id and frozen == report_body:
+                    return frozen
+                raise LedgerError("conflicting duplicate score-class export")
+            latest = cx.execute(
+                "SELECT source_epoch,report_id FROM score_class_exports "
+                "WHERE network = ? AND netuid = ? AND class_id = ? AND source_id = ? "
+                "ORDER BY source_epoch DESC LIMIT 1",
+                (network, netuid, class_id, source_id),
+            ).fetchone()
+            if latest is None:
+                if previous_report_id is not None:
+                    raise LedgerError(
+                        "first score-class export must not declare a previous report id"
+                    )
+            else:
+                if source_epoch <= int(latest["source_epoch"]):
+                    raise LedgerError("score-class source epoch is stale or out of order")
+                if previous_report_id != str(latest["report_id"]):
+                    raise LedgerError("durable export chain changed before insert")
             try:
                 cx.execute(
                     "INSERT INTO score_class_exports("
@@ -2102,14 +2142,7 @@ class Ledger:
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                raced = cx.execute(
-                    "SELECT report_body FROM score_class_exports WHERE epoch_id = ? "
-                    "AND network = ? AND netuid = ? AND class_id = ? AND source_id = ?",
-                    (epoch_id, network, netuid, class_id, source_id),
-                ).fetchone()
-                if raced is None:
-                    raise LedgerError("score-class export stream conflicts") from exc
-                return bytes(raced["report_body"])
+                raise LedgerError("score-class export stream conflicts") from exc
         return report_body
 
     def attested_hotkeys(self, epoch_id: int) -> frozenset[str]:

@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -781,6 +782,7 @@ def _export_score_class(
     *,
     generated_at: datetime = ISSUED,
     evidence_base_uri: str | None = None,
+    previous_report_id: str | None = None,
 ) -> bytes:
     return export_score_class_report(
         ledger,
@@ -797,7 +799,35 @@ def _export_score_class(
         valid_until_block=80,
         verifier_digest="sha256:" + "d" * 64,
         evidence_base_uri=evidence_base_uri,
+        previous_report_id=previous_report_id,
     )
+
+
+def _completed_zero_epoch(ledger: Ledger, source_epoch: int) -> int:
+    snapshot = _snapshot()
+    epoch_id = ledger.begin_epoch(
+        source_epoch,
+        policy_registry_release=snapshot.release,
+        policy_registry_digest=snapshot.digest,
+    )
+    ledger.complete_epoch(
+        epoch_id,
+        {"zero-hotkey"},
+        generated_at=ISSUED_TEXT,
+        score_network="local",
+        score_netuid=1,
+    )
+    return epoch_id
+
+
+def _two_completed_score_epochs(tmp_path: Path) -> tuple[Path, int, int]:
+    path = tmp_path / "score-class-chain.sqlite"
+    ledger = Ledger(path)
+    first_epoch = _completed_zero_epoch(ledger, 11)
+    ledger.mark_published(first_epoch)
+    second_epoch = _completed_zero_epoch(ledger, 12)
+    ledger.close()
+    return path, first_epoch, second_epoch
 
 
 def test_score_class_export_contains_exact_receipt_provenance_and_zero_revocation(
@@ -933,6 +963,142 @@ def test_score_class_export_replays_exact_first_bytes_and_chains_next_epoch(tmp_
     )
 
     assert json.loads(second)["previous_report_id"] == first_document["report_id"]
+
+
+def test_score_class_export_rejects_predecessor_that_appears_before_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path, first_epoch, second_epoch = _two_completed_score_epochs(tmp_path)
+    earlier = Ledger(path)
+    later = Ledger(path)
+    predecessor_read = threading.Event()
+    allow_later_insert = threading.Event()
+    original_lookup = later.previous_score_class_export
+
+    def pause_after_lookup(source_epoch: int, **stream: object):
+        prior = original_lookup(source_epoch, **stream)
+        assert prior is None
+        predecessor_read.set()
+        assert allow_later_insert.wait(timeout=5)
+        return prior
+
+    monkeypatch.setattr(later, "previous_score_class_export", pause_after_lookup)
+    outcome: dict[str, object] = {}
+
+    def export_later() -> None:
+        try:
+            outcome["report"] = _export_score_class(later, second_epoch)
+        except BaseException as exc:  # surfaced deterministically in the main test thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=export_later)
+    thread.start()
+    assert predecessor_read.wait(timeout=5)
+    try:
+        first = _export_score_class(earlier, first_epoch)
+    finally:
+        allow_later_insert.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert "report" not in outcome
+    assert isinstance(outcome.get("error"), ScoreClassError)
+    assert "durable export chain changed" in str(outcome["error"])
+    monkeypatch.setattr(later, "previous_score_class_export", original_lookup)
+    retry = _export_score_class(later, second_epoch)
+    assert json.loads(retry)["previous_report_id"] == json.loads(first)["report_id"]
+    earlier.close()
+    later.close()
+
+
+def test_score_class_export_rejects_out_of_order_older_epoch(tmp_path: Path):
+    path, first_epoch, second_epoch = _two_completed_score_epochs(tmp_path)
+    ledger = Ledger(path)
+
+    later = _export_score_class(ledger, second_epoch)
+    with pytest.raises(ScoreClassError, match="stale or out of order"):
+        _export_score_class(ledger, first_epoch)
+
+    stored = ledger._connection.execute(
+        "SELECT source_epoch,report_body FROM score_class_exports"
+    ).fetchall()
+    assert [(row["source_epoch"], bytes(row["report_body"])) for row in stored] == [(12, later)]
+    ledger.close()
+
+
+def test_score_class_export_rejects_unanchored_explicit_predecessor(tmp_path: Path):
+    ledger, epoch_id = _completed_receipt_epoch(tmp_path)
+
+    with pytest.raises(ScoreClassError, match="first score-class export"):
+        _export_score_class(
+            ledger,
+            epoch_id,
+            previous_report_id="sha256:" + "f" * 64,
+        )
+    ledger.close()
+
+
+def test_concurrent_conflicting_duplicate_export_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "score-class-duplicate.sqlite"
+    setup = Ledger(path)
+    epoch_id = _completed_zero_epoch(setup, 11)
+    setup.close()
+    first = Ledger(path)
+    second = Ledger(path)
+    candidates_ready = threading.Barrier(2)
+
+    def synchronize_lookup(ledger: Ledger) -> None:
+        original = ledger.previous_score_class_export
+
+        def lookup(source_epoch: int, **stream: object):
+            prior = original(source_epoch, **stream)
+            assert prior is None
+            candidates_ready.wait(timeout=5)
+            return prior
+
+        monkeypatch.setattr(ledger, "previous_score_class_export", lookup)
+
+    synchronize_lookup(first)
+    synchronize_lookup(second)
+    outcomes: list[bytes | BaseException] = []
+    outcome_lock = threading.Lock()
+
+    def export(ledger: Ledger, generated_at: datetime) -> None:
+        try:
+            outcome: bytes | BaseException = _export_score_class(
+                ledger,
+                epoch_id,
+                generated_at=generated_at,
+            )
+        except BaseException as exc:  # surfaced deterministically in the main test thread
+            outcome = exc
+        with outcome_lock:
+            outcomes.append(outcome)
+
+    threads = [
+        threading.Thread(target=export, args=(first, ISSUED)),
+        threading.Thread(target=export, args=(second, ISSUED + timedelta(minutes=1))),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    reports = [outcome for outcome in outcomes if isinstance(outcome, bytes)]
+    errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    assert len(reports) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], ScoreClassError)
+    assert "conflicting duplicate" in str(errors[0])
+    replay_ledger = Ledger(path)
+    replay = _export_score_class(replay_ledger, epoch_id)
+    assert replay == reports[0]
+    replay_ledger.close()
+    first.close()
+    second.close()
 
 
 @pytest.mark.parametrize("work_units", [0.30000000000000004, 1e30])
