@@ -10,6 +10,14 @@ submission is live; testnet SN292 remains the non-paying dry-run integration
 lane. The products, lanes, and hardware classes below beyond that are planned
 direction, not current launch evidence.
 
+The blocking confidential-GPU launch track is narrower than the roadmap below:
+one Spot GCP `a3-highgpu-1g` in `us-central1-a`, Intel TDX, one NVIDIA H100,
+production Stable Confidential Space, and the fixed Cathedral CUDA vector proof
+workload. It remains `NOT PROVEN` until the live attestation, key release, job,
+customer decryption, receipt, deletion, and validator-ingestion chain passes.
+Generic H200/B200, arbitrary inference/training, and miner-supplied CC-GPU
+capacity are future profiles, not claims about the selected first launch path.
+
 ---
 
 ## 1. Thesis

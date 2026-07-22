@@ -39,9 +39,15 @@ from cathedral.assurance import (
     sha256_digest,
 )
 from cathedral.channel import ChannelBindingError, application_key_binding
+from cathedral.cc_gpu import CcGpuJobContext
 from cathedral.common import Attested, ChannelBinding, ChannelBindingType, Policy, Tier
 from cathedral.enroll import RegistryStore
 from cathedral.lifecycle import WorkerLifecycleState, canonical_utc, parse_utc
+from cathedral.trustee import (
+    TRUSTEE_VERDICT_KEYS,
+    TRUSTEE_VERDICT_SCHEMA,
+    TrusteeCompositeVerdict,
+)
 from cathedral.workload import (
     AdmittedWorkload,
     ExecutionAuthorization,
@@ -250,6 +256,178 @@ class KeyReleasePolicy:
                 }
             )
         )
+
+
+@dataclass(frozen=True)
+class CcGpuKeyReleaseBinding:
+    """Exact composite admission and immutable job values bound into a grant."""
+
+    context: CcGpuJobContext
+    workload_manifest_digest: str
+    admission_bundle_digest: str
+    admission_evidence_digest: str
+    admission_nonce_digest: str
+    channel_binding_digest: str
+    trustee_verdict_digest: str
+    trustee_verdict_document: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.context, CcGpuJobContext):
+            raise KeyReleaseError("invalid_grant", "CC-GPU job context is invalid")
+        _require_digest(self.workload_manifest_digest, "CC-GPU workload manifest digest")
+        _require_digest(self.admission_bundle_digest, "CC-GPU admission bundle digest")
+        _require_digest(self.admission_evidence_digest, "CC-GPU admission evidence digest")
+        _require_digest(self.admission_nonce_digest, "CC-GPU admission nonce digest")
+        _require_digest(self.channel_binding_digest, "CC-GPU channel binding digest")
+        _require_digest(self.trustee_verdict_digest, "CC-GPU Trustee verdict digest")
+        if not isinstance(self.trustee_verdict_document, Mapping):
+            raise KeyReleaseError("invalid_grant", "CC-GPU Trustee verdict is invalid")
+        verdict_document = dict(self.trustee_verdict_document)
+        if (
+            set(verdict_document) != TRUSTEE_VERDICT_KEYS
+            or verdict_document.get("schema") != TRUSTEE_VERDICT_SCHEMA
+            or _digest(_canonical_json(verdict_document)) != self.trustee_verdict_digest
+            or any(
+                verdict_document.get(name) is not True
+                for name in (
+                    "same_guest_verified",
+                    "gpu_cc_mode_verified",
+                    "gpu_ready_state_verified",
+                    "measurement_policy_verified",
+                    "runtime_isolation_verified",
+                    "secret_release_authorized",
+                    "evidence_fresh",
+                    "runtime_ready",
+                )
+            )
+        ):
+            raise KeyReleaseError(
+                "invalid_grant", "CC-GPU Trustee verdict is not launch-eligible"
+            )
+        for name in (
+            "job_context_digest",
+            "nonce_digest",
+            "channel_binding_digest",
+            "cpu_evidence_digest",
+            "gpu_evidence_digest",
+            "composite_bundle_digest",
+            "gpu_identity_set_digest",
+            "trustee_policy_digest",
+            "runtime_manifest_digest",
+            "verifier_digest",
+        ):
+            _require_digest(verdict_document.get(name), f"CC-GPU Trustee {name}")
+        object.__setattr__(
+            self, "trustee_verdict_document", MappingProxyType(verdict_document)
+        )
+        if self.admission_bundle_digest == self.admission_evidence_digest:
+            raise KeyReleaseError(
+                "invalid_grant", "CC-GPU bundle and verified evidence digests must be distinct"
+            )
+
+    def document(self) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                **self.context.document(),
+                "admission_bundle_digest": self.admission_bundle_digest,
+                "admission_evidence_digest": self.admission_evidence_digest,
+                "admission_nonce_digest": self.admission_nonce_digest,
+                "channel_binding_digest": self.channel_binding_digest,
+                "schema": "cathedral_cc_gpu_key_release_binding_v1",
+                "trustee_verdict": dict(self.trustee_verdict_document),
+                "trustee_verdict_digest": self.trustee_verdict_digest,
+                "workload_manifest_digest": self.workload_manifest_digest,
+            }
+        )
+
+    @classmethod
+    def from_document(cls, document: object) -> CcGpuKeyReleaseBinding:
+        expected = {
+            "admission_bundle_digest",
+            "admission_evidence_digest",
+            "admission_nonce_digest",
+            "attempt_id",
+            "channel_binding_digest",
+            "image_digest",
+            "input_digest",
+            "job_context_digest",
+            "job_id",
+            "model_digest",
+            "policy_digest",
+            "profile_id",
+            "provider",
+            "machine_type",
+            "zone",
+            "cpu_tee",
+            "gpu_model",
+            "gpu_count",
+            "provisioning_model",
+            "profile_authority",
+            "schema",
+            "subject_hotkey",
+            "trustee_verdict",
+            "trustee_verdict_digest",
+            "worker_id",
+            "workload_manifest_digest",
+        }
+        if (
+            not isinstance(document, dict)
+            or set(document) != expected
+            or document.get("schema") != "cathedral_cc_gpu_key_release_binding_v1"
+        ):
+            raise KeyReleaseError("store_corrupt", "persisted CC-GPU binding is invalid")
+        try:
+            context = CcGpuJobContext(
+                worker_id=document["worker_id"],
+                subject_hotkey=document["subject_hotkey"],
+                job_id=document["job_id"],
+                attempt_id=document["attempt_id"],
+                profile_id=document["profile_id"],
+                provider=document["provider"],
+                machine_type=document["machine_type"],
+                zone=document["zone"],
+                cpu_tee=document["cpu_tee"],
+                gpu_model=document["gpu_model"],
+                gpu_count=document["gpu_count"],
+                provisioning_model=document["provisioning_model"],
+                profile_authority=document["profile_authority"],
+                image_digest=document["image_digest"],
+                policy_digest=document["policy_digest"],
+                input_digest=document["input_digest"],
+                model_digest=document["model_digest"],
+            )
+            if document["job_context_digest"] != context.digest:
+                raise KeyReleaseError(
+                    "store_corrupt", "persisted CC-GPU job context is mismatched"
+                )
+            return cls(
+                context=context,
+                workload_manifest_digest=document["workload_manifest_digest"],
+                admission_bundle_digest=document["admission_bundle_digest"],
+                admission_evidence_digest=document["admission_evidence_digest"],
+                admission_nonce_digest=document["admission_nonce_digest"],
+                channel_binding_digest=document["channel_binding_digest"],
+                trustee_verdict_digest=document["trustee_verdict_digest"],
+                trustee_verdict_document=document["trustee_verdict"],
+            )
+        except KeyReleaseError:
+            raise
+        except Exception as exc:
+            raise KeyReleaseError("store_corrupt", "persisted CC-GPU binding is invalid") from exc
+
+
+def _cc_gpu_binding_matches_persisted_verdict(binding: CcGpuKeyReleaseBinding) -> bool:
+    verdict = binding.trustee_verdict_document
+    return bool(
+        binding.admission_evidence_digest == binding.trustee_verdict_digest
+        and verdict["job_context_digest"] == binding.context.digest
+        and verdict["nonce_digest"] == binding.admission_nonce_digest
+        and verdict["subject_hotkey"] == binding.context.subject_hotkey
+        and verdict["channel_binding_digest"] == binding.channel_binding_digest
+        and verdict["profile_id"] == binding.context.profile_id
+        and verdict["profile_authority"] == binding.context.profile_authority
+        and verdict["composite_bundle_digest"] == binding.admission_bundle_digest
+    )
 
 
 @dataclass(frozen=True)
@@ -822,6 +1000,7 @@ class AttestationGrant:
     purpose: str
     issued_at: datetime
     expires_at: datetime
+    cc_gpu_binding: CcGpuKeyReleaseBinding | None = None
     state: GrantState = GrantState.ISSUED
     revision: int = 1
     envelope: EncryptedDataKeyEnvelope | None = None
@@ -870,6 +1049,10 @@ class AttestationGrant:
             raise KeyReleaseError("invalid_grant", "grant redemption time is invalid")
         if self.envelope is not None and self.envelope.grant_id != self.grant_id:
             raise KeyReleaseError("invalid_grant", "grant envelope binding is invalid")
+        if self.cc_gpu_binding is not None and not isinstance(
+            self.cc_gpu_binding, CcGpuKeyReleaseBinding
+        ):
+            raise KeyReleaseError("invalid_grant", "grant CC-GPU binding is invalid")
 
     def public_dict(self) -> Mapping[str, object]:
         return MappingProxyType(
@@ -889,8 +1072,7 @@ class AttestationGrant:
     def binding_document(self) -> Mapping[str, object]:
         """Immutable metadata authenticated by the broker ciphertext AAD."""
 
-        return MappingProxyType(
-            {
+        document: dict[str, object] = {
                 "assignment_id": self.assignment_id,
                 "attestation_policy_digest": self.attestation_policy_digest,
                 "attestation_policy_release": self.attestation_policy_release,
@@ -913,7 +1095,9 @@ class AttestationGrant:
                 "verification_policy_digest": self.verification_policy_digest,
                 "workload_policy_digest": self.workload_policy_digest,
             }
-        )
+        if self.cc_gpu_binding is not None:
+            document["cc_gpu_binding"] = dict(self.cc_gpu_binding.document())
+        return MappingProxyType(document)
 
     @property
     def binding_digest(self) -> str:
@@ -943,6 +1127,11 @@ class AttestationGrant:
                 "attestation_policy_digest": self.attestation_policy_digest,
                 "attestation_policy_release": self.attestation_policy_release,
                 "channel_key_digest": self.channel_key_digest,
+                "cc_gpu_binding": (
+                    dict(self.cc_gpu_binding.document())
+                    if self.cc_gpu_binding is not None
+                    else None
+                ),
                 "data_key_reference_digest": self.data_key_reference_digest,
                 "envelope_digest": self.envelope.digest if self.envelope else None,
                 "evidence_digest": self.evidence_digest,
@@ -1000,6 +1189,7 @@ class KeyReleaseStore:
                         worker_event_id INTEGER NOT NULL,
                         channel_key_digest TEXT NOT NULL,
                         data_key_reference_digest TEXT NOT NULL,
+                        cc_gpu_binding_json BLOB,
                         purpose TEXT NOT NULL,
                         issued_at TEXT NOT NULL,
                         expires_at TEXT NOT NULL,
@@ -1028,6 +1218,13 @@ class KeyReleaseStore:
                     BEGIN SELECT RAISE(ABORT, 'key-release events are append-only'); END;
                     """
                 )
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(key_release_grants)")
+                }
+                if "cc_gpu_binding_json" not in columns:
+                    connection.execute(
+                        "ALTER TABLE key_release_grants ADD COLUMN cc_gpu_binding_json BLOB"
+                    )
         except sqlite3.DatabaseError as exc:
             raise KeyReleaseError("store_unavailable", "key-release store is unavailable") from exc
 
@@ -1069,10 +1266,25 @@ class KeyReleaseStore:
         except (KeyError, KeyReleaseError, TypeError) as exc:
             raise KeyReleaseError("store_corrupt", "persisted key envelope is invalid") from exc
 
+    @staticmethod
+    def _cc_gpu_binding(raw: object) -> CcGpuKeyReleaseBinding | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, bytes) or not raw or len(raw) > 16 * 1024:
+            raise KeyReleaseError("store_corrupt", "persisted CC-GPU binding is invalid")
+        try:
+            document = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise KeyReleaseError("store_corrupt", "persisted CC-GPU binding is invalid") from exc
+        if not isinstance(document, dict) or _canonical_json(document) != raw:
+            raise KeyReleaseError("store_corrupt", "persisted CC-GPU binding is invalid")
+        return CcGpuKeyReleaseBinding.from_document(document)
+
     @classmethod
     def _grant(cls, row: sqlite3.Row) -> AttestationGrant:
         try:
             envelope = cls._envelope(row["envelope_json"])
+            cc_gpu_binding = cls._cc_gpu_binding(row["cc_gpu_binding_json"])
             grant = AttestationGrant(
                 grant_id=row["grant_id"],
                 assignment_id=row["assignment_id"],
@@ -1094,6 +1306,7 @@ class KeyReleaseStore:
                 purpose=row["purpose"],
                 issued_at=parse_utc(row["issued_at"]),
                 expires_at=parse_utc(row["expires_at"]),
+                cc_gpu_binding=cc_gpu_binding,
                 state=GrantState(row["state"]),
                 revision=row["revision"],
                 envelope=envelope,
@@ -1137,6 +1350,7 @@ class KeyReleaseStore:
             grant.worker_event_id,
             grant.channel_key_digest,
             grant.data_key_reference_digest,
+            grant.cc_gpu_binding,
             grant.purpose,
             grant.issued_at,
             grant.expires_at,
@@ -1158,6 +1372,24 @@ class KeyReleaseStore:
                         "grant_conflict", "assignment already has a differently bound grant"
                     )
                 return current
+            if candidate.cc_gpu_binding is not None:
+                persisted_bindings = connection.execute(
+                    "SELECT cc_gpu_binding_json FROM key_release_grants "
+                    "WHERE cc_gpu_binding_json IS NOT NULL"
+                ).fetchall()
+                for persisted_row in persisted_bindings:
+                    persisted = self._cc_gpu_binding(persisted_row["cc_gpu_binding_json"])
+                    assert persisted is not None
+                    if (
+                        persisted.admission_nonce_digest
+                        == candidate.cc_gpu_binding.admission_nonce_digest
+                        or persisted.channel_binding_digest
+                        == candidate.cc_gpu_binding.channel_binding_digest
+                    ):
+                        raise KeyReleaseError(
+                            "replay",
+                            "CC-GPU admission nonce or channel binding was already claimed",
+                        )
             connection.execute(
                 """
                 INSERT INTO key_release_grants(
@@ -1168,8 +1400,8 @@ class KeyReleaseStore:
                     workload_policy_digest,
                     worker_generation, worker_revision,
                     worker_event_id, channel_key_digest, data_key_reference_digest,
-                    purpose, issued_at, expires_at, state, revision
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'issued',1)
+                    cc_gpu_binding_json, purpose, issued_at, expires_at, state, revision
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'issued',1)
                 """,
                 (
                     candidate.grant_id,
@@ -1189,6 +1421,11 @@ class KeyReleaseStore:
                     candidate.worker_event_id,
                     candidate.channel_key_digest,
                     candidate.data_key_reference_digest,
+                    (
+                        _canonical_json(candidate.cc_gpu_binding.document())
+                        if candidate.cc_gpu_binding is not None
+                        else None
+                    ),
                     candidate.purpose,
                     canonical_utc(candidate.issued_at),
                     canonical_utc(candidate.expires_at),
@@ -1343,6 +1580,7 @@ class KeyReleaseService:
             in {
                 "_LOCKED_SECURITY_CONFIGURATION",
                 "_broker",
+                "_cc_gpu_profile_authority_provider",
                 "_clock",
                 "_clock_lock",
                 "_configuration_locked",
@@ -1372,6 +1610,7 @@ class KeyReleaseService:
         sealed_workloads_enabled: bool = False,
         production_mode: bool = True,
         required_broker_configuration_digest: str | None = None,
+        cc_gpu_profile_authority_provider: Callable[[], frozenset[str]] | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         if not isinstance(store, KeyReleaseStore) or not isinstance(registry, RegistryStore):
@@ -1394,6 +1633,10 @@ class KeyReleaseService:
             raise TypeError("key-release feature flags must be booleans")
         if not callable(clock):
             raise TypeError("key-release clock must be callable")
+        if cc_gpu_profile_authority_provider is not None and not callable(
+            cc_gpu_profile_authority_provider
+        ):
+            raise TypeError("CC-GPU profile authority provider must be callable")
         if required_broker_configuration_digest is not None and (
             not isinstance(required_broker_configuration_digest, str)
             or _DIGEST_RE.fullmatch(required_broker_configuration_digest) is None
@@ -1428,6 +1671,7 @@ class KeyReleaseService:
         self._required_broker_configuration_digest = (
             required_broker_configuration_digest
         )
+        self._cc_gpu_profile_authority_provider = cc_gpu_profile_authority_provider
         self._clock = clock
         self._clock_lock = threading.Lock()
         self._last_seen_time: datetime | None = None
@@ -1502,6 +1746,28 @@ class KeyReleaseService:
             )
         return attestation, workload
 
+    def _active_cc_gpu_profile_authorities(self) -> frozenset[str]:
+        provider = self._cc_gpu_profile_authority_provider
+        if provider is None:
+            raise KeyReleaseError(
+                "policy_unavailable", "active CC-GPU profile authority is unavailable"
+            )
+        try:
+            active = provider()
+        except Exception as exc:
+            raise KeyReleaseError(
+                "policy_unavailable", "active CC-GPU profile authority is unavailable"
+            ) from exc
+        if (
+            not isinstance(active, frozenset)
+            or not active
+            or any(not isinstance(value, str) or not value for value in active)
+        ):
+            raise KeyReleaseError(
+                "policy_unavailable", "active CC-GPU profile authority is unavailable"
+            )
+        return active
+
     @staticmethod
     def _measurement_digest(measurement: str) -> str:
         return _digest(b"cathedral-measurement-v1\0" + measurement.encode("utf-8"))
@@ -1521,22 +1787,36 @@ class KeyReleaseService:
 
     def _validate_current(self, grant: AttestationGrant, *, at: datetime) -> None:
         attestation_policy, workload_policy = self._active_policies()
+        cc_gpu_binding = grant.cc_gpu_binding
         if (
             attestation_policy.registry_release != grant.attestation_policy_release
             or attestation_policy.registry_digest != grant.attestation_policy_digest
-            or policy_digest(attestation_policy) != grant.verification_policy_digest
+            or (
+                cc_gpu_binding is None
+                and policy_digest(attestation_policy) != grant.verification_policy_digest
+            )
             or self.policy.digest != grant.key_release_policy_digest
             or workload_policy.digest != grant.workload_policy_digest
-            or grant.measurement_digest
-            not in {
-                self._measurement_digest(measurement)
-                for measurement in attestation_policy.allowed_measurements
-            }
+            or (
+                cc_gpu_binding is None
+                and grant.measurement_digest
+                not in {
+                    self._measurement_digest(measurement)
+                    for measurement in attestation_policy.allowed_measurements
+                }
+            )
         ):
             raise KeyReleaseError("policy_revoked", "grant policy is no longer active")
         lifecycle, record = self._verified_worker_state(grant.worker_hotkey)
         claims = record.assurance
         channel_claim = claims.channel
+        expected_tier = Tier.CC_GPU if cc_gpu_binding is not None else Tier.CC_CPU_TDX
+        if (
+            cc_gpu_binding is not None
+            and cc_gpu_binding.context.profile_authority
+            not in self._active_cc_gpu_profile_authorities()
+        ):
+            raise KeyReleaseError("policy_revoked", "CC-GPU profile authority is no longer active")
         try:
             channel_verified_at = parse_utc(channel_claim.verified_at or "")
             expected_channel_evidence = sha256_digest(
@@ -1560,7 +1840,7 @@ class KeyReleaseService:
             or lifecycle.policy_registry_release != grant.attestation_policy_release
             or lifecycle.policy_registry_digest != grant.attestation_policy_digest
             or lifecycle.policy_digest != grant.verification_policy_digest
-            or record.tier != Tier.CC_CPU_TDX.value
+            or record.tier != expected_tier.value
             or not KEY_RELEASE_POLICY.allows(claims)
             or claims.hardware.evidence_digest != grant.evidence_digest
             or claims.software.policy_digest != lifecycle.policy_digest
@@ -1574,6 +1854,17 @@ class KeyReleaseService:
             > at + timedelta(seconds=self.policy.clock_skew_seconds)
             or at - channel_verified_at
             >= timedelta(seconds=self.policy.max_attestation_age_seconds)
+            or (
+                cc_gpu_binding is not None
+                and (
+                    cc_gpu_binding.context.subject_hotkey != grant.worker_hotkey
+                    or cc_gpu_binding.workload_manifest_digest != grant.manifest_digest
+                    or cc_gpu_binding.admission_evidence_digest != grant.evidence_digest
+                    or cc_gpu_binding.channel_binding_digest
+                    != expected_channel_evidence
+                    or not _cc_gpu_binding_matches_persisted_verdict(cc_gpu_binding)
+                )
+            )
         ):
             raise KeyReleaseError(
                 "attestation_revoked", "worker attestation grant is no longer current"
@@ -1585,9 +1876,18 @@ class KeyReleaseService:
         attested: Attested,
         application_public_key: bytes,
         *,
+        cc_gpu_binding: CcGpuKeyReleaseBinding | None = None,
+        cc_gpu_verdict: TrusteeCompositeVerdict | None = None,
         ttl_seconds: int | None = None,
     ) -> AttestationGrant:
         self._require_enabled()
+        if self.production_mode and (
+            cc_gpu_binding is not None or cc_gpu_verdict is not None
+        ):
+            raise KeyReleaseError(
+                "cc_gpu_external_only",
+                "production CC-GPU release is owned by the external Go KBS",
+            )
         when = self._now()
         self.assignment_authority.verify(assignment, at=when)
         if self.production_mode and not assignment.production_admission:
@@ -1610,15 +1910,41 @@ class KeyReleaseService:
             raise KeyReleaseError("policy_revoked", "workload admission policy changed")
         lifecycle, record = self._verified_worker_state(assignment.worker_hotkey)
         claims = record.assurance
+        expected_tier = Tier.CC_GPU if cc_gpu_binding is not None else Tier.CC_CPU_TDX
+        cc_gpu_binding_valid = (
+            cc_gpu_binding is None
+            and cc_gpu_verdict is None
+            or (
+                isinstance(cc_gpu_binding, CcGpuKeyReleaseBinding)
+                and isinstance(cc_gpu_verdict, TrusteeCompositeVerdict)
+                and cc_gpu_verdict.launch_eligible
+                and cc_gpu_binding.context.subject_hotkey == assignment.worker_hotkey
+                and cc_gpu_binding.workload_manifest_digest == assignment.manifest_digest
+                and cc_gpu_binding.admission_evidence_digest
+                == claims.hardware.evidence_digest
+                and cc_gpu_binding.trustee_verdict_digest == cc_gpu_verdict.digest
+                and _canonical_json(cc_gpu_binding.trustee_verdict_document)
+                == cc_gpu_verdict.canonical_document
+                and _cc_gpu_binding_matches_persisted_verdict(cc_gpu_binding)
+                and isinstance(attested, Attested)
+                and attested.policy_mode == cc_gpu_binding.context.profile_authority
+                and cc_gpu_binding.context.profile_authority
+                in self._active_cc_gpu_profile_authorities()
+            )
+        )
         if (
             not isinstance(attested, Attested)
             or attested.verification_status != "VERIFIED"
-            or attested.tier is not Tier.CC_CPU_TDX
+            or attested.tier is not expected_tier
             or record.hotkey != assignment.worker_hotkey
             or record.chip_id != attested.chip_id
-            or record.tier != Tier.CC_CPU_TDX.value
+            or record.tier != expected_tier.value
             or claims != attested.assurance
-            or attested.measurement not in attestation_policy.allowed_measurements
+            or (
+                expected_tier is Tier.CC_CPU_TDX
+                and attested.measurement not in attestation_policy.allowed_measurements
+            )
+            or not cc_gpu_binding_valid
             or not KEY_RELEASE_POLICY.allows(claims)
             or lifecycle.state is not WorkerLifecycleState.ATTESTED
             or not lifecycle.eligible_at(when)
@@ -1631,7 +1957,10 @@ class KeyReleaseService:
             or lifecycle.evidence_digest != claims.hardware.evidence_digest
             or lifecycle.measurement != attested.measurement
             or lifecycle.policy_digest != claims.software.policy_digest
-            or lifecycle.policy_digest != policy_digest(attestation_policy)
+            or (
+                expected_tier is Tier.CC_CPU_TDX
+                and lifecycle.policy_digest != policy_digest(attestation_policy)
+            )
         ):
             raise KeyReleaseError(
                 "attestation_denied", "worker attestation does not satisfy key-release policy"
@@ -1660,6 +1989,13 @@ class KeyReleaseService:
         ):
             raise KeyReleaseError(
                 "channel_denied", "application key is not bound into fresh attestation"
+            )
+        if (
+            cc_gpu_binding is not None
+            and cc_gpu_binding.channel_binding_digest != channel_claim.evidence_digest
+        ):
+            raise KeyReleaseError(
+                "channel_denied", "CC-GPU grant channel binding does not match attestation"
             )
         try:
             channel_verified_at = parse_utc(channel_claim.verified_at)
@@ -1704,6 +2040,7 @@ class KeyReleaseService:
             purpose=assignment.purpose,
             issued_at=when,
             expires_at=expires_at,
+            cc_gpu_binding=cc_gpu_binding,
         )
         return self.store.create_or_get(candidate)
 
@@ -1754,6 +2091,11 @@ class KeyReleaseService:
                 "invalid_assignment", "production workload assignment is required"
             )
         grant = self.store.get(grant_id)
+        if self.production_mode and grant.cc_gpu_binding is not None:
+            raise KeyReleaseError(
+                "cc_gpu_external_only",
+                "production CC-GPU release is owned by the external Go KBS",
+            )
         if not self._assignment_matches(grant, assignment):
             raise KeyReleaseError("assignment_denied", "grant assignment does not match")
         try:
@@ -1762,9 +2104,15 @@ class KeyReleaseService:
         except (KeyReleaseError, ChannelBindingError) as exc:
             raise KeyReleaseError("channel_denied", "application key is invalid") from exc
         channel_digest = "sha256:" + binding.digest.hex()
+        verified_channel_digest = sha256_digest(binding.canonical_bytes())
         if (
             binding.binding_type is not ChannelBindingType.APPLICATION_KEY_SHA256
             or channel_digest != grant.channel_key_digest
+            or (
+                grant.cc_gpu_binding is not None
+                and verified_channel_digest
+                != grant.cc_gpu_binding.channel_binding_digest
+            )
         ):
             raise KeyReleaseError("channel_denied", "grant application key does not match")
         if when >= grant.expires_at:

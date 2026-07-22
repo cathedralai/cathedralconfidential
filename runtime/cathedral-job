@@ -1,0 +1,279 @@
+#!/usr/bin/python3
+"""Fixed H100 workload for the first Cathedral confidential-GPU profile.
+
+The supervisor, rather than the customer, selects this program.  It consumes
+exactly two attestation-released float32 vectors, multiplies them with an
+embedded CUDA kernel, and emits one bounded canonical result.json.  There is
+deliberately no CPU execution fallback.
+"""
+
+from __future__ import annotations
+
+import array
+import ctypes
+import hashlib
+import json
+import math
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+SCHEMA = "cathedral_cc_gpu_cuda_vector_result_v1"
+OPERATION = "cuda_vector_multiply_f32"
+MAX_VECTOR_BYTES = 256 * 1024 * 1024
+MAX_RESULT_BYTES = 262_144
+
+PTX = rb"""
+.version 8.0
+.target sm_90
+.address_size 64
+
+.visible .entry cathedral_vector_mul_f32(
+    .param .u64 input_ptr,
+    .param .u64 model_ptr,
+    .param .u64 output_ptr,
+    .param .u32 element_count
+)
+{
+    .reg .pred %done;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+
+    ld.param.u64 %rd1, [input_ptr];
+    ld.param.u64 %rd2, [model_ptr];
+    ld.param.u64 %rd3, [output_ptr];
+    ld.param.u32 %r1, [element_count];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %done, %r5, %r1;
+    @%done bra FINISHED;
+    mul.wide.u32 %rd4, %r5, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd6, %rd2, %rd4;
+    add.s64 %rd7, %rd3, %rd4;
+    ld.global.f32 %f1, [%rd5];
+    ld.global.f32 %f2, [%rd6];
+    mul.rn.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd7], %f3;
+FINISHED:
+    ret;
+}
+"""
+
+
+class CUDAError(RuntimeError):
+    pass
+
+
+class CUDADriver:
+    def __init__(self) -> None:
+        try:
+            self.lib = ctypes.CDLL("libcuda.so.1")
+        except OSError as exc:
+            raise CUDAError("NVIDIA CUDA driver library is unavailable") from exc
+        self._bind()
+        self.context = ctypes.c_void_p()
+        self.module = ctypes.c_void_p()
+        self.allocations: list[ctypes.c_uint64] = []
+
+    def _bind(self) -> None:
+        definitions = {
+            "cuInit": ([ctypes.c_uint], ctypes.c_int),
+            "cuDeviceGetCount": ([ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
+            "cuDeviceGet": ([ctypes.POINTER(ctypes.c_int), ctypes.c_int], ctypes.c_int),
+            "cuDeviceGetName": ([ctypes.c_char_p, ctypes.c_int, ctypes.c_int], ctypes.c_int),
+            "cuDriverGetVersion": ([ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
+            "cuCtxCreate_v2": ([ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_int], ctypes.c_int),
+            "cuCtxDestroy_v2": ([ctypes.c_void_p], ctypes.c_int),
+            "cuModuleLoadDataEx": ([ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+            "cuModuleUnload": ([ctypes.c_void_p], ctypes.c_int),
+            "cuModuleGetFunction": ([ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+            "cuMemAlloc_v2": ([ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t], ctypes.c_int),
+            "cuMemFree_v2": ([ctypes.c_uint64], ctypes.c_int),
+            "cuMemcpyHtoD_v2": ([ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t], ctypes.c_int),
+            "cuMemcpyDtoH_v2": ([ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t], ctypes.c_int),
+            "cuLaunchKernel": ([ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p], ctypes.c_int),
+            "cuCtxSynchronize": ([], ctypes.c_int),
+            "cuGetErrorName": ([ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)], ctypes.c_int),
+        }
+        for name, (arguments, result) in definitions.items():
+            function = getattr(self.lib, name)
+            function.argtypes = arguments
+            function.restype = result
+
+    def check(self, code: int, operation: str) -> None:
+        if code == 0:
+            return
+        name = ctypes.c_char_p()
+        if self.lib.cuGetErrorName(code, ctypes.byref(name)) == 0 and name.value:
+            detail = name.value.decode("ascii", "replace")
+        else:
+            detail = f"CUDA_ERROR_{code}"
+        raise CUDAError(f"{operation} failed: {detail}")
+
+    def start_h100(self) -> tuple[str, int]:
+        self.check(self.lib.cuInit(0), "cuInit")
+        count = ctypes.c_int()
+        self.check(self.lib.cuDeviceGetCount(ctypes.byref(count)), "cuDeviceGetCount")
+        if count.value != 1:
+            raise CUDAError("the measured workload requires exactly one CUDA device")
+        device = ctypes.c_int()
+        self.check(self.lib.cuDeviceGet(ctypes.byref(device), 0), "cuDeviceGet")
+        name = ctypes.create_string_buffer(256)
+        self.check(self.lib.cuDeviceGetName(name, len(name), device), "cuDeviceGetName")
+        device_name = name.value.decode("utf-8", "strict")
+        if "H100" not in device_name.upper():
+            raise CUDAError("the measured workload requires an NVIDIA H100")
+        version = ctypes.c_int()
+        self.check(self.lib.cuDriverGetVersion(ctypes.byref(version)), "cuDriverGetVersion")
+        self.check(self.lib.cuCtxCreate_v2(ctypes.byref(self.context), 0, device), "cuCtxCreate")
+        ptx = ctypes.create_string_buffer(PTX)
+        self.check(self.lib.cuModuleLoadDataEx(ctypes.byref(self.module), ctypes.cast(ptx, ctypes.c_void_p), 0, None, None), "cuModuleLoadDataEx")
+        return device_name, version.value
+
+    def allocate(self, size: int) -> ctypes.c_uint64:
+        pointer = ctypes.c_uint64()
+        self.check(self.lib.cuMemAlloc_v2(ctypes.byref(pointer), size), "cuMemAlloc")
+        self.allocations.append(pointer)
+        return pointer
+
+    def vector_multiply(self, left: array.array, right: array.array) -> bytes:
+        size = len(left) * left.itemsize
+        left_device = self.allocate(size)
+        right_device = self.allocate(size)
+        output_device = self.allocate(size)
+        left_view = (ctypes.c_ubyte * size).from_buffer(left)
+        right_view = (ctypes.c_ubyte * size).from_buffer(right)
+        self.check(self.lib.cuMemcpyHtoD_v2(left_device, ctypes.cast(left_view, ctypes.c_void_p), size), "cuMemcpyHtoD(input)")
+        self.check(self.lib.cuMemcpyHtoD_v2(right_device, ctypes.cast(right_view, ctypes.c_void_p), size), "cuMemcpyHtoD(model)")
+        function = ctypes.c_void_p()
+        self.check(self.lib.cuModuleGetFunction(ctypes.byref(function), self.module, b"cathedral_vector_mul_f32"), "cuModuleGetFunction")
+        count = ctypes.c_uint32(len(left))
+        arguments = (ctypes.c_void_p * 4)(
+            ctypes.cast(ctypes.byref(left_device), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(right_device), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(output_device), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(count), ctypes.c_void_p),
+        )
+        blocks = (len(left) + 255) // 256
+        self.check(self.lib.cuLaunchKernel(function, blocks, 1, 1, 256, 1, 1, 0, None, arguments, None), "cuLaunchKernel")
+        self.check(self.lib.cuCtxSynchronize(), "cuCtxSynchronize")
+        output = bytearray(size)
+        output_view = (ctypes.c_ubyte * size).from_buffer(output)
+        self.check(self.lib.cuMemcpyDtoH_v2(ctypes.cast(output_view, ctypes.c_void_p), output_device, size), "cuMemcpyDtoH(output)")
+        return bytes(output)
+
+    def close(self) -> None:
+        for pointer in reversed(self.allocations):
+            if pointer.value:
+                self.lib.cuMemFree_v2(pointer)
+        self.allocations.clear()
+        if self.module.value:
+            self.lib.cuModuleUnload(self.module)
+            self.module = ctypes.c_void_p()
+        if self.context.value:
+            self.lib.cuCtxDestroy_v2(self.context)
+            self.context = ctypes.c_void_p()
+
+
+def read_vector(root: Path, name: str) -> tuple[array.array, str]:
+    path = root / name
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_size < 4 or details.st_size > MAX_VECTOR_BYTES or details.st_size % 4:
+            raise ValueError(f"{name} is not a bounded nonempty float32 vector")
+        digest = hashlib.sha256()
+        values = array.array("f")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            raw = source.read()
+        digest.update(raw)
+        values.frombytes(raw)
+        del raw
+        if sys.byteorder != "little":
+            raise RuntimeError("the measured x86_64 workload requires little-endian input")
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError(f"{name} contains a non-finite float32 value")
+        return values, "sha256:" + digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def exact_directory(env_name: str) -> Path:
+    raw = os.environ.get(env_name, "")
+    path = Path(raw)
+    if not raw or not path.is_absolute() or path.resolve() != path or not path.is_dir():
+        raise RuntimeError(f"{env_name} is not an exact absolute directory")
+    return path
+
+
+def write_result(output_root: Path, document: dict[str, object]) -> None:
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    if not encoded or len(encoded) > MAX_RESULT_BYTES:
+        raise RuntimeError("canonical result.json exceeds its fixed bound")
+    target = output_root / "result.json"
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    complete = False
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as result:
+            result.write(encoded)
+            result.flush()
+            os.fsync(result.fileno())
+        complete = True
+    finally:
+        os.close(descriptor)
+        if not complete:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def main() -> int:
+    if len(sys.argv) != 1:
+        raise RuntimeError("the measured workload accepts no customer arguments")
+    input_root = exact_directory("CATHEDRAL_INPUT_DIR")
+    output_root = exact_directory("CATHEDRAL_OUTPUT_DIR")
+    input_values, input_digest = read_vector(input_root, "input.bin")
+    model_values, model_digest = read_vector(input_root, "model.bin")
+    if len(input_values) != len(model_values):
+        raise ValueError("input.bin and model.bin must have identical element counts")
+    driver = CUDADriver()
+    try:
+        device_name, driver_version = driver.start_h100()
+        output_raw = driver.vector_multiply(input_values, model_values)
+    finally:
+        driver.close()
+    output_values = array.array("f")
+    output_values.frombytes(output_raw)
+    if len(output_values) != len(input_values) or any(not math.isfinite(value) for value in output_values):
+        raise RuntimeError("CUDA output is incomplete or non-finite")
+    total = math.fsum(output_values)
+    document = {
+        "cuda_device_name": device_name,
+        "cuda_driver_version": driver_version,
+        "element_count": len(output_values),
+        "gpu_output_first_f32_hex": [float(value).hex() for value in output_values[:8]],
+        "gpu_output_sha256": "sha256:" + hashlib.sha256(output_raw).hexdigest(),
+        "gpu_output_sum_f64_hex": total.hex(),
+        "input_sha256": input_digest,
+        "model_sha256": model_digest,
+        "operation": OPERATION,
+        "schema": SCHEMA,
+    }
+    write_result(output_root, document)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"fixed CUDA workload failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+from cathedral.cc_gpu import CcGpuCapability, CcGpuReceiptError
 from cathedral.common import (
     ChannelBinding,
     ChannelBindingType,
@@ -260,11 +261,62 @@ def test_worker_capability_negotiation_tracks_customer_sat_mode():
         evidence_collector=_fake_evidence,
     ) as default_server:
         _start_server(default_server)
-        assert RemoteMiner(default_server.base_url, HOTKEY).supports_customer_sat() is False
+        remote = RemoteMiner(default_server.base_url, HOTKEY)
+        assert remote.supports_customer_sat() is False
+        capability = remote.capabilities().cc_gpu
+        assert capability.hardware_class == "confidential_gpu"
+        assert capability.execution_class == "cc_gpu"
+        assert capability.profile_id == "gcp-a3-high-h100-tdx-v1"
+        assert capability.availability == "unavailable"
+        assert capability.launch_gate == "NOT PROVEN"
+        assert capability.customer_jobs is False
 
     with WorkerServer(evidence_collector=_fake_evidence) as customer_server:
         _start_server(customer_server)
         assert RemoteMiner(customer_server.base_url, HOTKEY).supports_customer_sat() is True
+
+
+def test_legacy_cpu_capability_response_synthesizes_unavailable_cc_gpu(monkeypatch):
+    remote = RemoteMiner("http://127.0.0.1:1", HOTKEY)
+    monkeypatch.setattr(
+        remote,
+        "_post_http",
+        lambda *_args, **_kwargs: {"customer_sat": True},
+    )
+    capabilities = remote.capabilities()
+    assert capabilities.customer_sat is True
+    assert capabilities.cc_gpu.availability == "unavailable"
+    assert capabilities.cc_gpu.launch_gate == "NOT PROVEN"
+    assert capabilities.cc_gpu.customer_jobs is False
+
+
+def test_bare_live_digest_cannot_enable_worker_capability():
+    with pytest.raises(CcGpuReceiptError, match="inconsistent"):
+        CcGpuCapability(
+            availability="available",
+            launch_gate="PASS",
+            customer_jobs=True,
+            live_evidence_digest="sha256:" + "a" * 64,
+        )
+
+
+def test_remote_rejects_inconsistent_cc_gpu_capability(monkeypatch):
+    remote = RemoteMiner("http://127.0.0.1:1", HOTKEY)
+    inconsistent = dict(CcGpuCapability().document())
+    inconsistent.update(
+        {
+            "availability": "available",
+            "customer_jobs": True,
+            "live_evidence_digest": "sha256:" + "b" * 64,
+        }
+    )
+    monkeypatch.setattr(
+        remote,
+        "_post_http",
+        lambda *_args, **_kwargs: {"customer_sat": False, "cc_gpu": inconsistent},
+    )
+    with pytest.raises(RemoteError, match="inconsistent"):
+        remote.capabilities()
 
 
 def test_evidence_with_bearer_good_round_trip():
