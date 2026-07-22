@@ -218,6 +218,8 @@ def export_score_class_report(
             checked_previous = automatic_previous
         elif checked_previous != automatic_previous:
             raise ScoreClassError("previous report id does not match the durable export chain")
+    elif checked_previous is not None:
+        raise ScoreClassError("first score-class export must not declare a previous report id")
     rows = snapshot["rows"]
     if not isinstance(rows, tuple) or len(rows) > MAX_REPORT_ENTRIES:
         raise ScoreClassError("score report has too many entries")
@@ -315,6 +317,7 @@ def export_score_class_report(
             class_id=class_id,
             source_id=source_id,
             report_id=_report_id(report),
+            previous_report_id=checked_previous,
             report_body=encoded,
         )
     except LedgerError as exc:
