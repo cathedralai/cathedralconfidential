@@ -11,7 +11,7 @@ cannot satisfy a live or deployed gate.
 | Composite verifier software | Full Go race tests accept valid synthetic Google PKI claims and reject stale, duplicate, mismatched, multi-GPU, CC-off, debug, mutable-image, and channel-substitution cases | PASS |
 | KBS release software | Dedicated admin mTLS, exact keyless registration, signed positive-lifetime policy, TLS-exporter evidence verification, byte-identical release and completion response journaling for exact same-session retry, changed-request rejection, and completion replay fencing pass | PASS |
 | Fixed runtime code | Fixed H100-only CUDA vector job, no CPU fallback, namespace/mount isolation, atomic pre-fork cgroup placement, protected-input decrypt, output sealing, cancellation, and cleanup tests pass | PASS |
-| Native amd64 runtime build | The pinned multi-stage Dockerfile builds and passes the no-H100 fail-closed smoke test on a native amd64 CI runner | NOT PROVEN |
+| Native amd64 runtime build | The pinned multi-stage Dockerfile builds and passes the no-H100 fail-closed smoke test on a native amd64 CI runner | PASS |
 | Production runtime image | The exact CI-reviewed image is published to the protected registry and the launch policy pins its immutable manifest digest | NOT PROVEN |
 | Cross-repository software lifecycle | Polaris focused API/lifecycle tests exercise create, get, cancel, retry, output, evidence, receipt, billing, and failure states against PostgreSQL; the separately tested production command adapter has no simulated fallback | PASS |
 | Validator policy | Synthetic cross-repo export is accepted once and stale, duplicate, hybrid, substituted, or policy-mismatched evidence is rejected | PASS |
