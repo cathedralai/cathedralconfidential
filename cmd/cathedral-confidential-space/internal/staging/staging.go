@@ -681,10 +681,14 @@ func validBucketObject(bucket, object string) bool {
 }
 
 func readSecureCredential(path string, secret bool) ([]byte, error) {
+	return readSecureCredentialWithin(path, secret, string(filepath.Separator))
+}
+
+func readSecureCredentialWithin(path string, secret bool, trustedRoot string) ([]byte, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, errors.New("protected credential path must be absolute and clean")
 	}
-	if err := secureCredentialAncestors(path); err != nil {
+	if err := secureCredentialAncestors(path, trustedRoot); err != nil {
 		return nil, err
 	}
 	descriptor, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
@@ -712,14 +716,22 @@ func readSecureCredential(path string, secret bool) ([]byte, error) {
 	return raw, nil
 }
 
-func secureCredentialAncestors(path string) error {
+func secureCredentialAncestors(path, trustedRoot string) error {
+	trustedRoot = filepath.Clean(trustedRoot)
+	relative, err := filepath.Rel(trustedRoot, path)
+	if !filepath.IsAbs(trustedRoot) || err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("protected credential is outside its trusted path root")
+	}
 	for ancestor := filepath.Dir(path); ; ancestor = filepath.Dir(ancestor) {
 		info, err := os.Lstat(ancestor)
 		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o022 != 0 {
 			return errors.New("protected credential has a symlinked or writable ancestor")
 		}
-		if ancestor == filepath.Dir(ancestor) {
+		if ancestor == trustedRoot {
 			return nil
+		}
+		if ancestor == filepath.Dir(ancestor) {
+			return errors.New("protected credential trusted path root was not reached")
 		}
 	}
 }

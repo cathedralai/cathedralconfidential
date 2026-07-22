@@ -333,20 +333,20 @@ func TestProtectedCredentialRejectsSymlinkAndExposedSecret(t *testing.T) {
 	if err := os.WriteFile(private, []byte("token-value"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if raw, err := readSecureCredential(private, true); err != nil || string(raw) != "token-value" {
+	if raw, err := readSecureCredentialWithin(private, true, directory); err != nil || string(raw) != "token-value" {
 		t.Fatalf("private credential rejected: %v", err)
 	}
 	link := filepath.Join(directory, "token-link")
 	if err := os.Symlink(private, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readSecureCredential(link, true); err == nil {
+	if _, err := readSecureCredentialWithin(link, true, directory); err == nil {
 		t.Fatal("symlinked secret credential was accepted")
 	}
 	if err := os.Chmod(private, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readSecureCredential(private, true); err == nil {
+	if _, err := readSecureCredentialWithin(private, true, directory); err == nil {
 		t.Fatal("group-readable secret credential was accepted")
 	}
 	writable := filepath.Join(directory, "writable")
@@ -360,7 +360,7 @@ func TestProtectedCredentialRejectsSymlinkAndExposedSecret(t *testing.T) {
 	if err := os.WriteFile(writableToken, []byte("token-value"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readSecureCredential(writableToken, true); err == nil {
+	if _, err := readSecureCredentialWithin(writableToken, true, directory); err == nil {
 		t.Fatal("credential below a writable ancestor was accepted")
 	}
 }
