@@ -28,6 +28,7 @@ import ipaddress
 import json
 import os
 import re
+import ssl
 import stat
 import sys
 from collections.abc import Mapping
@@ -36,6 +37,7 @@ from pathlib import Path
 from cathedral import census as census_mod
 from cathedral.attest import collect_tdx_gpu
 from cathedral.assurance import AssuranceDimension
+from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.common import ChannelBinding, ChannelBindingType, Policy, Tier
 from cathedral.enroll import RegistryStore
 from cathedral.gpu import (
@@ -949,11 +951,16 @@ def _run_json(run: EpochRun) -> dict[str, object]:
 
 
 def cmd_worker_serve(args: argparse.Namespace) -> int:
+    tls_certificate = getattr(args, "tls_certificate", None)
+    tls_private_key = getattr(args, "tls_private_key", None)
+    if (tls_certificate is None) != (tls_private_key is None):
+        raise ValueError("worker TLS certificate and private key must be supplied together")
+    tls_enabled = tls_certificate is not None
     try:
         is_loopback = ipaddress.ip_address(args.host).is_loopback
     except ValueError:
         is_loopback = args.host == "localhost"
-    if not is_loopback and not args.development_allow_non_loopback:
+    if not is_loopback and not tls_enabled and not args.development_allow_non_loopback:
         raise ValueError("plain worker HTTP must bind loopback unless development mode is explicit")
     if getattr(args, "development_no_auth", False):
         token = None
@@ -977,6 +984,44 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
             channel_binding = ChannelBinding(ChannelBindingType(binding_type), digest)
         except (TypeError, ValueError):
             raise ValueError("worker channel binding is invalid") from None
+    tls_context = None
+    if tls_enabled:
+        key_path = Path(tls_private_key)
+        try:
+            key_stat = key_path.lstat()
+        except OSError as exc:
+            raise ValueError("worker TLS private key is not readable") from exc
+        if (
+            not stat.S_ISREG(key_stat.st_mode)
+            or stat.S_ISLNK(key_stat.st_mode)
+            or key_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        ):
+            raise ValueError("worker TLS private key must be a regular owner-only file")
+        certificate_path = Path(tls_certificate)
+        try:
+            certificate_pem = certificate_path.read_text(encoding="ascii")
+            match = re.search(
+                r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                certificate_pem,
+                flags=re.DOTALL,
+            )
+            if match is None:
+                raise ValueError
+            certificate_der = ssl.PEM_cert_to_DER_cert(match.group(0))
+            certificate_binding = tls_spki_binding(certificate_der)
+        except (OSError, UnicodeError, ValueError, ChannelBindingError) as exc:
+            raise ValueError("worker TLS certificate is invalid") from exc
+        if channel_binding is not None and channel_binding != certificate_binding:
+            raise ValueError("worker channel binding does not match TLS certificate")
+        channel_binding = certificate_binding
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            tls_context.load_cert_chain(
+                certfile=str(certificate_path), keyfile=str(key_path)
+            )
+        except (OSError, ssl.SSLError) as exc:
+            raise ValueError("worker TLS certificate or private key could not be loaded") from exc
     if not getattr(args, "development_no_auth", False) and channel_binding is None:
         raise ValueError("production worker requires a configured channel binding")
     allow_customer_sat = getattr(args, "allow_customer_sat", False)
@@ -992,11 +1037,21 @@ def cmd_worker_serve(args: argparse.Namespace) -> int:
         configured_hotkey=args.hotkey,
         bearer_token=token,
         channel_binding=channel_binding,
+        tls_context=tls_context,
         evidence_collector=(collect_tdx_gpu if getattr(args, "gpu_composite", False) else None),
         allow_noncanonical_sat=allow_customer_sat,
         allow_non_loopback_for_development=args.development_allow_non_loopback,
     ) as server:
-        print(json.dumps({"host": server.host, "port": server.port, "hotkey": args.hotkey}))
+        print(
+            json.dumps(
+                {
+                    "host": server.host,
+                    "port": server.port,
+                    "hotkey": args.hotkey,
+                    "tls": tls_context is not None,
+                }
+            )
+        )
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -1354,6 +1409,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8081)
     p_serve.add_argument("--bearer-token-env", default=DEFAULT_WORKER_BEARER_ENV)
+    p_serve.add_argument(
+        "--tls-certificate",
+        help="PEM certificate served directly by the worker",
+    )
+    p_serve.add_argument(
+        "--tls-private-key",
+        help="owner-only PEM private key kept inside the worker guest",
+    )
     p_serve.add_argument("--development-no-auth", action="store_true")
     p_serve.add_argument("--development-allow-non-loopback", action="store_true")
     p_serve.add_argument(
