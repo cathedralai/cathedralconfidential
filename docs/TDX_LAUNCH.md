@@ -306,12 +306,16 @@ unless all of the following hold:
 - quote shape and bounds are valid, debug is disabled, and migration is disabled
 - collateral fetches use bounded HTTPS requests to the two required Intel hosts
 
-The TDX TCB Info and TDX QE Identity requests force Intel's `update=early`
-channel. Intel documents that the omitted/default `standard` channel commonly
-lags public-disclosure TCB recovery collateral by 12 months. Version-pinned
-`tcbEvaluationDataNumber` requests are rejected, including after redirects.
+The TDX TCB Info and TDX QE Identity requests force Intel's `update=standard`
+channel, Intel's default production posture. The `early` channel applies TCB
+recovery requirements before cloud fleets can deploy the matching microcode and
+would reject every currently available host; `standard` gives fleets Intel's
+documented deployment window while still failing platforms that miss it.
+The channel is normalized on every request so callers cannot select a different
+one. Version-pinned `tcbEvaluationDataNumber` requests are rejected, including
+after redirects.
 Redirects may use only an allowlisted Intel host, must preserve the collateral
-endpoint and all resource-selecting query values, and have the `early`/no-
+endpoint and all resource-selecting query values, and have the `standard`/no-
 version-pin rules reapplied before the redirected request is sent.
 [Intel PCS API documentation](https://api.portal.trustedservices.intel.com/content/documentation.html)
 

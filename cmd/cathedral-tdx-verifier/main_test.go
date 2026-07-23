@@ -382,8 +382,8 @@ func TestCollateralURLForcesPublicDisclosureChannel(t *testing.T) {
 		if err := prepareIntelCollateralURL(parsed); err != nil {
 			t.Fatalf("prepareIntelCollateralURL(%q) error = %v", raw, err)
 		}
-		if got := parsed.Query().Get("update"); got != "early" {
-			t.Fatalf("prepared collateral update = %q, want early: %s", got, parsed)
+		if got := parsed.Query().Get("update"); got != "standard" {
+			t.Fatalf("prepared collateral update = %q, want standard: %s", got, parsed)
 		}
 	}
 
@@ -419,8 +419,8 @@ func TestCollateralURLForcesPublicDisclosureChannel(t *testing.T) {
 	if err := checkIntelCollateralRedirect(redirect, []*http.Request{source}); err != nil {
 		t.Fatalf("safe collateral redirect rejected: %v", err)
 	}
-	if got := redirect.URL.Query().Get("update"); got != "early" {
-		t.Fatalf("redirect update = %q, want early", got)
+	if got := redirect.URL.Query().Get("update"); got != "standard" {
+		t.Fatalf("redirect update = %q, want standard", got)
 	}
 
 	for name, raw := range map[string]string{
