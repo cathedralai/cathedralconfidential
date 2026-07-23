@@ -8,6 +8,23 @@ Cathedral worker.
 > chain. Testnet SN292 is the non-paying integration lane for proving the same
 > worker, attestation, work, scoring, and UID-mapping path before mainnet.
 
+## The Short Answer
+
+Registration and earning are different:
+
+| State | What it proves |
+|---|---|
+| **Registered** | The hotkey currently maps to a subnet UID |
+| **Reachable** | The validator can authenticate to the HTTPS worker |
+| **Verified** | A fresh, channel-bound Intel TDX quote passes current policy |
+| **Earning** | Verified work gives the miner positive weight in the current signed vector |
+| **Revoked** | Invalid or expired evidence gives the miner zero and returns its allocation to burn |
+
+There is not yet a public `cathedral miner enroll` command. Complete steps 1–6,
+then use the beta request in step 7 for operator-assisted enrollment. A UID,
+open port, self-reported CPU, or historical receipt never makes a miner
+**Verified** or **Earning**.
+
 ## What A Miner Does
 
 A Cathedral miner runs an authenticated worker on an Intel TDX confidential
@@ -130,24 +147,46 @@ openssl rand -hex 32 > "$HOME/.config/cathedral/worker-token"
 export CATHEDRAL_WORKER_BEARER_TOKEN="$(tr -d '\n' < "$HOME/.config/cathedral/worker-token")"
 ```
 
-## 5. Start The Worker
+## 5. Start The HTTPS Worker
 
-The current operator-assisted beta uses a temporary, explicitly marked
-development bind so the selected network's validator can reach the worker:
+Set the worker's public IPv4 address. Create a short-lived TLS certificate whose
+subject alternative names cover both that address and loopback:
+
+```bash
+export PUBLIC_IPV4='<worker-public-ipv4>'
+install -d -m 700 "$HOME/.config/cathedral/tls"
+
+openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 2 \
+  -subj '/CN=cathedral-worker' \
+  -addext "subjectAltName=IP:${PUBLIC_IPV4},IP:127.0.0.1" \
+  -keyout "$HOME/.config/cathedral/tls/worker.key" \
+  -out "$HOME/.config/cathedral/tls/worker.crt"
+
+chmod 600 "$HOME/.config/cathedral/tls/worker.key"
+```
+
+The beta operator pins this certificate out of band. A stable deployment may
+use a certificate from a publicly trusted CA instead. Never disable certificate
+verification.
+
+Start the native TLS worker:
 
 ```bash
 sudo --preserve-env=CATHEDRAL_WORKER_BEARER_TOKEN \
   "$PWD/.venv/bin/cathedral" worker serve \
   --hotkey "$HOTKEY_ADDRESS" \
   --host 0.0.0.0 \
-  --port 8081 \
-  --development-allow-non-loopback
+  --port 8443 \
+  --bearer-token-env CATHEDRAL_WORKER_BEARER_TOKEN \
+  --tls-certificate "$HOME/.config/cathedral/tls/worker.crt" \
+  --tls-private-key "$HOME/.config/cathedral/tls/worker.key" \
+  --allow-customer-sat
 ```
 
 The process prints one startup object and then waits for validator requests:
 
 ```json
-{"host": "0.0.0.0", "port": 8081, "hotkey": "<ss58-hotkey-address>"}
+{"host": "0.0.0.0", "port": 8443, "hotkey": "<ss58-hotkey-address>"}
 ```
 
 The token value is inherited through the environment and does not appear in
@@ -155,12 +194,9 @@ the command arguments. If local `sudo` policy rejects `--preserve-env`, stop and
 configure a root-readable environment file rather than placing the token value
 after `sudo env` or on the command line.
 
-This beta command serves authenticated plain HTTP. Restrict TCP port `8081` to
-the validator source IP in the cloud firewall. Do not expose it to the whole
-internet. The token is not encrypted on the network in this beta and may be
-visible to an on-path observer; the firewall allowlist and prompt rotation are
-mandatory. Production workers will bind to loopback behind HTTPS and will not
-use `--development-allow-non-loopback`.
+Restrict TCP port `8443` to the validator source IP in the cloud firewall. Do
+not expose it to the whole internet. TLS protects the bearer token in transit;
+the firewall allowlist and prompt token rotation remain mandatory.
 
 The configfs TDX collector must be able to create report directories beneath
 `/sys/kernel/config/tsm/report`. The current hardware proof runs the worker with
@@ -182,7 +218,8 @@ export HOTKEY_ADDRESS='<ss58-hotkey-address>'
 export CATHEDRAL_WORKER_BEARER_TOKEN="$(tr -d '\n' < "$HOME/.config/cathedral/worker-token")"
 NONCE="$(openssl rand -hex 32)"
 
-curl -fsS http://127.0.0.1:8081/v1/evidence \
+curl -fsS --cacert "$HOME/.config/cathedral/tls/worker.crt" \
+  https://127.0.0.1:8443/v1/evidence \
   -H "Authorization: Bearer $CATHEDRAL_WORKER_BEARER_TOKEN" \
   -H 'Content-Type: application/json' \
   --data "{\"nonce_hex\":\"$NONCE\",\"assigned_hotkey\":\"$HOTKEY_ADDRESS\"}" \
@@ -212,13 +249,16 @@ values:
 ```text
 network: mainnet SN39 or testnet SN292
 hotkey:  <ss58-hotkey-address registered on that network>
-endpoint: http://<public-ip>:8081
+endpoint: https://<public-ip>:8443
 bearer token: <contents of ~/.config/cathedral/worker-token>
+TLS certificate: <contents of ~/.config/cathedral/tls/worker.crt>
 ```
 
-Do not post the bearer token publicly. The validator uses it only to authenticate
-requests to this worker. Rotate it immediately if it appears in a screenshot,
-shell history shared with others, or a public message.
+Do not post the bearer token or private key publicly. The public certificate is
+not a secret, but send it through the maintainer's private enrollment channel
+so the operator can pin the intended worker. The validator uses the token only
+to authenticate requests to this worker. Rotate it immediately if it appears
+in a screenshot, shell history shared with others, or a public message.
 
 The validator operator will confirm:
 
@@ -260,11 +300,12 @@ the signed vector. Testnet SN292 results never imply token emissions.
 |---|---|
 | `Intel TDX : no` | Wrong VM type, guest kernel, or configfs-tsm support |
 | `configfs-tsm report root not found` | `/sys/kernel/config/tsm/report` is unavailable in the guest |
-| `plain worker HTTP must bind loopback` | Non-loopback HTTP requires the beta-only development flag; production requires HTTPS |
+| `plain worker HTTP must bind loopback` | Supply `--tls-certificate` and `--tls-private-key`; non-loopback mining requires HTTPS |
 | HTTP `401` | Validator and worker bearer tokens differ |
 | HTTP `403 assigned_hotkey mismatch` | Worker was started with a different hotkey address |
 | HTTP `500 evidence collection failed` | Check TDX availability and permission to write the configfs report directory |
-| Endpoint unreachable | Check cloud firewall, public IP, process, and port `8081` |
+| Endpoint unreachable | Check cloud firewall, public IP, process, and port `8443` |
+| Intel TCB `OutOfDate` | The cloud host firmware is behind current Intel PCS policy; move to a current host or wait for the provider update |
 | Enrollment rejected | Confirm the hotkey is registered on the selected subnet and the endpoint uses the expected public IP |
 | `admit=N` | Quote crypto, measurement, TCB, hotkey binding, or platform policy failed |
 | `score=0` | No verified work, stale evidence, failed work, or explicit revocation |
@@ -274,7 +315,6 @@ the signed vector. Testnet SN292 results never imply token emissions.
 The live operator-assisted path still needs:
 
 - public self-service signed enrollment;
-- a production HTTPS worker deployment without development flags;
 - a positive-miner-to-zero on-chain revocation acceptance test; and
 - published self-service policy and onboarding endpoints.
 
