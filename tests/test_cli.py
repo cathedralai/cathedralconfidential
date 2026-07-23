@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import argparse
 import importlib
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.x509.oid import NameOID
 
 from cathedral.cli import (
     DEFAULT_WORKER_BEARER_ENV,
@@ -37,6 +42,37 @@ from cathedral.gpu import (
 from cathedral.ledger import Ledger, LedgerError
 from cathedral.runtime import MinerOutcome
 from cathedral.worker import WorkerServer
+
+
+def _tls_material(tmp_path: Path) -> tuple[Path, Path]:
+    key = Ed25519PrivateKey.generate()
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "worker.example")])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime(2026, 7, 1, tzinfo=UTC))
+        .not_valid_after(datetime(2026, 7, 1, tzinfo=UTC) + timedelta(days=30))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("worker.example")]),
+            critical=False,
+        )
+        .sign(key, algorithm=None)
+    )
+    certificate_path = tmp_path / "worker-cert.pem"
+    private_key_path = tmp_path / "worker-key.pem"
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    private_key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    private_key_path.chmod(0o600)
+    return certificate_path, private_key_path
 
 
 def test_load_policy_supports_strict_tdx_claim_policy(tmp_path: Path):
@@ -718,6 +754,8 @@ def test_worker_serve_defaults_to_loopback():
     assert args.allow_customer_sat is False
     assert args.channel_binding_type is None
     assert args.channel_binding_digest is None
+    assert args.tls_certificate is None
+    assert args.tls_private_key is None
 
 
 def test_worker_serve_refuses_non_loopback_without_development_flag():
@@ -849,6 +887,101 @@ def test_worker_cli_builds_typed_channel_binding(monkeypatch):
 
     assert cmd_worker_serve(args) == 0
     assert calls[0]["channel_binding"].digest == bytes.fromhex("ab" * 32)
+
+
+def test_worker_cli_native_tls_derives_binding_and_allows_non_loopback(
+    tmp_path: Path, monkeypatch
+):
+    calls = []
+
+    class FakeServer:
+        host = "0.0.0.0"
+        port = 8443
+
+        def __init__(self, *_args, **kwargs):
+            calls.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def serve_forever(self):
+            return None
+
+    certificate, private_key = _tls_material(tmp_path)
+    monkeypatch.setattr("cathedral.cli.WorkerServer", FakeServer)
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8443",
+            "--tls-certificate",
+            str(certificate),
+            "--tls-private-key",
+            str(private_key),
+        ]
+    )
+
+    assert cmd_worker_serve(args) == 0
+    assert calls[0]["tls_context"] is not None
+    assert calls[0]["channel_binding"].binding_type.value == "tls_spki_sha256"
+
+
+def test_worker_cli_rejects_binding_that_does_not_match_tls_certificate(
+    tmp_path: Path, monkeypatch
+):
+    certificate, private_key = _tls_material(tmp_path)
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--tls-certificate",
+            str(certificate),
+            "--tls-private-key",
+            str(private_key),
+            "--channel-binding-type",
+            "tls_spki_sha256",
+            "--channel-binding-digest",
+            "ab" * 32,
+        ]
+    )
+
+    with pytest.raises(ValueError, match="does not match TLS certificate"):
+        cmd_worker_serve(args)
+
+
+def test_worker_cli_rejects_non_owner_only_tls_private_key(
+    tmp_path: Path, monkeypatch
+):
+    certificate, private_key = _tls_material(tmp_path)
+    private_key.chmod(0o644)
+    monkeypatch.setenv(DEFAULT_WORKER_BEARER_ENV, "worker-token")
+    args = build_parser().parse_args(
+        [
+            "worker",
+            "serve",
+            "--hotkey",
+            "miner",
+            "--tls-certificate",
+            str(certificate),
+            "--tls-private-key",
+            str(private_key),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="owner-only"):
+        cmd_worker_serve(args)
 
 
 def test_worker_cli_explicitly_enables_authenticated_customer_sat(monkeypatch):
