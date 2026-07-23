@@ -280,6 +280,38 @@ def test_tls_spki_binding_round_trip_before_protected_work(tmp_path: Path):
     assert certificate.assigned_hotkey == HOTKEY
 
 
+def test_native_tls_server_permits_non_loopback_bind(monkeypatch):
+    class FakeHttpServer:
+        def __init__(self, address, _handler):
+            self.server_address = address
+            self.socket = object()
+
+        def shutdown(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    class FakeTlsContext(ssl.SSLContext):
+        def __new__(cls):
+            return super().__new__(cls, ssl.PROTOCOL_TLS_SERVER)
+
+        def wrap_socket(self, socket, *, server_side):
+            assert server_side is True
+            return ("tls", socket)
+
+    monkeypatch.setattr("cathedral.worker.ThreadingHTTPServer", FakeHttpServer)
+
+    with WorkerServer(
+        "0.0.0.0",
+        configured_hotkey=HOTKEY,
+        channel_binding=_binding(),
+        tls_context=FakeTlsContext(),
+    ) as server:
+        assert server.host == "0.0.0.0"
+        assert server.base_url.startswith("https://")
+
+
 def test_tls_worker_remote_round_trip_carries_exact_composite_bundle(tmp_path: Path):
     cert, key, certificate_der = _certificate_pair(tmp_path, "gpu-worker")
     binding = tls_spki_binding(certificate_der)

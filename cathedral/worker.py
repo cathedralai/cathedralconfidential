@@ -478,11 +478,12 @@ def _parse_instance(raw: object) -> SatInstance | None:
 
 
 class WorkerServer:
-    """Expose one miner identity over bounded plain HTTP.
+    """Expose one miner identity over bounded HTTP or native TLS.
 
-    Production deployments must keep this server on loopback behind an HTTPS terminator.
-    SAT work is restricted to deterministic ``SatLane`` canonical backfill by
-    default. Customer-submitted SAT is an explicit authenticated deployment mode.
+    Plain HTTP production deployments must keep this server on loopback behind
+    an HTTPS terminator. Native TLS may bind a non-loopback address. SAT work is
+    restricted to deterministic ``SatLane`` canonical backfill by default.
+    Customer-submitted SAT is an explicit authenticated deployment mode.
     """
 
     def __init__(
@@ -511,7 +512,11 @@ class WorkerServer:
             loopback = host == "localhost"
         if not isinstance(allow_non_loopback_for_development, bool):
             raise ValueError("allow_non_loopback_for_development must be a boolean")
-        if not loopback and not allow_non_loopback_for_development:
+        if (
+            not loopback
+            and tls_context is None
+            and not allow_non_loopback_for_development
+        ):
             raise ValueError("plain worker HTTP must bind a loopback address")
         if (
             not isinstance(configured_hotkey, str)
