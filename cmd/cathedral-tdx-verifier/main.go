@@ -169,10 +169,13 @@ func prepareIntelCollateralURL(parsed *url.URL) error {
 	if query.Has("tcbEvaluationDataNumber") {
 		return errors.New("version-pinned Intel collateral is not accepted")
 	}
-	// Intel's omitted/default "standard" channel can trail public-disclosure
-	// TCB recovery collateral. Launch admission always evaluates the "early"
-	// channel for both TDX TCB Info and TDX QE Identity.
-	query.Set("update", "early")
+	// Launch admission evaluates Intel's "standard" channel for both TDX TCB
+	// Info and TDX QE Identity. Standard is Intel's default production posture;
+	// the "early" channel applies TCB recovery requirements before cloud fleets
+	// can deploy them and would reject all currently available hosts. The
+	// channel is still normalized here so callers cannot select a different
+	// one, and version-pinned collateral remains rejected.
+	query.Set("update", "standard")
 	parsed.RawQuery = query.Encode()
 	return nil
 }
