@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 
-from cathedral.cli import _outcome_json, _run_json, build_parser, main
+from cathedral.cli import _outcome_json, _run_json, main
 from cathedral.runtime import EpochRun, MinerOutcome
 
 SECRET = "sk-live-abc123XYZsupersecret"

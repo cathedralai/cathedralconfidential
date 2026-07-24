@@ -23,7 +23,6 @@ from cathedral.cli import (
     _sanitize_error,
     _utc_ts,
     build_parser,
-    _REDACT_PATTERNS,
 )
 from cathedral.runtime import MAX_BEARER_TOKEN_LENGTH, EpochRun, MinerOutcome, MinerTarget
 
@@ -259,7 +258,11 @@ class TestFormatRunPrettySuccess:
 
     def test_pub_field_per_worker_line(self):
         text = self._format(published=False)
-        worker_lines = [l for l in text.splitlines() if "OK  " in l or "ZERO" in l or "FAIL" in l]
+        worker_lines = [
+            line
+            for line in text.splitlines()
+            if "OK  " in line or "ZERO" in line or "FAIL" in line
+        ]
         assert worker_lines, "expected at least one worker line"
         for line in worker_lines:
             assert "pub=NO" in line
@@ -272,7 +275,7 @@ class TestFormatRunPrettySuccess:
 
     def test_no_error_part_for_clean_outcome(self):
         text = self._format()
-        worker_lines = [l for l in text.splitlines() if "OK  " in l]
+        worker_lines = [line for line in text.splitlines() if "OK  " in line]
         assert worker_lines
         assert "err=" not in worker_lines[0]
 

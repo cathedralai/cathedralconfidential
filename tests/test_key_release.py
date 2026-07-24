@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
+import json
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
@@ -23,12 +25,22 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from cathedral.assurance import attestation_claims, policy_digest, with_verified_channel
 from cathedral.channel import application_key_binding
-from cathedral.common import Attested, ChannelBinding, ChannelBindingType, Policy, Tier
+from cathedral.cc_gpu import CcGpuJobContext
+from cathedral.common import (
+    Attested,
+    ChannelBinding,
+    ChannelBindingType,
+    Evidence,
+    EvidenceKind,
+    Policy,
+    Tier,
+)
 from cathedral.enroll import RegistryStore
 from cathedral.key_release import (
     BrokerCustodyBoundary,
     BrokerPreflight,
     BrokerRedemptionRequest,
+    CcGpuKeyReleaseBinding,
     EncryptedDataKeyEnvelope,
     GrantState,
     KeyReleaseError,
@@ -39,6 +51,17 @@ from cathedral.key_release import (
     WorkloadAssignmentAuthority,
 )
 from cathedral.lifecycle import LifecycleReason, WorkerLifecycleState, canonical_utc
+from cathedral.policy_registry import canonical_json
+from cathedral.trustee import (
+    TRUSTEE_BACKEND,
+    TRUSTEE_PREFLIGHT_SCHEMA,
+    TRUSTEE_RESULT_SCHEMA,
+    TRUSTEE_RUNTIME_MANIFEST_SCHEMA,
+    TrusteeCompositeAdapter,
+    TrusteeCompositeVerdict,
+    sign_trustee_runtime_manifest,
+    verify_trustee_runtime_manifest,
+)
 from cathedral.workload import (
     ExternalSignatureVerifier,
     ExternalVerifierConfig,
@@ -66,6 +89,14 @@ HOTKEY = "worker-hotkey"
 DATA_KEY_REFERENCE = "kms/customer/project/data-key-7"
 PLAINTEXT_DATA_KEY = b"customer-data-key-material-32byte"
 BROKER_CONFIG_DIGEST = "sha256:" + "6" * 64
+GPU_PROFILE_AUTHORITY = (
+    "gpu-profile:gcp-a3-high-h100-tdx-v1@profile=sha256:"
+    + "7" * 64
+    + "@release=7@registry="
+    + REGISTRY_DIGEST
+)
+GPU_TRUSTEE_POLICY_DIGEST = "sha256:" + "8" * 64
+GPU_ADMISSION_NONCE = b"cc-gpu-admission-nonce-32-byte!!"
 
 
 @dataclass
@@ -254,6 +285,231 @@ def _service_with_broker(harness: Harness, broker) -> KeyReleaseService:
     )
 
 
+def _gpu_context(harness: Harness, **context_changes) -> CcGpuJobContext:
+    context_values = {
+        "worker_id": "11111111-1111-4111-8111-111111111111",
+        "subject_hotkey": HOTKEY,
+        "job_id": "88888888-8888-4888-8888-888888888888",
+        "attempt_id": "99999999-9999-4999-8999-999999999999",
+        "profile_id": "gcp-a3-high-h100-tdx-v1",
+        "provider": "gcp",
+        "machine_type": "a3-highgpu-1g",
+        "zone": "us-central1-a",
+        "cpu_tee": "intel_tdx",
+        "gpu_model": "nvidia_h100_80gb",
+        "gpu_count": 1,
+        "provisioning_model": "spot",
+        "profile_authority": GPU_PROFILE_AUTHORITY,
+        "image_digest": IMAGE_DIGEST,
+        "policy_digest": harness.workload_policy.digest,
+        "input_digest": "sha256:" + "a" * 64,
+        "model_digest": "sha256:" + "b" * 64,
+    }
+    context_values.update(context_changes)
+    return CcGpuJobContext(**context_values)
+
+
+class _TrusteeRunner:
+    def __init__(self, manifest_digest: str, verifier_digest: str) -> None:
+        self.manifest_digest = manifest_digest
+        self.verifier_digest = verifier_digest
+
+    def _invoke(self, request):
+        if request["operation"] == "preflight":
+            return {
+                "artifact_manifest_digest": self.manifest_digest,
+                "backend": TRUSTEE_BACKEND,
+                "profile_authority": GPU_PROFILE_AUTHORITY,
+                "profile_id": "gcp-a3-high-h100-tdx-v1",
+                "protocol_version": 1,
+                "schema": TRUSTEE_PREFLIGHT_SCHEMA,
+                "status": "ready",
+                "trustee_policy_digest": GPU_TRUSTEE_POLICY_DIGEST,
+            }
+        return {
+            "backend": TRUSTEE_BACKEND,
+            "channel_binding_digest": request["channel_binding_digest"],
+            "composite_bundle_digest": "sha256:" + "c" * 64,
+            "cpu_evidence_digest": "sha256:" + "d" * 64,
+            "cpu_tee": "tdx",
+            "evidence_fresh": True,
+            "gpu_cc_mode_verified": True,
+            "gpu_evidence_digest": "sha256:" + "e" * 64,
+            "gpu_identity_set_digest": "sha256:" + "f" * 64,
+            "gpu_ready_state_verified": True,
+            "gpu_tee": "nvidia_cc",
+            "job_context_digest": request["job_context_digest"],
+            "measurement_policy_verified": True,
+            "nonce_digest": "sha256:" + hashlib.sha256(
+                bytes.fromhex(request["nonce_hex"])
+            ).hexdigest(),
+            "profile_authority": GPU_PROFILE_AUTHORITY,
+            "profile_id": "gcp-a3-high-h100-tdx-v1",
+            "runtime_isolation_verified": True,
+            "runtime_manifest_digest": self.manifest_digest,
+            "same_guest_verified": True,
+            "schema": TRUSTEE_RESULT_SCHEMA,
+            "secret_release_authorized": True,
+            "subject_hotkey": HOTKEY,
+            "trustee_policy_digest": GPU_TRUSTEE_POLICY_DIGEST,
+            "verdict": "verified",
+            "verifier_digest": self.verifier_digest,
+        }
+
+
+def _gpu_trustee_verdict(
+    harness: Harness,
+    context: CcGpuJobContext,
+    *,
+    nonce: bytes = GPU_ADMISSION_NONCE,
+    application_public_key: bytes | None = None,
+    runtime_manifest_enabled: bool = True,
+) -> TrusteeCompositeVerdict:
+    key = application_public_key or harness.application_public_key
+    channel_binding = application_key_binding(key)
+    directory = Path(harness.store.path).parent
+    artifacts = []
+    for name, role, content, mode in (
+        ("trustee-bridge", "executable", b"bridge-v1", 0o700),
+        ("ld-linux-x86-64.so.2", "loader", b"loader-v1", 0o600),
+        ("libnvat.so", "dependency", b"nvat-v1", 0o600),
+    ):
+        path = directory / name
+        path.write_bytes(content)
+        path.chmod(mode)
+        artifacts.append(
+            {
+                "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+                "path": str(path),
+                "role": role,
+            }
+        )
+    seed = bytes(range(32))
+    public_key = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    signed = sign_trustee_runtime_manifest(
+        {
+            "artifacts": artifacts,
+            "dependency_closure_complete": True,
+            "profile_authority": GPU_PROFILE_AUTHORITY,
+            "profile_id": "gcp-a3-high-h100-tdx-v1",
+            "release": 1,
+            "schema": TRUSTEE_RUNTIME_MANIFEST_SCHEMA,
+            "signing_key_id": "key-release-trustee-test",
+            "trustee_policy_digest": GPU_TRUSTEE_POLICY_DIGEST,
+            "valid_from": "2026-07-17T10:00:00.000000Z",
+            "valid_until": "2026-07-18T10:00:00.000000Z",
+        },
+        seed,
+    )
+    manifest = verify_trustee_runtime_manifest(
+        canonical_json(signed),
+        {"key-release-trustee-test": public_key},
+        at=START,
+        require_root_owned=False,
+    )
+    runner = _TrusteeRunner(manifest.digest, manifest.executable_digest)
+    adapter = TrusteeCompositeAdapter(
+        ExternalVerifierConfig((manifest.executable_path,)),
+        profile_id=context.profile_id,
+        profile_authority=context.profile_authority,
+        trustee_policy_digest=GPU_TRUSTEE_POLICY_DIGEST,
+        artifact_manifest_digest=manifest.digest,
+        runtime_manifest=manifest if runtime_manifest_enabled else None,
+        runner=runner,
+    )
+    adapter.preflight()
+    tdx = Evidence(
+        EvidenceKind.TDX,
+        b"tdx-quote",
+        nonce,
+        HOTKEY,
+        [b"tdx-cert"],
+        report_data_version=2,
+        channel_binding=channel_binding,
+    )
+    gpu = Evidence(
+        EvidenceKind.GPU_CC,
+        b"gpu-quote",
+        nonce,
+        HOTKEY,
+        [b"gpu-cert"],
+        report_data_version=2,
+        channel_binding=channel_binding,
+    )
+    return adapter.verify(
+        context=context,
+        nonce=nonce,
+        channel_binding=channel_binding,
+        tdx_evidence=tdx,
+        gpu_evidence=gpu,
+    )
+
+
+def _enable_gpu_release(
+    harness: Harness,
+    *,
+    nonce: bytes = GPU_ADMISSION_NONCE,
+    application_public_key: bytes | None = None,
+    **context_changes,
+) -> tuple[TrusteeCompositeVerdict, CcGpuKeyReleaseBinding]:
+    context = _gpu_context(harness, **context_changes)
+    verdict = _gpu_trustee_verdict(
+        harness,
+        context,
+        nonce=nonce,
+        application_public_key=application_public_key,
+    )
+    channel_key = application_public_key or harness.application_public_key
+    assurance = with_verified_channel(
+        harness.attested.assurance,
+        application_key_binding(channel_key).canonical_bytes(),
+        verified_at=canonical_utc(harness.clock.now),
+    )
+    hardware = dataclasses.replace(
+        assurance.hardware,
+        evidence_digest=verdict.digest,
+    )
+    assurance = dataclasses.replace(assurance, hardware=hardware)
+    harness.attested = dataclasses.replace(
+        harness.attested,
+        tier=Tier.CC_GPU,
+        policy_mode=GPU_PROFILE_AUTHORITY,
+        assurance=assurance,
+    )
+    harness.registry.record_verdict(
+        HOTKEY,
+        harness.attested,
+        policy_registry_release=7,
+        policy_registry_digest=REGISTRY_DIGEST,
+    )
+    harness.service = KeyReleaseService(
+        harness.store,
+        harness.registry,
+        harness.authority,
+        harness.broker,
+        lambda: harness.active["attestation"],  # type: ignore[return-value]
+        lambda: harness.active["workload"],  # type: ignore[return-value]
+        sealed_workloads_enabled=True,
+        production_mode=False,
+        cc_gpu_profile_authority_provider=lambda: frozenset({GPU_PROFILE_AUTHORITY}),
+        clock=harness.clock,
+    )
+    binding = CcGpuKeyReleaseBinding(
+        context=context,
+        workload_manifest_digest=harness.assignment.manifest_digest,
+        admission_bundle_digest=verdict.composite_bundle_digest,
+        admission_evidence_digest=verdict.digest,
+        admission_nonce_digest=verdict.nonce_digest,
+        channel_binding_digest=verdict.channel_binding_digest,
+        trustee_verdict_digest=verdict.digest,
+        trustee_verdict_document=json.loads(verdict.canonical_document),
+    )
+    return verdict, binding
+
+
 class ProductionSignatureVerifier:
     production_capable = True
 
@@ -342,6 +598,342 @@ def test_valid_grant_releases_only_ciphertext_decryptable_by_attested_key(tmp_pa
         "redeeming",
         "redeemed",
     ]
+
+
+def test_cc_gpu_grant_requires_and_persists_exact_composite_job_binding(tmp_path: Path):
+    harness = _harness(tmp_path)
+    verdict, binding = _enable_gpu_release(harness)
+
+    with pytest.raises(KeyReleaseError, match="does not satisfy"):
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+        )
+    with pytest.raises(KeyReleaseError, match="does not satisfy"):
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+            cc_gpu_binding=binding,
+        )
+
+    grant = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+        cc_gpu_binding=binding,
+        cc_gpu_verdict=verdict,
+    )
+    assert grant.cc_gpu_binding == binding
+    assert grant.binding_document()["cc_gpu_binding"] == dict(binding.document())
+    assert harness.store.get(grant.grant_id).cc_gpu_binding == binding
+    assert binding.trustee_verdict_digest == verdict.digest
+    assert binding.trustee_verdict_document == json.loads(verdict.canonical_document)
+    envelope = harness.service.redeem(
+        grant.grant_id,
+        harness.assignment,
+        harness.application_public_key,
+    )
+    assert envelope.grant_id == grant.grant_id
+
+
+def test_production_python_trustee_refuses_cc_gpu_release(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    verdict, binding = _enable_gpu_release(harness)
+
+    class ReadyBroker:
+        def preflight(self):
+            return BrokerPreflight(
+                configuration_digest=BROKER_CONFIG_DIGEST,
+                custody_boundary=BrokerCustodyBoundary.EXTERNAL_KMS,
+                ciphertext_only=True,
+                durable_idempotency=True,
+                request_binding=True,
+            )
+
+        def redeem(self, _request):
+            raise AssertionError("production Python trustee must not receive CC-GPU keys")
+
+    service = KeyReleaseService(
+        harness.store,
+        harness.registry,
+        _production_authority(),
+        ReadyBroker(),
+        lambda: harness.attestation_policy,
+        lambda: harness.workload_policy,
+        sealed_workloads_enabled=True,
+        production_mode=True,
+        required_broker_configuration_digest=BROKER_CONFIG_DIGEST,
+        clock=harness.clock,
+    )
+    with pytest.raises(KeyReleaseError) as raised:
+        service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+            cc_gpu_binding=binding,
+            cc_gpu_verdict=verdict,
+        )
+    assert raised.value.category == "cc_gpu_external_only"
+
+
+def test_cc_gpu_key_release_rejects_cross_job_profile_and_cpu_downgrade(tmp_path: Path):
+    harness = _harness(tmp_path)
+    generic_relabel = dataclasses.replace(
+        harness.attested,
+        tier=Tier.CC_GPU,
+        policy_mode=GPU_PROFILE_AUTHORITY,
+    )
+    verdict, binding = _enable_gpu_release(harness)
+    cpu_attested = dataclasses.replace(harness.attested, tier=Tier.CC_CPU_TDX)
+    with pytest.raises(KeyReleaseError, match="does not satisfy"):
+        harness.service.issue_grant(
+            harness.assignment,
+            cpu_attested,
+            harness.application_public_key,
+            cc_gpu_binding=binding,
+            cc_gpu_verdict=verdict,
+        )
+    with pytest.raises(KeyReleaseError, match="does not satisfy"):
+        harness.service.issue_grant(
+            harness.assignment,
+            generic_relabel,
+            harness.application_public_key,
+            cc_gpu_binding=binding,
+            cc_gpu_verdict=verdict,
+        )
+
+    wrong_worker = dataclasses.replace(
+        binding,
+        context=dataclasses.replace(binding.context, subject_hotkey="other-worker"),
+    )
+    with pytest.raises(KeyReleaseError, match="does not satisfy"):
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+            cc_gpu_binding=wrong_worker,
+            cc_gpu_verdict=verdict,
+        )
+    wrong_profile = dataclasses.replace(
+        binding,
+        context=dataclasses.replace(
+            binding.context,
+            profile_authority=(
+                "gpu-profile:gcp-a3-high-h100-tdx-v1@profile=sha256:"
+                + "d" * 64
+                + "@release=7@registry="
+                + REGISTRY_DIGEST
+            ),
+        ),
+    )
+    with pytest.raises(KeyReleaseError, match="does not satisfy"):
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+            cc_gpu_binding=wrong_profile,
+            cc_gpu_verdict=verdict,
+        )
+
+
+def test_cc_gpu_key_release_rejects_mismatched_issue_and_redeem_channels(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    verdict, binding = _enable_gpu_release(harness)
+    wrong_channel = dataclasses.replace(
+        binding, channel_binding_digest="sha256:" + "e" * 64
+    )
+    with pytest.raises(KeyReleaseError, match="does not satisfy"):
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+            cc_gpu_binding=wrong_channel,
+            cc_gpu_verdict=verdict,
+        )
+    grant = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+        cc_gpu_binding=binding,
+        cc_gpu_verdict=verdict,
+    )
+    with sqlite3.connect(harness.store.path) as connection:
+        row = connection.execute(
+            "SELECT cc_gpu_binding_json FROM key_release_grants WHERE grant_id = ?",
+            (grant.grant_id,),
+        ).fetchone()
+        assert row is not None
+        document = json.loads(row[0])
+        document["channel_binding_digest"] = "sha256:" + "e" * 64
+        connection.execute(
+            "UPDATE key_release_grants SET cc_gpu_binding_json = ? WHERE grant_id = ?",
+            (
+                json.dumps(
+                    document,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                ).encode(),
+                grant.grant_id,
+            ),
+        )
+    with pytest.raises(KeyReleaseError, match="application key does not match"):
+        harness.service.redeem(
+            grant.grant_id,
+            harness.assignment,
+            harness.application_public_key,
+        )
+
+
+def test_cc_gpu_key_release_rejects_fabricated_and_non_launch_verdicts(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    verdict, binding = _enable_gpu_release(harness)
+    fabricated_document = json.loads(verdict.canonical_document)
+    fabricated_document["verifier_digest"] = "sha256:" + "0" * 64
+    fabricated_digest = "sha256:" + hashlib.sha256(
+        canonical_json(fabricated_document)
+    ).hexdigest()
+    fabricated_binding = dataclasses.replace(
+        binding,
+        admission_evidence_digest=fabricated_digest,
+        trustee_verdict_digest=fabricated_digest,
+        trustee_verdict_document=fabricated_document,
+    )
+    with pytest.raises(KeyReleaseError, match="does not satisfy"):
+        harness.service.issue_grant(
+            harness.assignment,
+            harness.attested,
+            harness.application_public_key,
+            cc_gpu_binding=fabricated_binding,
+            cc_gpu_verdict=verdict,
+        )
+
+    context = _gpu_context(harness)
+    non_launch = _gpu_trustee_verdict(
+        harness,
+        context,
+        runtime_manifest_enabled=False,
+    )
+    assert non_launch.launch_eligible is False
+    with pytest.raises(KeyReleaseError, match="not launch-eligible"):
+        CcGpuKeyReleaseBinding(
+            context=context,
+            workload_manifest_digest=harness.assignment.manifest_digest,
+            admission_bundle_digest=non_launch.composite_bundle_digest,
+            admission_evidence_digest=non_launch.digest,
+            admission_nonce_digest=non_launch.nonce_digest,
+            channel_binding_digest=non_launch.channel_binding_digest,
+            trustee_verdict_digest=non_launch.digest,
+            trustee_verdict_document=json.loads(non_launch.canonical_document),
+        )
+
+def test_cc_gpu_key_release_rejects_replayed_channel_across_jobs(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    first_verdict, first_binding = _enable_gpu_release(harness)
+    harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+        cc_gpu_binding=first_binding,
+        cc_gpu_verdict=first_verdict,
+    )
+    second_assignment = harness.authority.issue(
+        authenticated_issuer_id="customer-account-7",
+        worker_hotkey=HOTKEY,
+        workload=harness.workload_controller.admit(_workload_request()),
+        data_key_reference=DATA_KEY_REFERENCE,
+    )
+    second_verdict, second_binding = _enable_gpu_release(
+        harness,
+        nonce=b"next-cc-gpu-admission-nonce-32!!",
+        job_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        attempt_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    )
+    with pytest.raises(KeyReleaseError, match="already claimed"):
+        harness.service.issue_grant(
+            second_assignment,
+            harness.attested,
+            harness.application_public_key,
+            cc_gpu_binding=second_binding,
+            cc_gpu_verdict=second_verdict,
+        )
+
+
+def test_cc_gpu_key_release_rejects_replayed_nonce_across_fresh_channels(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    first_verdict, first_binding = _enable_gpu_release(harness)
+    harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+        cc_gpu_binding=first_binding,
+        cc_gpu_verdict=first_verdict,
+    )
+
+    second_private_key = X25519PrivateKey.generate()
+    second_public_key = _public_bytes(second_private_key)
+    second_assignment = harness.authority.issue(
+        authenticated_issuer_id="customer-account-7",
+        worker_hotkey=HOTKEY,
+        workload=harness.workload_controller.admit(_workload_request()),
+        data_key_reference=DATA_KEY_REFERENCE,
+    )
+    second_verdict, second_binding = _enable_gpu_release(
+        harness,
+        nonce=GPU_ADMISSION_NONCE,
+        application_public_key=second_public_key,
+        job_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        attempt_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    )
+    with pytest.raises(KeyReleaseError, match="already claimed"):
+        harness.service.issue_grant(
+            second_assignment,
+            harness.attested,
+            second_public_key,
+            cc_gpu_binding=second_binding,
+            cc_gpu_verdict=second_verdict,
+        )
+
+
+def test_cc_gpu_profile_revocation_blocks_redemption(tmp_path: Path):
+    harness = _harness(tmp_path)
+    verdict, binding = _enable_gpu_release(harness)
+    active = {GPU_PROFILE_AUTHORITY}
+    harness.service = KeyReleaseService(
+        harness.store,
+        harness.registry,
+        harness.authority,
+        harness.broker,
+        lambda: harness.active["attestation"],  # type: ignore[return-value]
+        lambda: harness.active["workload"],  # type: ignore[return-value]
+        sealed_workloads_enabled=True,
+        production_mode=False,
+        cc_gpu_profile_authority_provider=lambda: frozenset(active),
+        clock=harness.clock,
+    )
+    grant = harness.service.issue_grant(
+        harness.assignment,
+        harness.attested,
+        harness.application_public_key,
+        cc_gpu_binding=binding,
+        cc_gpu_verdict=verdict,
+    )
+    active.clear()
+    with pytest.raises(KeyReleaseError, match="authority"):
+        harness.service.redeem(
+            grant.grant_id,
+            harness.assignment,
+            harness.application_public_key,
+        )
 
 
 def test_grant_contains_exact_assignment_policy_lifecycle_and_channel_bindings(tmp_path: Path):

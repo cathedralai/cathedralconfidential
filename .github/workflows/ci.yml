@@ -75,3 +75,55 @@ jobs:
             exit 1
           fi
           test ! -s rejected.stdout
+
+  cc-gpu-runtime:
+    name: Confidential GPU runtime (native amd64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25.12"
+          cache: false
+
+      - name: Test and vet the composite verifier, KBS, stager, and supervisor
+        working-directory: cmd/cathedral-confidential-space
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          test "$(go env GOVERSION)" = go1.25.12
+          go mod verify
+          go vet ./...
+          go test -race ./...
+
+      - name: Vulnerability scan
+        working-directory: cmd/cathedral-confidential-space
+        env:
+          GOTOOLCHAIN: local
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Build the pinned production runtime image
+        env:
+          CONFIG_SIGNING_KEY_ID: ci-config-key
+          # RFC 8032 test-vector public key; CI proves image construction only.
+          CONFIG_SIGNING_PUBLIC_KEY_BASE64: 11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=
+          WORKLOAD_ATTESTATION_AUDIENCE: https://ci.cathedral.invalid/cc-gpu
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /tmp/cathedral-ci-kbs.key \
+            -out /tmp/cathedral-ci-kbs.pem \
+            -subj /CN=cathedral-ci-kbs \
+            -days 1
+          docker build \
+            --platform linux/amd64 \
+            --secret id=kbs_root_ca,src=/tmp/cathedral-ci-kbs.pem \
+            --build-arg CONFIG_SIGNING_KEY_ID="$CONFIG_SIGNING_KEY_ID" \
+            --build-arg CONFIG_SIGNING_PUBLIC_KEY_BASE64="$CONFIG_SIGNING_PUBLIC_KEY_BASE64" \
+            --build-arg WORKLOAD_ATTESTATION_AUDIENCE="$WORKLOAD_ATTESTATION_AUDIENCE" \
+            --tag cathedral-cc-gpu-runtime:ci \
+            --file runtime/Dockerfile \
+            .
+          runtime/smoke-container.sh cathedral-cc-gpu-runtime:ci
+          docker image inspect --format 'image_id={{.Id}}' cathedral-cc-gpu-runtime:ci

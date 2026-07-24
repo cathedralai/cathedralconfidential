@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
 from cathedral.attest import collect_tdx
+from cathedral.cc_gpu import CcGpuCapability
 from cathedral.common import (
     ChannelBinding,
     ChannelBindingType,
@@ -177,6 +178,7 @@ def _make_handler(
     max_response_body: int,
     request_timeout: float,
     allow_noncanonical_sat: bool,
+    cc_gpu_capability_provider: Callable[[], CcGpuCapability],
 ) -> type[BaseHTTPRequestHandler]:
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
@@ -276,7 +278,19 @@ def _make_handler(
                 if set(body) != _CAPABILITIES_REQUEST_KEYS:
                     self._send_json(400, {"error": "invalid capabilities schema"})
                 else:
-                    self._send_json(200, {"customer_sat": allow_noncanonical_sat})
+                    try:
+                        cc_gpu_capability = cc_gpu_capability_provider()
+                    except Exception:
+                        cc_gpu_capability = CcGpuCapability()
+                    if not isinstance(cc_gpu_capability, CcGpuCapability):
+                        cc_gpu_capability = CcGpuCapability()
+                    self._send_json(
+                        200,
+                        {
+                            "customer_sat": allow_noncanonical_sat,
+                            "cc_gpu": dict(cc_gpu_capability.document()),
+                        },
+                    )
             elif path == "/v1/sat-work":
                 self._handle_sat_work(body)
             else:
@@ -504,6 +518,7 @@ class WorkerServer:
         max_response_body: int = MAX_RESPONSE_BODY,
         timeout: float = 10.0,
         allow_noncanonical_sat: bool = False,
+        cc_gpu_capability_provider: Callable[[], CcGpuCapability] | None = None,
         allow_non_loopback_for_development: bool = False,
     ) -> None:
         try:
@@ -547,6 +562,10 @@ class WorkerServer:
             raise ValueError("timeout must be a positive finite number")
         if not isinstance(allow_noncanonical_sat, bool):
             raise ValueError("allow_noncanonical_sat must be a boolean")
+        if cc_gpu_capability_provider is not None and not callable(
+            cc_gpu_capability_provider
+        ):
+            raise ValueError("cc_gpu_capability_provider must be callable")
         if channel_binding is not None and not isinstance(
             channel_binding, ChannelBinding
         ):
@@ -573,6 +592,7 @@ class WorkerServer:
             max_response_body,
             float(timeout),
             allow_noncanonical_sat,
+            cc_gpu_capability_provider or CcGpuCapability,
         )
         self._server = ThreadingHTTPServer((host, port), handler)
         self._tls_enabled = tls_context is not None

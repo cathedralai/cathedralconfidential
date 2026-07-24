@@ -10,8 +10,10 @@ import string
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Callable
 
+from cathedral.cc_gpu import CcGpuCapability, CcGpuReceiptError
 from cathedral.channel import ChannelBindingError, tls_spki_binding
 from cathedral.common import (
     ChannelBinding,
@@ -44,12 +46,30 @@ _EVIDENCE_BUNDLE_ITEM_KEYS = _EVIDENCE_V2_RESPONSE_KEYS | frozenset(
 _SAT_RESPONSE_KEYS = frozenset(
     {"satisfiable", "assignment", "work_units", "challenge_id", "assigned_hotkey"}
 )
-_CAPABILITIES_RESPONSE_KEYS = frozenset({"customer_sat"})
+_CAPABILITIES_RESPONSE_KEYS = frozenset({"customer_sat", "cc_gpu"})
+_CC_GPU_CAPABILITY_KEYS = frozenset(
+    {
+        "schema",
+        "hardware_class",
+        "execution_class",
+        "profile_id",
+        "availability",
+        "launch_gate",
+        "customer_jobs",
+        "live_evidence_digest",
+    }
+)
 _HEX_DIGITS = frozenset(string.hexdigits)
 
 
 class RemoteError(Exception):
     """A bounded, caller-safe failure returned by :class:`RemoteMiner`."""
+
+
+@dataclass(frozen=True)
+class WorkerCapabilities:
+    customer_sat: bool
+    cc_gpu: CcGpuCapability
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -288,8 +308,8 @@ class RemoteMiner:
             assigned_hotkey=self._hotkey,
         )
 
-    def supports_customer_sat(self) -> bool:
-        """Negotiate customer-work capability over the attested worker channel."""
+    def capabilities(self) -> WorkerCapabilities:
+        """Return typed capabilities over the attested worker channel."""
 
         if self._scheme == "https":
             if self._trusted_binding is None:
@@ -308,11 +328,34 @@ class RemoteMiner:
                 include_auth=True,
                 response_body_limit=1024,
             )
-        _check_exact_keys(response, _CAPABILITIES_RESPONSE_KEYS, "capabilities response")
+        response_keys = frozenset(response)
+        if response_keys not in {
+            frozenset({"customer_sat"}),
+            _CAPABILITIES_RESPONSE_KEYS,
+        }:
+            raise RemoteError("capabilities response has missing or unknown fields")
         supported = response["customer_sat"]
         if not isinstance(supported, bool):
             raise RemoteError("capabilities response has invalid customer_sat flag")
-        return supported
+        if response_keys == frozenset({"customer_sat"}):
+            cc_gpu = CcGpuCapability()
+        else:
+            cc_gpu_value = response["cc_gpu"]
+            if not isinstance(cc_gpu_value, dict) or frozenset(cc_gpu_value) != _CC_GPU_CAPABILITY_KEYS:
+                raise RemoteError("capabilities response has invalid CC-GPU schema")
+            try:
+                cc_gpu = CcGpuCapability.from_document(cc_gpu_value)
+            except CcGpuReceiptError as exc:
+                raise RemoteError("capabilities response makes an inconsistent CC-GPU claim") from exc
+        return WorkerCapabilities(
+            customer_sat=supported,
+            cc_gpu=cc_gpu,
+        )
+
+    def supports_customer_sat(self) -> bool:
+        """Negotiate customer-work capability over the attested worker channel."""
+
+        return self.capabilities().customer_sat
 
     def _post_http(
         self,

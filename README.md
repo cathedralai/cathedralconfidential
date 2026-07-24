@@ -79,9 +79,10 @@ Future product direction, not yet scored on chain:
 
 - General customer containers, long-running agents, inference, and evaluation
   as scored workloads.
-- Confidential GPU workloads (NVIDIA H100/H200 in CC mode) now have a
-  fail-closed, hardware-free composite-attestation foundation. Live hardware
-  acceptance and scoring remain disabled; B200-class remains later work.
+- The fixed NVIDIA H100 Confidential Space proof workload now has a fail-closed,
+  hardware-free composite-attestation contract. Live hardware acceptance and
+  scoring remain disabled; general inference, H200, and B200-class work are
+  later tracks.
 - AMD SEV-SNP as a second CPU platform. Quote parsing and cryptographic
   verification exist in-repo; runtime scoring is not yet enabled.
 
@@ -91,8 +92,8 @@ Future product direction, not yet scored on chain:
 |---|---|
 | Intel TDX CPU | Proven launch path |
 | AMD SEV-SNP CPU | Planned second platform (crypto exists, scoring not enabled) |
-| NVIDIA H100/H200 CC | Audit-only foundation; live acceptance pending |
-| NVIDIA B200-class | Planned |
+| NVIDIA H100 CC | Fixed proof-workload contract; live acceptance not proven |
+| NVIDIA H200/B200-class | Planned |
 
 Attestation grants admission. Emissions come from verified delivery. Validators
 never require SSH or remote root access to miner machines.
@@ -137,6 +138,8 @@ the real `verify()` interface; the real Intel TDX path runs on hardware (see
 - [`docs/WORKLOAD_ADMISSION.md`](docs/WORKLOAD_ADMISSION.md) - immutable signed workload admission contract
 - [`docs/KEY_RELEASE.md`](docs/KEY_RELEASE.md) - attestation-gated encrypted data-key release contract
 - [`docs/GPU_ATTESTATION.md`](docs/GPU_ATTESTATION.md) - composite TDX plus confidential-GPU evidence and rollout gates
+- [`docs/CC_GPU_WORKER.md`](docs/CC_GPU_WORKER.md) - attempt-bound confidential-GPU Worker lifecycle, delivery, receipt, and live gate
+- [`docs/CC_GPU_LAUNCH_SCORECARD.md`](docs/CC_GPU_LAUNCH_SCORECARD.md) - PASS/FAIL/NOT PROVEN launch evidence gates
 - [`docs/TDX_LAUNCH.md`](docs/TDX_LAUNCH.md) - Intel TDX attestation path
 - [`HANDOFF.md`](HANDOFF.md) - commissioning and test handoff
 - [`RUNTEST.md`](RUNTEST.md) - test commands

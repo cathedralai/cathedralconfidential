@@ -254,6 +254,22 @@ Mainnet chain submission is live. A miner earns only after its registered SN39
 hotkey passes attestation and verified work and appears with positive weight in
 the signed vector. Testnet SN292 results never imply token emissions.
 
+### Confidential-GPU launch track
+
+The first `cc_gpu` profile is a bounded Cathedral-operated GCP proof target, not
+open miner enrollment. Do not advertise an H100, a provider VM, or a successful
+local NVIDIA attestation as reward-eligible confidential-GPU supply. The
+current GPU launch gate requires one Spot `a3-highgpu-1g` with Intel TDX and one
+H100 to produce a fresh, policy-compliant Cathedral job receipt that an
+independent validator accepts exactly once.
+
+Until that live chain is `PASS`, CC-GPU registration, uptime, capacity offers,
+synthetic receipts, and hybrid-GPU work earn no CC-GPU score or weight. When
+miner enrollment opens, validators will reward only unique real jobs with the
+selected receipt schema and current policy; stale, duplicate, mismatched,
+hybrid-preview, or unverifiable evidence receives zero credit. The ordinary
+TDX CPU mining lane above is unchanged.
+
 ## Troubleshooting
 
 | Symptom | Meaning and next check |
